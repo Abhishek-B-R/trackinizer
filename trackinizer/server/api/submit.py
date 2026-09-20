@@ -109,7 +109,11 @@ async def submit_batch_route(
         items,
         edges=req.edges,
         api_key_id=identity.api_key_id,
-        actor=identity.email,
+        # The batch actor when the caller supplied one, else the authenticated
+        # principal as before. ``Store.submit_batch`` still lets an individual
+        # item override it. Without this a CLI ``--as`` reached edits but not
+        # creates, which recorded the wrong author on every batch-created row.
+        actor=req.actor or identity.email,
     )
     body: MutableJSON = {"ids": [str(row_id) for row_id in ids]}
     return body

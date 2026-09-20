@@ -619,6 +619,7 @@ class Client:
         items: Sequence[tuple[Inquiry.InquiryKind, Mapping[str, object]]],
         *,
         edges: Sequence[Mapping[str, object]] = (),
+        actor: Inquiry.Actor | None = None,
     ) -> list[uuid.UUID]:
         """Create many inquiries and their edges in one atomic request.
 
@@ -631,6 +632,8 @@ class Client:
         Args:
           items: (kind, body) tuples; idempotency_key auto-minted if missing.
           edges: Edge definitions referencing item indices by name.
+          actor: Audit actor for items that do not name their own. Omit to
+            let the server default to the authenticated principal's email.
 
         Returns:
           result: Server-minted UUIDs in item order.
@@ -654,11 +657,13 @@ class Client:
                 payload["idempotency_key"] = str(uuid.uuid4())
             item_bodies.append(payload)
         where = "/api/inquiries/batch"
-        response = self._request(
-            "POST",
-            where,
-            body={"items": item_bodies, "edges": list(edges)},
-        )
+        batch_body: dict[str, object] = {
+            "items": item_bodies,
+            "edges": list(edges),
+        }
+        if actor is not None:
+            batch_body["actor"] = actor
+        response = self._request("POST", where, body=batch_body)
         return [
             _require_uuid(rid, where)
             for rid in _require_list(_require_field(response, "ids", where), where)

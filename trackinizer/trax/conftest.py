@@ -367,9 +367,16 @@ class FakeClient:
         items: Sequence[tuple[Inquiry.InquiryKind, object]],
         *,
         edges: Sequence[object] = (),
+        actor: Inquiry.Actor | None = None,
     ) -> list[uuid.UUID]:
         """Submit batch."""
-        self.calls.append(("submit_batch", (tuple(items),), {"edges": tuple(edges)}))
+        self.calls.append(
+            (
+                "submit_batch",
+                (tuple(items),),
+                {"edges": tuple(edges), "actor": actor},
+            ),
+        )
         # One distinct id per item so callers can map inline targets back.
         return [self.target_id if i == 0 else uuid.uuid4() for i in range(len(items))]
 

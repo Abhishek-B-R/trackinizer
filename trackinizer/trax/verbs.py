@@ -931,7 +931,7 @@ class Kind(Command):
         # a `begin ... end` group fans out. The whole create commits or rolls back
         # together, so a failed edge or target can never orphan the root.
         items: list[tuple[Inquiry.InquiryKind, Mapping[str, object]]] = [
-            (kind, cls._create_body(kind, create_actions, actor, client)),
+            (kind, cls._create_body(kind, create_actions, client)),
         ]
         edges: list[dict[str, object]] = []
         # The edges in flatten (creation) order, each tagged with its SOURCE node's
@@ -963,7 +963,10 @@ class Kind(Command):
             flat_edges=flat_edges,
             resolved=resolved,
         )
-        ids = client.submit_batch(items, edges=edges)
+        # ``--as`` must reach the created rows' audit: the batch route
+        # otherwise records the authenticated principal's email, so a
+        # CLI actor showed up on edits but never on creates.
+        ids = client.submit_batch(items, edges=edges, actor=actor)
         # Cost columns are flattened, so a delta cannot ride the create body;
         # each is applied right after the atomic create lands, on its OWN node,
         # through the same signed-delta setter a standalone ``agent-cost add`` uses.
@@ -1120,7 +1123,7 @@ class Kind(Command):
                     target.kind,
                     tuple(f.field for f in target.fields),
                 )
-                items.append((target.kind, _inline_create_body(target, actor, client)))
+                items.append((target.kind, _inline_create_body(target, client)))
                 new_index = len(items) - 1
                 edges.append(
                     cls._batch_edge(action, from_index=from_index, to_index=new_index),
@@ -1150,10 +1153,15 @@ class Kind(Command):
         cls,
         kind: Inquiry.InquiryKind,
         actions: Sequence[SetField | AddList | RemoveList],
-        actor: Inquiry.Actor,
         client: Client,
     ) -> dict[str, object]:
-        body: dict[str, object] = {"owner": actor}
+        # No implicit owner: ``types/inquiries.py`` specifies that owner is
+        # "never auto-stamped from the submitter or audit ``actor``", and an
+        # unowned row is what makes work claimable -- seeding it here left
+        # every row looking in-progress, so ``trax next`` had nothing to hand
+        # out. An explicit ``owner to X`` in the create still applies, via the
+        # action loop below.
+        body: dict[str, object] = {}
         for action in actions:
             if isinstance(action, SetField):
                 # A ref-list `... to KIND SEQ` resolves to its wire shape via
@@ -1302,7 +1310,7 @@ class Kind(Command):
         validate_writable_fields(target.kind, tuple(f.field for f in target.fields))
 
         items: list[tuple[Inquiry.InquiryKind, Mapping[str, object]]] = [
-            (target.kind, _inline_create_body(target, actor, client)),
+            (target.kind, _inline_create_body(target, client)),
         ]
         # The anchor edge: existing subject (by id) -> the inline target (item 0).
         edges: list[dict[str, object]] = [
@@ -1329,7 +1337,10 @@ class Kind(Command):
             flat_edges=flat_edges,
             resolved=resolved,
         )
-        ids = client.submit_batch(items, edges=edges)
+        # ``--as`` must reach the created rows' audit: the batch route
+        # otherwise records the authenticated principal's email, so a
+        # CLI actor showed up on edits but never on creates.
+        ids = client.submit_batch(items, edges=edges, actor=actor)
         for node_index, cost in deferred_costs:
             client.add_cost(
                 ids[node_index],
@@ -2582,11 +2593,15 @@ def _resolve_field_value(field: SetField, *, used_stdin: bool) -> tuple[SetField
 
 def _inline_create_body(
     target: InlineCreate,
-    actor: Inquiry.Actor,
     client: Client,
 ) -> dict[str, object]:
     """Build an inline-create row body, resolving ref-list fields and defaults."""
-    body: dict[str, object] = {"owner": actor}
+    # No implicit owner: ``types/inquiries.py`` specifies that owner is "never
+    # auto-stamped from the submitter or audit ``actor``", and an unowned row
+    # is what makes work claimable -- seeding it here left every row looking
+    # in-progress, so ``trax next`` had nothing to hand out. An explicit
+    # ``owner to X`` in the create still applies, via the field loop below.
+    body: dict[str, object] = {}
     for field in target.fields:
         body[field.field] = _resolve_set_value(field, client)
     _apply_create_defaults(target.kind, body)
