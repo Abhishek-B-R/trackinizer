@@ -1048,14 +1048,48 @@ def test_session_creates_row(
     assert "created:" in capsys.readouterr().out
 
 
-def test_kind_create_owner_defaults_to_caller(
+def test_kind_create_leaves_owner_unset_so_the_row_is_claimable(
     client: FakeClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Creating work must not assign it, or nothing is ever available.
+
+    ``types/inquiries.py`` specifies owner is "never auto-stamped from the
+    submitter or audit ``actor``". Stamping it made every row born
+    in-progress, so the ``owner IS NULL`` predicate behind ``trax next``
+    matched nothing and no agent could ever claim work.
+    """
     monkeypatch.setenv("USER", "doe")
     run(["issue", "title", "to", "Hi"], client)
     body = _batch_items(client)[0][1]
-    assert body["owner"] == "doe"
+    assert "owner" not in body
+
+
+def test_kind_create_still_honors_an_explicit_owner(
+    client: FakeClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assigning at creation stays supported; only the implicit default went."""
+    monkeypatch.setenv("USER", "doe")
+    run(["issue", "title", "to", "Hi", "owner", "to", "worker-1"], client)
+    body = _batch_items(client)[0][1]
+    assert body["owner"] == "worker-1"
+
+
+def test_kind_create_sends_the_audit_actor_at_batch_level(
+    client: FakeClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--as`` must still reach the created row's audit.
+
+    The batch route otherwise records the authenticated principal's email, so
+    dropping the owner stamp would have lost the CLI actor on creates
+    entirely -- it reached edits but never creation.
+    """
+    monkeypatch.setenv("USER", "doe")
+    run(["issue", "title", "to", "Hi", "--as", "dhanya"], client)
+    batch = next(c for c in client.calls if c[0] == "submit_batch")
+    assert batch[2]["actor"] == "dhanya"
 
 
 def test_kind_create_reads_stdin_value(
@@ -1263,9 +1297,10 @@ def test_create_inline_cost_lands_on_the_inline_node_not_root(
         items: object,
         *,
         edges: object = (),
+        actor: str | None = None,
     ) -> list[uuid.UUID]:
         del self
-        del edges
+        del edges, actor
         # Deterministic ids: item 0 = root belief, item 1 = inline websearch.
         return [root_id, websearch_id][: len(cast(list[object], items))]
 

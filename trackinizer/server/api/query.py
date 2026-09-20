@@ -25,6 +25,7 @@ from trackinizer.lib.postgres import DatabaseEngine
 from trackinizer.server.api._deps import get_store, tag_kind, tag_row
 from trackinizer.server.api._regex_guard import regex_failures_as_400
 from trackinizer.server.api._routes_shared import (
+    idempotency_key,
     parse_seq_ranges,
 )
 from trackinizer.server.auth import AuthIdentity, require_role
@@ -40,7 +41,7 @@ from trackinizer.types.inquiries import (
     KIND_TO_CLASS,
     Inquiry,
 )
-from trackinizer.wire.bodies import FieldMutation
+from trackinizer.wire.bodies import ClaimNextIssue, FieldMutation
 from trackinizer.wire.filters import (
     IDENTITY_COLUMNS,
     VALUELESS_FILTER_OPS,
@@ -92,6 +93,54 @@ async def next_issue_route(
     """
     del identity
     return tag_kind(await get_store(request).next_issue())
+
+
+# Declared here, beside its read-only twin and ahead of ``/api/inquiries/{kind}``:
+# Starlette matches in registration order, so a later declaration would let the
+# generic route swallow ``next_issue`` as a ``kind`` and 422 on it.
+@router.post("/api/inquiries/next_issue")
+async def claim_next_issue_route(
+    req: ClaimNextIssue,
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("writer"))],
+) -> MutableJSON | None:
+    """Atomically select and claim the next available Issue.
+
+    Unlike the ``GET`` twin, this reserves what it returns: selection and
+    the owner write are one statement, so concurrent callers receive
+    different issues instead of all receiving the first one and overwriting
+    each other's claim.
+
+    ``null`` means "nothing claimable right now", NOT "all work is
+    finished" -- an eligible row may simply be locked by another in-flight
+    claim, and a later request may succeed.
+
+    Requires an ``Idempotency-Key``: the acquisition is a mutation, and a
+    retry whose first attempt already committed must return that same issue
+    rather than consuming a second one.
+
+    Args:
+      req: Claim body naming the new owner and the audit actor.
+      request: FastAPI request object for middleware access.
+      identity: Authenticated writer; enforced by Depends(require_role("writer")).
+
+    Returns:
+      result: The claimed Issue, or None when nothing is available.
+
+    """
+    if idempotency_key(request) is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key header is required to claim an issue",
+        )
+    return tag_kind(
+        await get_store(request).claim_next_issue(
+            owner=req.owner,
+            api_key_id=identity.api_key_id,
+            actor=req.actor or identity.email,
+            reason=req.reason,
+        ),
+    )
 
 
 @router.post("/api/inquiries/lookup")

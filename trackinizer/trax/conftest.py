@@ -367,9 +367,16 @@ class FakeClient:
         items: Sequence[tuple[Inquiry.InquiryKind, object]],
         *,
         edges: Sequence[object] = (),
+        actor: Inquiry.Actor | None = None,
     ) -> list[uuid.UUID]:
         """Submit batch."""
-        self.calls.append(("submit_batch", (tuple(items),), {"edges": tuple(edges)}))
+        self.calls.append(
+            (
+                "submit_batch",
+                (tuple(items),),
+                {"edges": tuple(edges), "actor": actor},
+            ),
+        )
         # One distinct id per item so callers can map inline targets back.
         return [self.target_id if i == 0 else uuid.uuid4() for i in range(len(items))]
 
@@ -531,6 +538,26 @@ class FakeClient:
     def next_issue(self) -> dict[str, JSONValue] | None:
         """Next issue."""
         self.calls.append(("next_issue", (), {}))
+        return cast(
+            dict[str, JSONValue] | None,
+            self.next_payload,  # -- fake payload is JSON-shaped.
+        )
+
+    def claim_next_issue(
+        self,
+        *,
+        owner: Inquiry.Actor,
+        actor: Inquiry.Actor | None = None,
+        reason: str = "",
+    ) -> dict[str, JSONValue] | None:
+        """Record a claim; the fake hands back its canned next-issue row."""
+        self.calls.append(
+            (
+                "claim_next_issue",
+                (),
+                {"owner": owner, "actor": actor, "reason": reason},
+            ),
+        )
         return cast(
             dict[str, JSONValue] | None,
             self.next_payload,  # -- fake payload is JSON-shaped.

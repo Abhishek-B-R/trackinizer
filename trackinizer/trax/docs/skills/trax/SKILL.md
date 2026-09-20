@@ -26,9 +26,14 @@ ownership from prose; apply these boundaries.
    Paper takes `source` (not url); `note`/`valence` are EDGE metadata, not
    row fields -- there is no bare `note` verb on a row.
 3. Use trax for task/inquiry tracking, not git operations.
-4. Take ownership of substantial multi-agent work before editing:
-   `trax issue 7 owner to Agent`. An `active` row with no owner is open;
-   with an owner it is in progress.
+4. Take ownership of substantial multi-agent work before editing. Prefer
+   `trax next owner to Agent --as Agent`, which selects and claims in one
+   atomic step -- safe under concurrent agents, since no two callers can
+   land on the same Issue. Only use `trax issue 7 owner to Agent` when you
+   already know the specific Issue you want (e.g. one the user pointed
+   you at); doing that on an Issue found via `trax next`/`board` recreates
+   the race the atomic form exists to close. An `active` row with no owner
+   is open; with an owner it is in progress.
 5. Every trax write must include `--as ACTOR`, where `ACTOR` is your current
    agent self name (for this session, `Agent`). Add `--reason TEXT` when the
    audit log needs context; `--reason` is optional.
@@ -285,11 +290,15 @@ Slash args forward verbatim to `trax`. A bare number routes to `trax issue <seq>
 
 ## Workflow
 
-1. Pick: `trax next` / `trax blocked` / `trax board`.
-2. Take ownership: `trax issue 7 owner to Agent`.
-3. Implement.
-4. Verify: `trax issue 7 validation to "pytest ... passed"`.
-5. Close when the user requests it or closing is clearly part of the task:
+1. Claim: `trax next owner to Agent --as Agent` -- selects and claims the
+   next unblocked, unowned Issue in one atomic step. If you need to survey
+   what's open first, `trax blocked` / `trax board` are read-only and fine
+   to run before claiming, but do not follow them with a separate
+   `trax issue N owner to Agent` on a row you found that way -- that
+   reintroduces the two-step race the atomic form exists to close.
+2. Implement.
+3. Verify: `trax issue 7 validation to "pytest ... passed"`.
+4. Close when the user requests it or closing is clearly part of the task:
    `trax issue 7 status to complete`.
 
 Re-running `description to @body.md` (or `to -`) overwrites; that is the
