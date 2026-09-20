@@ -487,6 +487,7 @@ class _EditMixin(_CascadeAuditMixin):
         owner: Inquiry.Actor,
         api_key_id: UUID | None = None,
         actor: Inquiry.Actor,
+        reason: str = "",
     ) -> Issue | None:
         """Atomically select and claim the next available Issue for ``owner``.
 
@@ -510,6 +511,7 @@ class _EditMixin(_CascadeAuditMixin):
           owner: Identity to record as the new owner.
           api_key_id: Authenticated credential recorded in the audit entry.
           actor: Identity recorded in the audit entry.
+          reason: Optional audit context, stored on the change log entry.
 
         Returns:
           issue: The claimed Issue, or ``None`` when nothing is available.
@@ -521,6 +523,14 @@ class _EditMixin(_CascadeAuditMixin):
           NotFoundError: The replayed issue has since been deleted.
 
         """
+        if not owner.strip():
+            # Mirror ``ClaimNextIssue.owner``'s min_length=1 + non-blank
+            # validator so a direct Store caller can't blank-claim. ``owner``
+            # is a nullable column, so a blank string isn't caught by any
+            # NOT NULL constraint -- it would silently write '' (not NULL),
+            # which permanently excludes the row from every future
+            # ``owner IS NULL`` scan. No route or verb can ever reclaim it.
+            raise ConflictError("owner cannot be empty")
         async with (
             notify_after_commit(),
             self.engine.acquire() as conn,
@@ -558,6 +568,7 @@ class _EditMixin(_CascadeAuditMixin):
                 new=Snapshot(owner=owner),
                 api_key_id=api_key_id,
                 actor=actor,
+                reason=reason,
             )
             outbound, inbound = await fetch_edges(conn, claimed_id)
         issue = materialize(row, {claimed_id: outbound}, {claimed_id: inbound})

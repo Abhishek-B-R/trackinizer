@@ -138,6 +138,7 @@ async def claim_next_issue_route(
             owner=req.owner,
             api_key_id=identity.api_key_id,
             actor=req.actor or identity.email,
+            reason=req.reason,
         ),
     )
 

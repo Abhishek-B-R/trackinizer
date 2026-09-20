@@ -484,6 +484,7 @@ class Client:
         *,
         owner: Inquiry.Actor,
         actor: Inquiry.Actor | None = None,
+        reason: str = "",
     ) -> dict[str, JSONValue] | None:
         """Atomically claim the next available Issue for ``owner``.
 
@@ -503,6 +504,7 @@ class Client:
         Args:
           owner: Identity to record as the Issue's new owner.
           actor: Audit actor; ``None`` defaults to the authenticated principal.
+          reason: Optional audit context, stored on the change log entry.
 
         Returns:
           result: The claimed Issue's fields, or None if nothing was available.
@@ -512,6 +514,8 @@ class Client:
         body: dict[str, object] = {"owner": owner}
         if actor is not None:
             body["actor"] = actor
+        if reason:
+            body["reason"] = reason
         payload = self.post(where, body=body)
         if payload is None:
             return None

@@ -548,10 +548,15 @@ class FakeClient:
         *,
         owner: Inquiry.Actor,
         actor: Inquiry.Actor | None = None,
+        reason: str = "",
     ) -> dict[str, JSONValue] | None:
         """Record a claim; the fake hands back its canned next-issue row."""
         self.calls.append(
-            ("claim_next_issue", (), {"owner": owner, "actor": actor}),
+            (
+                "claim_next_issue",
+                (),
+                {"owner": owner, "actor": actor, "reason": reason},
+            ),
         )
         return cast(
             dict[str, JSONValue] | None,

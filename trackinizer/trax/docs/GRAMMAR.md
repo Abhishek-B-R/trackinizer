@@ -448,8 +448,16 @@ kinds resolve first, so a field can never shadow a command.
 - `trax id <uuid> [--format table|json] [--changes]` -- show one row by its
   global id, with no leading kind (the UUID is unique, so the kind is
   redundant). Unlike `trax <kind> <uuid>` it applies no kind typo-guard.
-- `trax next [--format text|json|ids]` -- show the next unblocked
-  active Issue.
+- `trax next [--format text|json|ids]` -- preview the next unblocked
+  active Issue; reserves nothing.
+- `trax next owner to ACTOR [--as ACTOR]` -- select AND claim the next
+  unblocked, unowned active Issue in one atomic step. Concurrent callers
+  never receive the same Issue. Prints "(nothing claimable right now)" on
+  an empty queue -- not the same as "(no active issues)" from the preview
+  form, since a claim can miss due to a concurrent winner even when work
+  remains. Do not reconstruct this as `trax next` followed by a separate
+  `owner to` write on the result -- that reintroduces the race this form
+  exists to close.
 - `trax recent [--limit INT] [--format text|json]` -- audit-log feed.
 - `trax cost KIND SEQ [--deep] [--format text|json]` -- cost rollup.
 - `trax blocked` -- active Issues with at least one active blocker.

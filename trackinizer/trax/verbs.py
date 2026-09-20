@@ -2008,6 +2008,7 @@ Options:
         row = client.claim_next_issue(
             owner=owner,
             actor=resolve_actor(_arg_str(args, "actor"), client),
+            reason=_arg_str(args, "reason"),
         )
         if row is None:
             # Not "everything is done": an eligible issue may be locked by

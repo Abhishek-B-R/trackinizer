@@ -507,6 +507,9 @@ class ClaimNextIssue(BaseModel):
     actor: str | None = None
     """Audit actor; ``None`` defaults to the authenticated principal's email."""
 
+    reason: str = ""
+    """Optional audit context, stored on the change log entry."""
+
     @field_validator("owner", "actor", mode="after")
     @classmethod
     def _reject_blank(cls, value: str | None) -> str | None:
