@@ -543,6 +543,21 @@ class FakeClient:
             self.next_payload,  # -- fake payload is JSON-shaped.
         )
 
+    def claim_next_issue(
+        self,
+        *,
+        owner: Inquiry.Actor,
+        actor: Inquiry.Actor | None = None,
+    ) -> dict[str, JSONValue] | None:
+        """Record a claim; the fake hands back its canned next-issue row."""
+        self.calls.append(
+            ("claim_next_issue", (), {"owner": owner, "actor": actor}),
+        )
+        return cast(
+            dict[str, JSONValue] | None,
+            self.next_payload,  # -- fake payload is JSON-shaped.
+        )
+
     def version(self) -> str:
         """Version."""
         self.calls.append(("version", (), {}))

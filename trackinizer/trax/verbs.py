@@ -1951,10 +1951,16 @@ class Next(Command):
 
     names = ("next",)
     help = """\
-Usage: trax next [OPTIONS]
+Usage: trax next [owner to ACTOR] [OPTIONS]
+
+Bare `next` previews without reserving: two agents running it both see the
+same issue. Add `owner to ACTOR` to claim atomically -- selection and the
+owner write happen in one step, so concurrent claimants get different
+issues instead of overwriting each other.
 
 Examples:
-  trax next                                     show next active issue
+  trax next                                     preview next available issue
+  trax next owner to worker-1 --as worker-1    claim it for worker-1
   trax next --format ids                       print selected row id
   trax next --format json                      print JSON
 
@@ -1972,6 +1978,13 @@ Options:
             default="text",
             choices=("text", "json", "ids"),
         )
+        # Only the `owner to ACTOR` mutation is accepted here; the tail is
+        # validated in ``run`` rather than by argparse so an unsupported one
+        # gets a message naming the single legal form.
+        parser.add_argument("claim", nargs="*", default=[])
+        # ``next`` writes once it is claiming, so it takes the same actor flag
+        # every other write command does.
+        add_write_flags(parser)
         return parser
 
     @classmethod
@@ -1983,11 +1996,40 @@ Options:
         client_factory: Callable[[], Client],
     ) -> None:
         del verb
-        row = client_factory().next_issue()
+        client = client_factory()
+        owner = cls._claim_owner(getattr(args, "claim", []) or [])
+        if owner is None:
+            row = client.next_issue()
+            if row is None:
+                echo("(no active issues)")
+                return
+            print_rows([row], _arg_str(args, "format_"))
+            return
+        row = client.claim_next_issue(
+            owner=owner,
+            actor=resolve_actor(_arg_str(args, "actor"), client),
+        )
         if row is None:
-            echo("(no active issues)")
+            # Not "everything is done": an eligible issue may be locked by
+            # another in-flight claim right now, and a later call may win it.
+            echo("(nothing claimable right now)")
             return
         print_rows([row], _arg_str(args, "format_"))
+
+    @staticmethod
+    def _claim_owner(tail: Sequence[str]) -> str | None:
+        """Return the owner from an `owner to ACTOR` tail, or None if absent."""
+        if not tail:
+            return None
+        if len(tail) != 3 or tail[0] != "owner" or tail[1] != "to":
+            raise ClientError(
+                "trax next accepts only `owner to ACTOR` after it; got "
+                f"{' '.join(tail)!r}",
+            )
+        owner = tail[2]
+        if not owner.strip():
+            raise ClientError("claim owner must not be blank")
+        return owner
 
 
 class Blocked(Command):

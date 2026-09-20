@@ -256,7 +256,7 @@ class Client:
         """Send a DELETE request."""
         return self._request("DELETE", path, body=body)
 
-    # -- Reference resolution ------------------------------------------------
+    # -- Reference resolution
 
     def resolve_id(self, ref: Ref) -> tuple[Inquiry.InquiryKind, uuid.UUID]:
         """Resolve a ref to ``(kind, uuid)``.
@@ -334,7 +334,7 @@ class Client:
             out.append((kind, ref.uuid))
         return out
 
-    # -- Reads --------------------------------------------------------------
+    # -- Reads
 
     def list_kind(
         self,
@@ -479,6 +479,44 @@ class Client:
             return None
         return dict(_require_mapping(payload, where))
 
+    def claim_next_issue(
+        self,
+        *,
+        owner: Inquiry.Actor,
+        actor: Inquiry.Actor | None = None,
+    ) -> dict[str, JSONValue] | None:
+        """Atomically claim the next available Issue for ``owner``.
+
+        ONE request, deliberately -- never :meth:`next_issue` followed by an
+        owner write. The server selects and claims in a single statement, so
+        concurrent callers receive different issues instead of all receiving
+        the first one and silently overwriting each other's claim.
+
+        ``None`` means nothing is claimable right now, not that all work is
+        finished: an eligible issue may simply be locked by another in-flight
+        claim, and a later call may succeed.
+
+        The ``Idempotency-Key`` on this POST is reused across transport
+        retries, so a retry whose first attempt already committed replays that
+        same issue instead of consuming a second one.
+
+        Args:
+          owner: Identity to record as the Issue's new owner.
+          actor: Audit actor; ``None`` defaults to the authenticated principal.
+
+        Returns:
+          result: The claimed Issue's fields, or None if nothing was available.
+
+        """
+        where = "/api/inquiries/next_issue"
+        body: dict[str, object] = {"owner": owner}
+        if actor is not None:
+            body["actor"] = actor
+        payload = self.post(where, body=body)
+        if payload is None:
+            return None
+        return dict(_require_mapping(payload, where))
+
     def version(self) -> str:
         """Return the server's build SHA, for stale-deploy detection.
 
@@ -585,7 +623,7 @@ class Client:
             ),
         )
 
-    # -- Writes -------------------------------------------------------------
+    # -- Writes
 
     def submit(
         self,
