@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Literal, cast
+from uuid import UUID
 
 import asyncpg
 
@@ -20,11 +21,13 @@ from trackinizer.server.primitives import (
     upsert_embedding,
     validate_list_references,
 )
+from trackinizer.server.projection import fetch_edges, materialize
 from trackinizer.server.setter_dispatch import (
     COLUMN_SPECS,
     NO_HOOKS,
     RUNTIME_HOOKS,
 )
+from trackinizer.server.sql_fragments import CLAIM_NEXT_ISSUE_SQL
 from trackinizer.server.store.cascade import _CascadeAuditMixin
 from trackinizer.server.store.change_id_slot import (
     _consume_client_change_id,
@@ -48,7 +51,6 @@ from trackinizer.types.inquiries import (
 
 if TYPE_CHECKING:
     from datetime import datetime
-    from uuid import UUID
 
     from trackinizer.lib.postgres import Conn
 
@@ -478,6 +480,156 @@ class _EditMixin(_CascadeAuditMixin):
                 actor=actor,
             )
             return change_id
+
+    async def claim_next_issue(
+        self,
+        *,
+        owner: Inquiry.Actor,
+        api_key_id: UUID | None = None,
+        actor: Inquiry.Actor,
+        reason: str = "",
+    ) -> Issue | None:
+        """Atomically select and claim the next available Issue for ``owner``.
+
+        Selection and claiming are ONE statement
+        (:data:`CLAIM_NEXT_ISSUE_SQL`). A read followed by an owner write
+        leaves a window -- seconds wide, with an agent thinking in between --
+        in which every caller sees the same unowned row and each silently
+        overwrites the last, so N agents duplicate one issue while the rest
+        go untouched.
+
+        ``None`` means "nothing claimable right now", NOT "all work is
+        finished": an eligible row may simply be locked by another in-flight
+        claim, and a later attempt may succeed.
+
+        Retries replay rather than allocating a second issue. The
+        ``Idempotency-Key`` names one logical acquisition, so a retry whose
+        first attempt committed returns that same issue without a second
+        owner change, audit row, or notification.
+
+        Args:
+          owner: Identity to record as the new owner.
+          api_key_id: Authenticated credential recorded in the audit entry.
+          actor: Identity recorded in the audit entry.
+          reason: Optional audit context, stored on the change log entry.
+
+        Returns:
+          issue: The claimed Issue, or ``None`` when nothing is available.
+
+        Raises:
+          ConflictError: The idempotency key names a different operation, or
+            the replayed issue is no longer active / no longer owned by
+            ``owner``.
+          NotFoundError: The replayed issue has since been deleted.
+
+        """
+        if not owner.strip():
+            # Mirror ``ClaimNextIssue.owner``'s min_length=1 + non-blank
+            # validator so a direct Store caller can't blank-claim. ``owner``
+            # is a nullable column, so a blank string isn't caught by any
+            # NOT NULL constraint -- it would silently write '' (not NULL),
+            # which permanently excludes the row from every future
+            # ``owner IS NULL`` scan. No route or verb can ever reclaim it.
+            raise ConflictError("owner cannot be empty")
+        async with (
+            notify_after_commit(),
+            self.engine.acquire() as conn,
+            tx(conn),
+        ):
+            # Serialize overlapping retries OF THIS REQUEST -- not all
+            # claimants. Without it, two retries of one key can both miss the
+            # other's uncommitted audit row and each allocate an issue, which
+            # is exactly the duplication the key exists to prevent.
+            request_key = _peek_client_change_id()
+            if request_key is not None:
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1))",
+                    f"claim_next_issue:{request_key}",
+                )
+            # Probe AFTER the lock: probing first lets overlapping retries
+            # miss a commit that is still in flight, which matters most when
+            # it claimed the last available issue.
+            replayed = await self._replay_claim(conn, owner=owner, actor=actor)
+            if replayed is not None:
+                return replayed
+            row = await conn.fetchrow(CLAIM_NEXT_ISSUE_SQL, owner)
+            if row is None:
+                return None
+            claimed_id = cast(UUID, row["id"])
+            # The row UPDATE alone is not enough: the audit entry carries the
+            # old/new owner snapshot, actor and key attribution, subscriber
+            # capture, and the cascade that dependent rows read.
+            await self._emit_field_change(
+                conn,
+                claimed_id,
+                cast(Inquiry.InquiryKind, row["kind"]),
+                "owner",
+                Snapshot(owner=None),
+                new=Snapshot(owner=owner),
+                api_key_id=api_key_id,
+                actor=actor,
+                reason=reason,
+            )
+            outbound, inbound = await fetch_edges(conn, claimed_id)
+        issue = materialize(row, {claimed_id: outbound}, {claimed_id: inbound})
+        assert isinstance(issue, Issue)
+        return issue
+
+    # Unlike :meth:`_replay_field_change` the subject is not known up front --
+    # discovering which issue was claimed is the point -- so the audit row supplies it.
+    async def _replay_claim(
+        self,
+        conn: Conn,
+        *,
+        owner: Inquiry.Actor,
+        actor: Inquiry.Actor,
+    ) -> Issue | None:
+        """Return the issue a committed claim under this key already took."""
+        client_change_id = _peek_client_change_id()
+        if client_change_id is None:
+            return None
+        existing = await conn.fetchrow(
+            "SELECT subject_id, subject_kind, kind, actor, old_owner, new_owner "
+            "FROM change_log WHERE id = $1",
+            client_change_id,
+        )
+        if existing is None:
+            return None
+        # ``ContextVar`` siblings share one consume cursor; only the winner
+        # may replay, later siblings continue as fresh acquisitions.
+        if _consume_client_change_id() != client_change_id:
+            return None
+        # The key must name THIS operation: an Issue owner transition from
+        # unowned to this owner, by this actor. Anything else is key reuse.
+        if not (
+            existing["kind"] == "owner"
+            and existing["subject_kind"] == "Issue"
+            and existing["actor"] == actor
+            and existing["old_owner"] is None
+            and existing["new_owner"] == owner
+        ):
+            raise ConflictError(
+                f"idempotency_key {client_change_id} already used for a "
+                "different operation",
+            )
+        subject_id = cast(UUID, existing["subject_id"])
+        row = await conn.fetchrow(
+            "SELECT * FROM inquiries WHERE id = $1",
+            subject_id,
+        )
+        if row is None:
+            raise NotFoundError(f"claimed issue {subject_id} no longer exists")
+        # Never substitute a different issue: the caller may already be acting
+        # on this one, so a changed state is reported rather than papered over.
+        if row["status"] != "active" or row["owner"] != owner:
+            raise ConflictError(
+                f"claimed issue {subject_id} is no longer active and owned by "
+                f"{owner!r}",
+            )
+        outbound, inbound = await fetch_edges(conn, subject_id)
+        issue = materialize(row, {subject_id: outbound}, {subject_id: inbound})
+        assert isinstance(issue, Issue)
+        return issue
 
     async def set_account(
         self,

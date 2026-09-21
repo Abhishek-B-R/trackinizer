@@ -931,7 +931,7 @@ class Kind(Command):
         # a `begin ... end` group fans out. The whole create commits or rolls back
         # together, so a failed edge or target can never orphan the root.
         items: list[tuple[Inquiry.InquiryKind, Mapping[str, object]]] = [
-            (kind, cls._create_body(kind, create_actions, actor, client)),
+            (kind, cls._create_body(kind, create_actions, client)),
         ]
         edges: list[dict[str, object]] = []
         # The edges in flatten (creation) order, each tagged with its SOURCE node's
@@ -963,7 +963,10 @@ class Kind(Command):
             flat_edges=flat_edges,
             resolved=resolved,
         )
-        ids = client.submit_batch(items, edges=edges)
+        # ``--as`` must reach the created rows' audit: the batch route
+        # otherwise records the authenticated principal's email, so a
+        # CLI actor showed up on edits but never on creates.
+        ids = client.submit_batch(items, edges=edges, actor=actor)
         # Cost columns are flattened, so a delta cannot ride the create body;
         # each is applied right after the atomic create lands, on its OWN node,
         # through the same signed-delta setter a standalone ``agent-cost add`` uses.
@@ -1120,7 +1123,7 @@ class Kind(Command):
                     target.kind,
                     tuple(f.field for f in target.fields),
                 )
-                items.append((target.kind, _inline_create_body(target, actor, client)))
+                items.append((target.kind, _inline_create_body(target, client)))
                 new_index = len(items) - 1
                 edges.append(
                     cls._batch_edge(action, from_index=from_index, to_index=new_index),
@@ -1150,10 +1153,15 @@ class Kind(Command):
         cls,
         kind: Inquiry.InquiryKind,
         actions: Sequence[SetField | AddList | RemoveList],
-        actor: Inquiry.Actor,
         client: Client,
     ) -> dict[str, object]:
-        body: dict[str, object] = {"owner": actor}
+        # No implicit owner: ``types/inquiries.py`` specifies that owner is
+        # "never auto-stamped from the submitter or audit ``actor``", and an
+        # unowned row is what makes work claimable -- seeding it here left
+        # every row looking in-progress, so ``trax next`` had nothing to hand
+        # out. An explicit ``owner to X`` in the create still applies, via the
+        # action loop below.
+        body: dict[str, object] = {}
         for action in actions:
             if isinstance(action, SetField):
                 # A ref-list `... to KIND SEQ` resolves to its wire shape via
@@ -1302,7 +1310,7 @@ class Kind(Command):
         validate_writable_fields(target.kind, tuple(f.field for f in target.fields))
 
         items: list[tuple[Inquiry.InquiryKind, Mapping[str, object]]] = [
-            (target.kind, _inline_create_body(target, actor, client)),
+            (target.kind, _inline_create_body(target, client)),
         ]
         # The anchor edge: existing subject (by id) -> the inline target (item 0).
         edges: list[dict[str, object]] = [
@@ -1329,7 +1337,10 @@ class Kind(Command):
             flat_edges=flat_edges,
             resolved=resolved,
         )
-        ids = client.submit_batch(items, edges=edges)
+        # ``--as`` must reach the created rows' audit: the batch route
+        # otherwise records the authenticated principal's email, so a
+        # CLI actor showed up on edits but never on creates.
+        ids = client.submit_batch(items, edges=edges, actor=actor)
         for node_index, cost in deferred_costs:
             client.add_cost(
                 ids[node_index],
@@ -1874,6 +1885,79 @@ class Recent(Command):
             echo(render.format_changes(list(rows)), nl=False)
 
 
+class Search(Command):
+    """Search captured sessions: embeddings + full text, RRF-merged."""
+
+    # NOT ``search``: that verb was retired (the filter grammar subsumed
+    # inquiry search; ``cli_test.test_search_verb_is_gone`` pins its removal).
+    # Session search is a distinct surface over ``session_records``, so it takes
+    # its own, previously-unused name rather than resurrecting the retired one.
+    names = ("search-sessions",)
+    help = HelpPage(
+        usage='trax search-sessions "QUERY" [OPTIONS]',
+        summary="Search captured agent sessions by meaning and by keyword.",
+        arguments=(("QUERY", "The search text (quote multi-word queries)."),),
+        options=(
+            ("--limit INT", "Maximum hits to return (default 20)."),
+            (
+                "--no-semantic",
+                "Full-text only; skip the embedding arm even if available.",
+            ),
+            ("--format TEXT", "text|json."),
+        ),
+        examples=(
+            'trax search-sessions "advisory lock deadlock"',
+            'trax search-sessions "retry backoff" --limit 5',
+            'trax search-sessions "postgres" --no-semantic',
+            'trax search-sessions "deploy" --format json',
+        ),
+    )
+
+    @classmethod
+    @override
+    def make_parser(cls) -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser(
+            prog="trax search-sessions",
+            description=cls.__doc__,
+        )
+        parser.add_argument("query", metavar="QUERY", help="search text")
+        parser.add_argument("--limit", type=_positive_int, default=20)
+        # Semantic on by default; the server degrades to full-text-only when no
+        # session embedder is configured, so this flag is a caller opt-OUT.
+        parser.add_argument(
+            "--semantic",
+            dest="semantic",
+            default=True,
+            action=argparse.BooleanOptionalAction,
+        )
+        parser.add_argument(
+            "--format",
+            dest="format_",
+            default="text",
+            choices=("text", "json"),
+        )
+        return parser
+
+    @classmethod
+    @override
+    def run(
+        cls,
+        verb: str,
+        args: argparse.Namespace,
+        client_factory: Callable[[], Client],
+    ) -> None:
+        del verb
+        body = client_factory().search_sessions(
+            _arg_str(args, "query"),
+            semantic=bool(getattr(args, "semantic", True)),
+            limit=_arg_int(args, "limit"),
+        )
+        if _arg_str(args, "format_") == "json":
+            echo(render.format_json(body), nl=False)
+        else:
+            echo(render.format_session_hits(body), nl=False)
+
+
 class Id(Command):
     """Show one row by its global id, regardless of kind.
 
@@ -1940,10 +2024,16 @@ class Next(Command):
 
     names = ("next",)
     help = """\
-Usage: trax next [OPTIONS]
+Usage: trax next [owner to ACTOR] [OPTIONS]
+
+Bare `next` previews without reserving: two agents running it both see the
+same issue. Add `owner to ACTOR` to claim atomically -- selection and the
+owner write happen in one step, so concurrent claimants get different
+issues instead of overwriting each other.
 
 Examples:
-  trax next                                     show next active issue
+  trax next                                     preview next available issue
+  trax next owner to worker-1 --as worker-1    claim it for worker-1
   trax next --format ids                       print selected row id
   trax next --format json                      print JSON
 
@@ -1961,6 +2051,13 @@ Options:
             default="text",
             choices=("text", "json", "ids"),
         )
+        # Only the `owner to ACTOR` mutation is accepted here; the tail is
+        # validated in ``run`` rather than by argparse so an unsupported one
+        # gets a message naming the single legal form.
+        parser.add_argument("claim", nargs="*", default=[])
+        # ``next`` writes once it is claiming, so it takes the same actor flag
+        # every other write command does.
+        add_write_flags(parser)
         return parser
 
     @classmethod
@@ -1972,11 +2069,41 @@ Options:
         client_factory: Callable[[], Client],
     ) -> None:
         del verb
-        row = client_factory().next_issue()
+        client = client_factory()
+        owner = cls._claim_owner(getattr(args, "claim", []) or [])
+        if owner is None:
+            row = client.next_issue()
+            if row is None:
+                echo("(no active issues)")
+                return
+            print_rows([row], _arg_str(args, "format_"))
+            return
+        row = client.claim_next_issue(
+            owner=owner,
+            actor=resolve_actor(_arg_str(args, "actor"), client),
+            reason=_arg_str(args, "reason"),
+        )
         if row is None:
-            echo("(no active issues)")
+            # Not "everything is done": an eligible issue may be locked by
+            # another in-flight claim right now, and a later call may win it.
+            echo("(nothing claimable right now)")
             return
         print_rows([row], _arg_str(args, "format_"))
+
+    @classmethod
+    def _claim_owner(cls, tail: Sequence[str]) -> str | None:
+        """Return the owner from an `owner to ACTOR` tail, or None if absent."""
+        if not tail:
+            return None
+        if len(tail) != 3 or tail[0] != "owner" or tail[1] != "to":
+            raise ClientError(
+                "trax next accepts only `owner to ACTOR` after it; got "
+                f"{' '.join(tail)!r}",
+            )
+        owner = tail[2]
+        if not owner.strip():
+            raise ClientError("claim owner must not be blank")
+        return owner
 
 
 class Blocked(Command):
@@ -2582,11 +2709,15 @@ def _resolve_field_value(field: SetField, *, used_stdin: bool) -> tuple[SetField
 
 def _inline_create_body(
     target: InlineCreate,
-    actor: Inquiry.Actor,
     client: Client,
 ) -> dict[str, object]:
     """Build an inline-create row body, resolving ref-list fields and defaults."""
-    body: dict[str, object] = {"owner": actor}
+    # No implicit owner: ``types/inquiries.py`` specifies that owner is "never
+    # auto-stamped from the submitter or audit ``actor``", and an unowned row
+    # is what makes work claimable -- seeding it here left every row looking
+    # in-progress, so ``trax next`` had nothing to hand out. An explicit
+    # ``owner to X`` in the create still applies, via the field loop below.
+    body: dict[str, object] = {}
     for field in target.fields:
         body[field.field] = _resolve_set_value(field, client)
     _apply_create_defaults(target.kind, body)

@@ -4,8 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal, Protocol, cast
-
-from fastapi import HTTPException
+from uuid import UUID
 
 from trackinizer.wire.seq_ranges import SeqRange, parse_seq_range
 
@@ -13,9 +12,13 @@ from trackinizer.wire.seq_ranges import SeqRange, parse_seq_range
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from fastapi import Request
+    from fastapi import HTTPException, Request
 
     from trackinizer.lib.postgres import DatabaseEngine
+else:
+    from wrapt import lazy_import
+
+    HTTPException = lazy_import("fastapi", "HTTPException")  # ~120 ms.
 
 
 RoleLiteral = Literal["viewer", "writer", "admin"]
@@ -80,6 +83,19 @@ def iso_format(value: object) -> str | None:
         return None
     assert isinstance(value, datetime)
     return value.isoformat()
+
+
+# ``ChangeIdMiddleware`` parses the header once (rejecting a malformed key with
+# 400) and stashes the validated UUID on ``request.state``; this just reads it,
+# so the parse and its failure branch live in exactly one place. The ``getattr``
+# default covers a request that never passed through the middleware (a bare test
+# app), leaving the caller to decide whether an absent key is acceptable.
+def idempotency_key(request: Request) -> UUID | None:
+    """Return the request's already-parsed ``Idempotency-Key``, or ``None``."""
+    key = getattr(request.state, "idempotency_key", None)
+    if key is not None and not isinstance(key, UUID):
+        raise ValueError("Expected key is None or isinstance(key, UUID).")
+    return key
 
 
 class _App(Protocol):

@@ -53,6 +53,7 @@ __all__ = [
     "ActorMixin",
     "BatchEdge",
     "Citation",
+    "ClaimNextIssue",
     "FieldMutation",
     "FieldOp",
     "FieldSet",
@@ -491,6 +492,33 @@ class BatchEdge(BaseModel):
         return self
 
 
+class ClaimNextIssue(BaseModel):
+    """Body for ``POST /api/inquiries/next_issue``: claim the next Issue.
+
+    ``owner`` is who becomes responsible for the work; ``actor`` is who
+    performed the acquisition. They are usually the same agent, but an
+    orchestrator claiming on a worker's behalf needs them to differ, and the
+    audit must record the real performer either way.
+    """
+
+    owner: str = Field(min_length=1)
+    """Identity to record as the Issue's new owner."""
+
+    actor: str | None = None
+    """Audit actor; ``None`` defaults to the authenticated principal's email."""
+
+    reason: str = ""
+    """Optional audit context, stored on the change log entry."""
+
+    @field_validator("owner", "actor", mode="after")
+    @classmethod
+    def _reject_blank(cls, value: str | None) -> str | None:
+        """Reject whitespace-only values, which would claim under a blank name."""
+        if value is not None and not value.strip():
+            raise ValueError("must be non-empty")
+        return value
+
+
 class SubmitBatch(BaseModel):
     """Batch-submit body: collapse N submit round-trips into one.
 
@@ -508,6 +536,27 @@ class SubmitBatch(BaseModel):
 
     items: list[SubmitItem] = Field(min_length=1, max_length=BATCH_MAX_ITEMS)
     edges: list[BatchEdge] = Field(default_factory=list, max_length=BATCH_MAX_ITEMS)
+
+    actor: str | None = None
+    """Audit actor for every item that does not name its own.
+
+    ``Store.submit_batch`` already resolves ``item.actor or actor``; this
+    carries the batch-level half of that pair over the wire. Without it the
+    route could only pass the authenticated principal's email, so a CLI
+    ``--as`` was recorded on edits but silently dropped on creates. ``None``
+    keeps that email fallback.
+    """
+
+    # Mirrors ``SubmitItem._validate_actor``: a whitespace-only value would
+    # fall through the ``item.actor or actor`` chain to the email default
+    # rather than failing, which hides malformed input.
+    @field_validator("actor", mode="after")
+    @classmethod
+    def _validate_actor(cls, value: str | None) -> str | None:
+        """Reject a blank (whitespace-only) batch actor as malformed input."""
+        if value is not None and not value.strip():
+            raise ValueError("actor must be non-empty")
+        return value
 
     @field_validator("items", mode="after")
     @classmethod
