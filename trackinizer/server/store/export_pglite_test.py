@@ -44,7 +44,10 @@ _LEFT_OUT: Final = frozenset(
         "api_keys",
         "applied_migrations",
         "inquiry_embeddings",
+        "session_bodies",
         "session_ciphertext",
+        "session_embeddings",
+        "session_index_state",
         "users",
     },
 )
