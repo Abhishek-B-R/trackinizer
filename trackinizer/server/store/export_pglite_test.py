@@ -17,7 +17,7 @@ import pytest_asyncio
 from trackinizer.lib.custom_json import DictCodec, ListCodec, loads
 from trackinizer.lib.postgres.testing import reset_schema
 from trackinizer.server.api.export_routes import export_lines
-from trackinizer.server.embedder import StubEmbedder
+from trackinizer.server.embedders.stub import StubEmbedder
 from trackinizer.server.store.core import Store
 from trackinizer.server.store.session_ir import SlashCommandRow
 from trackinizer.types.session_records import SessionRecordRow
