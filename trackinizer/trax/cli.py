@@ -34,8 +34,10 @@ from trackinizer.trax.profile import (
 )
 from trackinizer.trax.render import SHOW_IDS, echo
 from trackinizer.trax.verbs import (
+    Authority,
     Blocked,
     Board,
+    Confidence,
     Cost,
     Export,
     Graph,
@@ -164,6 +166,8 @@ DISPATCHERS: tuple[type[Command], ...] = (
     Graph,
     Board,
     Cost,
+    Confidence,
+    Authority,
     Send,
     Version,
     Export,

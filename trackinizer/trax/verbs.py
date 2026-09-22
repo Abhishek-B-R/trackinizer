@@ -2463,6 +2463,122 @@ Options:
         echo(f"resource: ${payload.get('resource_usd', 0):.6f}")
 
 
+class Confidence(Command):
+    """Show the derived confidence of a Belief/Experiment from its citations."""
+
+    names = ("confidence",)
+    help = """\
+Usage: trax confidence KIND SEQ [OPTIONS]
+
+Examples:
+  trax confidence belief 3                     show derived confidence
+  trax confidence experiment 5 --format json   print JSON
+
+Notes:
+  Derived from currently-true `proves` citations, folded through a logistic
+  (0.5 neutral, >0.5 supported, <0.5 attacked). Read-only: it never reflects
+  into the row's own stored fields, so it can disagree with a human's prior.
+
+Values:
+  kinds: belief experiment (only these carry inbound proves citations)
+
+Options:
+  --format text|json
+"""
+
+    @classmethod
+    @override
+    def make_parser(cls) -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser(
+            prog="trax confidence",
+            description=cls.__doc__,
+        )
+        parser.add_argument("kind", choices=list(KIND_LOWER), type=str.lower)
+        parser.add_argument("seq", type=int)
+        parser.add_argument(
+            "--format",
+            dest="format_",
+            default="text",
+            choices=("text", "json"),
+        )
+        return parser
+
+    @classmethod
+    @override
+    def run(
+        cls,
+        verb: str,
+        args: argparse.Namespace,
+        client_factory: Callable[[], Client],
+    ) -> None:
+        del verb
+        client = client_factory()
+        ref = SeqRef(kind=KIND_LOWER[_arg_str(args, "kind")], seq=_arg_int(args, "seq"))
+        _, target_id = client.resolve_id(ref)
+        confidence = client.confidence_for(target_id)
+        if _arg_str(args, "format_") == "json":
+            echo(render.format_json({"confidence": confidence}), nl=False)
+            return
+        echo(f"confidence: {confidence:.6f}")
+
+
+class Authority(Command):
+    """Show a row's derived load-bearing (PageRank) authority scores."""
+
+    names = ("authority",)
+    help = """\
+Usage: trax authority KIND SEQ [OPTIONS]
+
+Examples:
+  trax authority belief 3                       show load-bearing scores
+  trax authority paper 8 --format json          print JSON
+
+Notes:
+  How much the citation graph leans on this row, by relation: proves, favors,
+  cited_by (bibliographic), and issue (requires/narrows). Computed by a periodic
+  sweep; a relation that never reaches the row is omitted. Read-only.
+
+Options:
+  --format text|json
+"""
+
+    @classmethod
+    @override
+    def make_parser(cls) -> argparse.ArgumentParser:
+        parser = argparse.ArgumentParser(prog="trax authority", description=cls.__doc__)
+        parser.add_argument("kind", choices=list(KIND_LOWER), type=str.lower)
+        parser.add_argument("seq", type=int)
+        parser.add_argument(
+            "--format",
+            dest="format_",
+            default="text",
+            choices=("text", "json"),
+        )
+        return parser
+
+    @classmethod
+    @override
+    def run(
+        cls,
+        verb: str,
+        args: argparse.Namespace,
+        client_factory: Callable[[], Client],
+    ) -> None:
+        del verb
+        client = client_factory()
+        ref = SeqRef(kind=KIND_LOWER[_arg_str(args, "kind")], seq=_arg_int(args, "seq"))
+        _, target_id = client.resolve_id(ref)
+        scores = client.authority_for(target_id)
+        if _arg_str(args, "format_") == "json":
+            echo(render.format_json(scores), nl=False)
+            return
+        if not scores:
+            echo("(no authority: nothing depends on this row yet)")
+            return
+        for column, score in scores.items():
+            echo(f"{column.removesuffix('_authority'):10} {score:.6f}")
+
+
 class Send(Command):
     """Send a message into a live agent session by routing name."""
 

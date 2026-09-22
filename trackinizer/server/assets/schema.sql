@@ -59,6 +59,15 @@ CREATE TABLE IF NOT EXISTS inquiries (
     subscribers    TEXT[],
     marginal_cost_agent_usd    NUMERIC(14, 6) NOT NULL DEFAULT 0,
     marginal_cost_resource_usd NUMERIC(14, 6) NOT NULL DEFAULT 0,
+    -- Derived load-bearing (PageRank) scores, one per citation-relation graph.
+    -- System-written by the authority sweep, never by a user, so they are plain
+    -- fixed columns rather than per-kind ColumnSpec fields. NULL means "not yet
+    -- computed"; a score exists only on the kinds its relation targets
+    -- (proves/favors -> Belief/Experiment, cited_by -> Paper, issue -> Issue).
+    proves_authority    DOUBLE PRECISION,
+    favors_authority    DOUBLE PRECISION,
+    cited_by_authority  DOUBLE PRECISION,
+    issue_authority     DOUBLE PRECISION,
     created        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     modified       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
 

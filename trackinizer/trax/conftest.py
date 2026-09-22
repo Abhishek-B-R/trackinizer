@@ -266,6 +266,8 @@ class FakeClient:
             },
         ]
         self.cost_payload: dict[str, float] = {"agent_usd": 1.0, "resource_usd": 2.0}
+        self.confidence_payload: float = 0.5
+        self.authority_payload: dict[str, float] = {"proves_authority": 0.42}
         self.session_hits: dict[str, object] = {
             "hits": [
                 {
@@ -643,6 +645,16 @@ class FakeClient:
         """Cost for."""
         self.calls.append(("cost_for", (target_id,), {"deep": deep}))
         return dict(self.cost_payload)
+
+    def confidence_for(self, target_id: uuid.UUID) -> float:
+        """Record a confidence query; the fake reports a fixed score."""
+        self.calls.append(("confidence_for", (target_id,), {}))
+        return self.confidence_payload
+
+    def authority_for(self, target_id: uuid.UUID) -> dict[str, float]:
+        """Record an authority query; the fake reports fixed scores."""
+        self.calls.append(("authority_for", (target_id,), {}))
+        return dict(self.authority_payload)
 
     def edit(
         self,

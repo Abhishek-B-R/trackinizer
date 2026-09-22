@@ -332,6 +332,29 @@ async def proves_belief_route(
     return [tag_row(r) for r in rows]
 
 
+@router.get("/api/inquiries/{target_id}/confidence")
+async def confidence_route(
+    target_id: uuid.UUID,
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+) -> dict[str, float]:
+    """Return the derived confidence of a Belief/Experiment, 404 if absent."""
+    del identity
+    confidence = await get_store(request).confidence_for(target_id)
+    return {"confidence": _require_found(confidence)}
+
+
+@router.get("/api/inquiries/{target_id}/authority")
+async def authority_route(
+    target_id: uuid.UUID,
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+) -> dict[str, float]:
+    """Return a row's derived load-bearing authority scores, 404 if absent."""
+    del identity
+    return _require_found(await get_store(request).authority_for(target_id))
+
+
 @router.get("/api/inquiries/{kind}/{seq}")
 async def by_seq_route(
     kind: Inquiry.InquiryKind,

@@ -23,9 +23,11 @@ from trackinizer.server.sql_fragments import (
     COST_SUBTREE_SQL,
     NEXT_ISSUE_SQL,
     PROVES_BELIEF_SQL,
+    PROVING_EDGES_SQL,
 )
 from trackinizer.server.store.shared import _StoreShared
 from trackinizer.server.values import manifest_bound, vetted_sql
+from trackinizer.types.belief_confidence import NEUTRAL_CONFIDENCE, fold_confidence
 from trackinizer.types.change_log import Change
 from trackinizer.types.cost import Cost
 from trackinizer.types.errors import NotFoundError
@@ -53,6 +55,12 @@ __all__ = [
     "_ReadMixin",
     "seq_range_clause",
 ]
+
+
+# The only kinds a ``proves`` edge can target, so the only kinds
+# ``confidence_for`` recurses into. Every other Artifact kind can cite but
+# never be cited, so it is a recursion leaf counted at full weight.
+_CLAIMABLE_KINDS: frozenset[str] = frozenset({"Belief", "Experiment"})
 
 
 def seq_range_clause(
@@ -340,6 +348,119 @@ class _ReadMixin(_StoreShared):
                 [cast(UUID, r["id"]) for r in rows],
             )
         return [materialize(row, outbound, inbound) for row in rows]
+
+    async def confidence_for(
+        self,
+        belief_id: UUID,
+        *,
+        conn: Conn | None = None,
+    ) -> float | None:
+        """Compute derived confidence of a Belief/Experiment; None if missing.
+
+        Folds the currently-true ``proves`` graph into a log-odds sum and maps
+        it through a logistic (see :mod:`trackinizer.types.belief_confidence`):
+        each citation contributes ``citation_confidence * valence``, recursing
+        into any citer that is itself a Belief/Experiment so a chain resolves
+        bottom-up. Neutral ``0.5`` when no currently-true evidence exists.
+        Purely derived and read-only -- it never writes the stored row.
+
+        ``conn`` joins a caller's open transaction: PGlite's single connection
+        deadlocks on a re-entrant ``acquire``, and this walk issues one query
+        per node.
+
+        Args:
+          belief_id: Belief or Experiment row id to score.
+          conn: Existing connection to reuse, or None to acquire one.
+
+        Returns:
+          confidence: Derived confidence in ``(0, 1)``, or None if ``belief_id``
+            does not exist.
+
+        """
+        if conn is not None:
+            return await self._confidence_walk(conn, belief_id)
+        async with self.engine.acquire() as new_conn:
+            return await self._confidence_walk(new_conn, belief_id)
+
+    async def _confidence_walk(self, conn: Conn, belief_id: UUID) -> float | None:
+        """Resolve derived confidence, or None if absent or a non-claimable kind.
+
+        Confidence is defined only for the kinds a ``proves`` edge can target
+        (Belief/Experiment). For any other kind the proves graph is always
+        empty, so folding it would return a misleading neutral 0.5 -- a real
+        number for a question that does not apply. Return None instead.
+        """
+        kind = await conn.fetchval(
+            "SELECT kind FROM inquiries WHERE id = $1",
+            belief_id,
+        )
+        if kind not in _CLAIMABLE_KINDS:
+            return None
+        return await self._node_confidence(conn, belief_id, memo={}, visiting=set())
+
+    async def _node_confidence(
+        self,
+        conn: Conn,
+        node_id: UUID,
+        *,
+        memo: dict[UUID, float],
+        visiting: set[UUID],
+    ) -> float:
+        """One node's derived confidence, memoized, recursing into claimable citers."""
+        if node_id in memo:
+            return memo[node_id]
+        # The ``proves`` graph points child -> older parent, so it is acyclic;
+        # a node revisited mid-walk means a corrupted graph, which must degrade
+        # to neutral rather than recurse forever.
+        if node_id in visiting:
+            return NEUTRAL_CONFIDENCE
+        visiting.add(node_id)
+        log_odds = 0.0
+        for row in await conn.fetch(PROVING_EDGES_SQL, node_id):
+            from_kind = cast(str, row["from_kind"])
+            valence = cast(float, row["valence"])
+            citation_confidence = (
+                await self._node_confidence(
+                    conn,
+                    cast(UUID, row["from_id"]),
+                    memo=memo,
+                    visiting=visiting,
+                )
+                if from_kind in _CLAIMABLE_KINDS
+                else 1.0
+            )
+            log_odds += citation_confidence * valence
+        visiting.discard(node_id)
+        result = fold_confidence(log_odds)
+        memo[node_id] = result
+        return result
+
+    async def authority_for(self, target_id: UUID) -> dict[str, float] | None:
+        """Return a row's derived authority scores, or None if it is absent.
+
+        Reads the four load-bearing (PageRank) columns the authority sweep
+        writes. Only relations that reach the row carry a score; the rest are
+        omitted (their column is NULL), so an uncited row returns ``{}``.
+
+        Args:
+          target_id: Inquiry row id to read authority for.
+
+        Returns:
+          authority: ``column -> score`` for every non-NULL authority column, or
+            None if ``target_id`` does not exist.
+
+        """
+        async with self.engine.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT proves_authority, favors_authority, cited_by_authority, "
+                "issue_authority FROM inquiries WHERE id = $1",
+                target_id,
+            )
+        if row is None:
+            return None
+        return {
+            key: cast(float, value) for key, value in row.items() if value is not None
+        }
 
     async def what_changed_for_me(
         self,

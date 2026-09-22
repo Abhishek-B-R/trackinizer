@@ -792,6 +792,54 @@ class TestMissingResourceIs404:
         r = client.get(f"/api/inquiries/{new_uuid()}/cost")
         assert r.status_code == 404
 
+    def test_confidence_unknown_id_is_404(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        # ``confidence_for`` kind probe returns no row (missing id).
+        engine.conn.fetchval.return_value = None
+        r = client.get(f"/api/inquiries/{new_uuid()}/confidence")
+        assert r.status_code == 404
+
+    def test_confidence_no_evidence_is_neutral(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        engine.conn.fetchval.return_value = "Belief"  # claimable kind probe
+        engine.conn.fetch.return_value = []  # no proving edges
+        r = client.get(f"/api/inquiries/{new_uuid()}/confidence")
+        assert r.status_code == 200
+        assert DictCodec.coerce(r.json())["confidence"] == 0.5
+
+    def test_authority_unknown_id_is_404(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        set_field_row(engine.conn, None)
+        r = client.get(f"/api/inquiries/{new_uuid()}/authority")
+        assert r.status_code == 404
+
+    def test_authority_returns_non_null_scores(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        set_field_row(
+            engine.conn,
+            {
+                "proves_authority": 0.42,
+                "favors_authority": None,
+                "cited_by_authority": None,
+                "issue_authority": None,
+            },
+        )
+        r = client.get(f"/api/inquiries/{new_uuid()}/authority")
+        assert r.status_code == 200
+        assert DictCodec.coerce(r.json()) == {"proves_authority": 0.42}
+
 
 # -- Property: the list endpoint never 500s on malformed query params ----------
 # The route parses ``seq_range`` / ``filter`` / ``limit`` / ``offset`` BEFORE the

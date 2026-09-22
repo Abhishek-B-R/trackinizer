@@ -209,6 +209,21 @@ def test_export_api_paths_are_registered_and_documented() -> None:
     assert [p for p in EXPORT_API_PATHS if p not in api_md] == []
 
 
+def test_derived_read_routes_are_registered_and_documented() -> None:
+    """The confidence / authority read routes exist and appear in ``docs/api.md``.
+
+    Static-suffix reads like ``/cost``; without this guard a rename or a dropped
+    doc entry would strand the client silently, as it nearly did on the export
+    route.
+    """
+    registered = registered_paths(app)
+    api_md = (_CWD.parents[1] / "docs" / "api.md").read_text()
+    for suffix in ("confidence", "authority"):
+        path = f"/api/inquiries/{{target_id}}/{suffix}"
+        assert path in registered, f"{suffix} route not registered"
+        assert f"/api/inquiries/<uuid>/{suffix}" in api_md, f"{suffix} not in api.md"
+
+
 def test_session_api_paths_are_documented() -> None:
     """Every session-family route appears in ``docs/api.md``.
 

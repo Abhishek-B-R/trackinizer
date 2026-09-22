@@ -1999,6 +1999,34 @@ def test_cost_calls_cost_for(client: FakeClient) -> None:
     assert any(c[0] == "cost_for" for c in client.calls)
 
 
+def test_confidence_calls_confidence_for(client: FakeClient) -> None:
+    run(["confidence", "belief", "3"], client)
+    assert any(c[0] == "confidence_for" for c in client.calls)
+
+
+def test_confidence_json_format(
+    client: FakeClient,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client.confidence_payload = 0.73
+    run(["confidence", "belief", "3", "--format", "json"], client)
+    assert '"confidence"' in capsys.readouterr().out
+
+
+def test_authority_calls_authority_for(client: FakeClient) -> None:
+    run(["authority", "belief", "3"], client)
+    assert any(c[0] == "authority_for" for c in client.calls)
+
+
+def test_authority_empty_reports_no_dependents(
+    client: FakeClient,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client.authority_payload = {}
+    run(["authority", "belief", "3"], client)
+    assert "no authority" in capsys.readouterr().out
+
+
 def test_board_lists_issues(client: FakeClient) -> None:
     run(["board"], client)
     # Board pages the whole collection via list_kind_all (no silent truncation).

@@ -18,6 +18,8 @@ GET  /api/inquiries/<uuid>/cost?deep=true
 GET  /api/inquiries
 GET  /api/inquiries/next_issue
 GET  /api/inquiries/<uuid>/proves_belief
+GET  /api/inquiries/<uuid>/confidence
+GET  /api/inquiries/<uuid>/authority
 POST /api/inquiries/lookup
 ```
 

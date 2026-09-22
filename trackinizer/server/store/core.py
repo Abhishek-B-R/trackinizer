@@ -36,6 +36,7 @@ from trackinizer.server.schema_gen import (
     substitute_schema_placeholders,
 )
 from trackinizer.server.sql import schema_migrations
+from trackinizer.server.store.authority import _AuthorityMixin
 from trackinizer.server.store.cascade import _CascadeAuditMixin
 from trackinizer.server.store.edge import (
     _EdgeMixin,
@@ -429,6 +430,7 @@ def _is_transient_pglite_fault(err: BaseException) -> bool:
 class Store(
     _LifecycleMixin,
     _ReadMixin,
+    _AuthorityMixin,
     _ExportMixin,
     _MetricsMixin,
     _SessionMixin,

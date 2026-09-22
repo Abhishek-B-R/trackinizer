@@ -7,6 +7,19 @@ All notable trackinizer changes are documented here. This project follows
 
 ### Added
 
+- Derived belief confidence: `trax confidence KIND SEQ`, `GET
+  /api/inquiries/{id}/confidence`, and `Client.confidence_for` fold a
+  Belief/Experiment's currently-true `proves` citations into a log-odds sum and
+  map it through a logistic (`sigmoid(sum(citation_confidence * valence))`).
+  Neutral 0.5, symmetric, recursion into claimable citers, DAG one-pass.
+  Read-only: it never writes the stored row, so it can disagree with a human's
+  prior, which is the point.
+- Derived load-bearing authority: `trax authority KIND SEQ`, `GET
+  /api/inquiries/{id}/authority`, and `Client.authority_for` expose PageRank
+  over each citation-relation graph (`proves`, `favors`, `cited_by`, and the
+  union `issue` = `requires`/`narrows`), stored in four `inquiries` columns
+  (migration 025). A periodic background sweep recomputes them off the request
+  path, coalescing edge-change bursts.
 - `trax export` and `GET /api/export` write the whole graph as JSON lines:
   every inquiry, edge, and `change_log` row, experiment metrics, and
   agent-session records, read in one snapshot. The header names the applied

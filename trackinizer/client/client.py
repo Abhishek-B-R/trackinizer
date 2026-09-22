@@ -689,6 +689,39 @@ class Client:
             ),
         )
 
+    def confidence_for(self, target_id: uuid.UUID) -> float:
+        """Fetch the derived confidence of a Belief/Experiment.
+
+        Computed by the server from currently-true ``proves`` citations; never
+        the row's own stored value.
+
+        Args:
+          target_id: Belief or Experiment ID to score.
+
+        Returns:
+          confidence: Derived confidence in ``(0, 1)``; 0.5 is neutral.
+
+        """
+        where = f"/api/inquiries/{target_id}/confidence"
+        body = _require_mapping(self.get(where), where)
+        return cast(float, body["confidence"])
+
+    def authority_for(self, target_id: uuid.UUID) -> dict[str, float]:
+        """Fetch a row's derived load-bearing (PageRank) authority scores.
+
+        Computed by the periodic authority sweep. Only relations that reach the
+        row carry a score, so an uncited row returns an empty mapping.
+
+        Args:
+          target_id: Inquiry ID to read authority for.
+
+        Returns:
+          authority: ``column -> score`` for every relation that reaches the row.
+
+        """
+        where = f"/api/inquiries/{target_id}/authority"
+        return cast(dict[str, float], _require_mapping(self.get(where), where))
+
     # -- Writes.
 
     def submit(

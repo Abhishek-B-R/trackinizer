@@ -433,8 +433,9 @@ flags documented here.
 
 ```
 verb_name   ::= "help" | "profile" | "next" | "recent"
-             |  "cost" | "blocked" | "board" | "graph" | "id"
-             |  "version" | "export" | "send" | "run" | "search-sessions"
+             |  "cost" | "confidence" | "authority" | "blocked" | "board"
+             |  "graph" | "id" | "version" | "export" | "send" | "run"
+             |  "search-sessions"
 ```
 
 A leading token that is neither a verb nor a kind is a FILTER FIELD, and the
