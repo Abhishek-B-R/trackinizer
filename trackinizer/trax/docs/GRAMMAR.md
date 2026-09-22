@@ -434,7 +434,7 @@ flags documented here.
 ```
 verb_name   ::= "help" | "profile" | "next" | "recent"
              |  "cost" | "blocked" | "board" | "graph" | "id"
-             |  "version" | "send" | "run" | "search-sessions"
+             |  "version" | "export" | "send" | "run" | "search-sessions"
 ```
 
 A leading token that is neither a verb nor a kind is a FILTER FIELD, and the
@@ -464,6 +464,8 @@ kinds resolve first, so a field can never shadow a command.
 - `trax board [--width INT]` -- Issues grouped by status.
 - `trax graph [--open-only]` -- dependency tree.
 - `trax version` -- print the CLI version.
+- `trax export` -- write the whole graph as JSON lines to stdout, for
+  backup or a mirror (`trax export > graph.jsonl`). Read-only.
 - `trax search-sessions "QUERY" [--limit INT] [--no-semantic] [--format
   text|json]` -- search captured sessions by meaning (embeddings) and keyword
   (full text), RRF-merged. Semantic is on by default; the server degrades to

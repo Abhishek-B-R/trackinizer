@@ -37,6 +37,7 @@ from trackinizer.trax.verbs import (
     Blocked,
     Board,
     Cost,
+    Export,
     Graph,
     Id,
     Kind,
@@ -165,6 +166,7 @@ DISPATCHERS: tuple[type[Command], ...] = (
     Cost,
     Send,
     Version,
+    Export,
     Help,
     Profiles,
 )
