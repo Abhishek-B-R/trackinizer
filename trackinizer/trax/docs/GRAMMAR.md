@@ -434,7 +434,7 @@ flags documented here.
 ```
 verb_name   ::= "help" | "profile" | "next" | "recent"
              |  "cost" | "blocked" | "board" | "graph" | "id"
-             |  "version" | "export" | "send" | "run"
+             |  "version" | "export" | "send" | "run" | "search-sessions"
 ```
 
 A leading token that is neither a verb nor a kind is a FILTER FIELD, and the
@@ -448,8 +448,16 @@ kinds resolve first, so a field can never shadow a command.
 - `trax id <uuid> [--format table|json] [--changes]` -- show one row by its
   global id, with no leading kind (the UUID is unique, so the kind is
   redundant). Unlike `trax <kind> <uuid>` it applies no kind typo-guard.
-- `trax next [--format text|json|ids]` -- show the next unblocked
-  active Issue.
+- `trax next [--format text|json|ids]` -- preview the next unblocked
+  active Issue; reserves nothing.
+- `trax next owner to ACTOR [--as ACTOR]` -- select AND claim the next
+  unblocked, unowned active Issue in one atomic step. Concurrent callers
+  never receive the same Issue. Prints "(nothing claimable right now)" on
+  an empty queue -- not the same as "(no active issues)" from the preview
+  form, since a claim can miss due to a concurrent winner even when work
+  remains. Do not reconstruct this as `trax next` followed by a separate
+  `owner to` write on the result -- that reintroduces the race this form
+  exists to close.
 - `trax recent [--limit INT] [--format text|json]` -- audit-log feed.
 - `trax cost KIND SEQ [--deep] [--format text|json]` -- cost rollup.
 - `trax blocked` -- active Issues with at least one active blocker.
@@ -458,6 +466,12 @@ kinds resolve first, so a field can never shadow a command.
 - `trax version` -- print the CLI version.
 - `trax export` -- write the whole graph as JSON lines to stdout, for
   backup or a mirror (`trax export > graph.jsonl`). Read-only.
+- `trax search-sessions "QUERY" [--limit INT] [--no-semantic] [--format
+  text|json]` -- search captured sessions by meaning (embeddings) and keyword
+  (full text), RRF-merged. Semantic is on by default; the server degrades to
+  full-text-only when no session embedder is configured. `--no-semantic` opts
+  out. (Named `search-sessions`, not `search`: the bare `search` verb was
+  retired when the filter grammar subsumed inquiry search.)
 - `trax send @actor[:room] TEXT...` -- inject a message into a live agent
   session addressed by its routing name (its `run --as` owner).
 - `trax run claude|gemini|codex [--out FILE] [--verbose] [--dry-run]
@@ -902,6 +916,14 @@ trax issue title re retry --limit 10
 
 ```trax
 trax recent --limit 20
+```
+
+```trax
+trax search-sessions "advisory lock deadlock"
+```
+
+```trax
+trax search-sessions "retry backoff" --limit 5 --no-semantic
 ```
 
 ```trax

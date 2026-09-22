@@ -258,7 +258,7 @@ class Client:
         """Send a DELETE request."""
         return self._request("DELETE", path, body=body)
 
-    # -- Reference resolution ------------------------------------------------
+    # -- Reference resolution.
 
     def resolve_id(self, ref: Ref) -> tuple[Inquiry.InquiryKind, uuid.UUID]:
         """Resolve a ref to ``(kind, uuid)``.
@@ -336,7 +336,7 @@ class Client:
             out.append((kind, ref.uuid))
         return out
 
-    # -- Reads --------------------------------------------------------------
+    # -- Reads.
 
     def list_kind(
         self,
@@ -481,6 +481,48 @@ class Client:
             return None
         return dict(_require_mapping(payload, where))
 
+    def claim_next_issue(
+        self,
+        *,
+        owner: Inquiry.Actor,
+        actor: Inquiry.Actor | None = None,
+        reason: str = "",
+    ) -> dict[str, JSONValue] | None:
+        """Atomically claim the next available Issue for ``owner``.
+
+        ONE request, deliberately -- never :meth:`next_issue` followed by an
+        owner write. The server selects and claims in a single statement, so
+        concurrent callers receive different issues instead of all receiving
+        the first one and silently overwriting each other's claim.
+
+        ``None`` means nothing is claimable right now, not that all work is
+        finished: an eligible issue may simply be locked by another in-flight
+        claim, and a later call may succeed.
+
+        The ``Idempotency-Key`` on this POST is reused across transport
+        retries, so a retry whose first attempt already committed replays that
+        same issue instead of consuming a second one.
+
+        Args:
+          owner: Identity to record as the Issue's new owner.
+          actor: Audit actor; ``None`` defaults to the authenticated principal.
+          reason: Optional audit context, stored on the change log entry.
+
+        Returns:
+          result: The claimed Issue's fields, or None if nothing was available.
+
+        """
+        where = "/api/inquiries/next_issue"
+        body: dict[str, object] = {"owner": owner}
+        if actor is not None:
+            body["actor"] = actor
+        if reason:
+            body["reason"] = reason
+        payload = self.post(where, body=body)
+        if payload is None:
+            return None
+        return dict(_require_mapping(payload, where))
+
     def version(self) -> str:
         """Return the server's build SHA, for stale-deploy detection.
 
@@ -591,6 +633,42 @@ class Client:
             )
         ]
 
+    def search_sessions(
+        self,
+        query: str,
+        *,
+        semantic: bool = True,
+        limit: int = 20,
+    ) -> dict[str, JSONValue]:
+        """Search captured sessions: embeddings + full text, RRF-merged.
+
+        Args:
+          query: The search query text.
+          semantic: Request the embedding arm; the server degrades to
+            full-text-only when no session embedder is configured.
+          limit: Maximum merged hits.
+
+        Returns:
+          body: ``{"hits": [...], "semantic": bool, "degraded": bool}`` -- each
+            hit carries its ``session_id``/``part``/``idx`` position, title,
+            score, source, and snippet.
+
+        """
+        where = "/api/web/search_sessions"
+        return dict(
+            _require_mapping(
+                self.get(
+                    where,
+                    params={
+                        "q": query,
+                        "semantic": "true" if semantic else "false",
+                        "limit": limit,
+                    },
+                ),
+                where,
+            ),
+        )
+
     def cost_for(self, target_id: uuid.UUID, *, deep: bool = False) -> dict[str, float]:
         """Fetch cost breakdown by field name; optionally include related rows.
 
@@ -611,7 +689,7 @@ class Client:
             ),
         )
 
-    # -- Writes -------------------------------------------------------------
+    # -- Writes.
 
     def submit(
         self,
@@ -645,6 +723,7 @@ class Client:
         items: Sequence[tuple[Inquiry.InquiryKind, Mapping[str, object]]],
         *,
         edges: Sequence[Mapping[str, object]] = (),
+        actor: Inquiry.Actor | None = None,
     ) -> list[uuid.UUID]:
         """Create many inquiries and their edges in one atomic request.
 
@@ -657,6 +736,8 @@ class Client:
         Args:
           items: (kind, body) tuples; idempotency_key auto-minted if missing.
           edges: Edge definitions referencing item indices by name.
+          actor: Audit actor for items that do not name their own. Omit to
+            let the server default to the authenticated principal's email.
 
         Returns:
           result: Server-minted UUIDs in item order.
@@ -680,11 +761,13 @@ class Client:
                 payload["idempotency_key"] = str(uuid.uuid4())
             item_bodies.append(payload)
         where = "/api/inquiries/batch"
-        response = self._request(
-            "POST",
-            where,
-            body={"items": item_bodies, "edges": list(edges)},
-        )
+        batch_body: dict[str, object] = {
+            "items": item_bodies,
+            "edges": list(edges),
+        }
+        if actor is not None:
+            batch_body["actor"] = actor
+        response = self._request("POST", where, body=batch_body)
         return [
             _require_uuid(rid, where)
             for rid in _require_list(_require_field(response, "ids", where), where)

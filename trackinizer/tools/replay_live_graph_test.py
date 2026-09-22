@@ -34,8 +34,9 @@ class _FailingInsertClient(Client):
         items: Sequence[tuple[Inquiry.InquiryKind, Mapping[str, object]]],
         *,
         edges: Sequence[Mapping[str, object]] = (),
+        actor: Inquiry.Actor | None = None,
     ) -> list[uuid.UUID]:
-        del items, edges
+        del items, edges, actor
         raise ClientError("POST /api/inquiries/batch failed: [Errno 61]")
 
     @override

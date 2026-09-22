@@ -17,6 +17,7 @@ from trackinizer.types.edges import EDGE_POLICIES
 
 
 __all__ = [
+    "CLAIM_NEXT_ISSUE_SQL",
     "COST_SUBTREE_SQL",
     "NEXT_ISSUE_SQL",
     "PROVES_BELIEF_SQL",
@@ -65,9 +66,21 @@ def _policy_exclude_clauses(
     return " ".join(clauses)
 
 
-NEXT_ISSUE_SQL: Final[str] = vetted_sql(
-    "SELECT issue.* FROM inquiries issue "
-    "WHERE issue.kind = 'Issue' AND issue.status = 'active' "
+# One predicate, two readers: the read-only preview (``NEXT_ISSUE_SQL``) and the
+# atomic acquisition (``CLAIM_NEXT_ISSUE_SQL``) must agree on what "available"
+# means, or an agent can be shown work it then cannot claim.
+#
+# ``owner IS NULL`` is what makes the queue a queue: ``trax/SKILL.md`` defines an
+# active row with no owner as open and one with an owner as in progress, but the
+# scheduler used to ignore ownership entirely and hand the same issue to every
+# caller.
+#
+# A prerequisite blocks only while it is ``active``. Terminal is not the same as
+# complete -- ``abandoned`` and ``invalid`` also unblock -- so this deliberately
+# tests ``status = 'active'`` rather than ``status = 'complete'``.
+_ELIGIBLE_ISSUE_PREDICATE: Final[str] = vetted_sql(
+    "issue.kind = 'Issue' AND issue.status = 'active' "
+    "  AND issue.owner IS NULL "
     "  AND NOT EXISTS ("
     # ``requires`` is stored requirer -> prerequisite, so an issue with an
     # active prerequisite (its to-side) is not yet schedulable.
@@ -78,13 +91,49 @@ NEXT_ISSUE_SQL: Final[str] = vetted_sql(
     "      AND prerequisite.status = 'active'"
     "  ) ",
     _policy_exclude_clauses(subject_alias="issue.id", policy_attr="skips_scheduler_on"),
-    " ORDER BY issue.issue_priority, issue.created LIMIT 1",
 )
-"""Next active Issue whose prerequisites are terminal and which no
-:data:`EdgeKindPolicy` excludes from the scheduler.
+"""What makes an Issue available to work on. Shared by preview and acquisition."""
 
-Built from the policy registry: any edge kind with
-``skips_scheduler_on`` contributes a ``NOT EXISTS`` clause here.
+# Lowest ``issue_priority`` first, then oldest. A NULL priority sorts last under
+# Postgres' default ASC NULL ordering, which keeps unprioritised work behind
+# anything explicitly ranked.
+_ELIGIBLE_ISSUE_ORDER: Final[str] = " ORDER BY issue.issue_priority, issue.created "
+
+
+NEXT_ISSUE_SQL: Final[str] = vetted_sql(
+    "SELECT issue.* FROM inquiries issue WHERE ",
+    _ELIGIBLE_ISSUE_PREDICATE,
+    _ELIGIBLE_ISSUE_ORDER,
+    " LIMIT 1",
+)
+"""Preview the next available Issue WITHOUT reserving it.
+
+Read-only: two callers racing this both see the same row, which is why
+acquisition goes through :data:`CLAIM_NEXT_ISSUE_SQL` instead.
+"""
+
+
+CLAIM_NEXT_ISSUE_SQL: Final[str] = vetted_sql(
+    # Select and claim in ONE statement. Splitting it into a read followed by an
+    # owner write leaves a window -- seconds wide, with an agent deciding in
+    # between -- where every caller sees the same unowned row and each overwrites
+    # the last, so N agents duplicate one issue while the rest go untouched.
+    #
+    # ``SKIP LOCKED`` is what makes concurrent callers diverge rather than
+    # collide: a row another transaction has locked is passed over, so the second
+    # caller takes the next eligible issue instead of contending for this one.
+    # ``OF issue`` scopes the lock to the inquiries row being claimed.
+    "UPDATE inquiries SET owner = $1 WHERE id = ("
+    "  SELECT issue.id FROM inquiries issue WHERE ",
+    _ELIGIBLE_ISSUE_PREDICATE,
+    _ELIGIBLE_ISSUE_ORDER,
+    "  LIMIT 1 FOR UPDATE OF issue SKIP LOCKED) RETURNING *",
+)
+"""Atomically select and claim one available Issue for ``$1``.
+
+Returns the claimed row, or no row when nothing is available -- which means
+"nothing claimable right now", not "all work is finished": eligible rows may
+simply be locked by another in-flight claim.
 """
 
 
