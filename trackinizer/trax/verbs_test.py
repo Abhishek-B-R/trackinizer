@@ -10,7 +10,7 @@ import pytest
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.custom_json import IntCodec
+from trackinizer.lib.custom_json import DictCodec, IntCodec, loads
 from trackinizer.trax import verbs
 from trackinizer.trax.conftest import FakeClient, run
 from trackinizer.trax.grammar import (
@@ -1120,14 +1120,48 @@ def test_session_creates_row(
     assert "created:" in capsys.readouterr().out
 
 
-def test_kind_create_owner_defaults_to_caller(
+def test_kind_create_leaves_owner_unset_so_the_row_is_claimable(
     client: FakeClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Creating work must not assign it, or nothing is ever available.
+
+    ``types/inquiries.py`` specifies owner is "never auto-stamped from the
+    submitter or audit ``actor``". Stamping it made every row born
+    in-progress, so the ``owner IS NULL`` predicate behind ``trax next``
+    matched nothing and no agent could ever claim work.
+    """
     monkeypatch.setenv("USER", "doe")
     run(["issue", "title", "to", "Hi"], client)
     body = _batch_items(client)[0][1]
-    assert body["owner"] == "doe"
+    assert "owner" not in body
+
+
+def test_kind_create_still_honors_an_explicit_owner(
+    client: FakeClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Assigning at creation stays supported; only the implicit default went."""
+    monkeypatch.setenv("USER", "doe")
+    run(["issue", "title", "to", "Hi", "owner", "to", "worker-1"], client)
+    body = _batch_items(client)[0][1]
+    assert body["owner"] == "worker-1"
+
+
+def test_kind_create_sends_the_audit_actor_at_batch_level(
+    client: FakeClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--as`` must still reach the created row's audit.
+
+    The batch route otherwise records the authenticated principal's email, so
+    dropping the owner stamp would have lost the CLI actor on creates
+    entirely -- it reached edits but never creation.
+    """
+    monkeypatch.setenv("USER", "doe")
+    run(["issue", "title", "to", "Hi", "--as", "dhanya"], client)
+    batch = next(c for c in client.calls if c[0] == "submit_batch")
+    assert batch[2]["actor"] == "dhanya"
 
 
 def test_kind_create_reads_stdin_value(
@@ -1335,9 +1369,10 @@ def test_create_inline_cost_lands_on_the_inline_node_not_root(
         items: object,
         *,
         edges: object = (),
+        actor: str | None = None,
     ) -> list[uuid.UUID]:
         del self
-        del edges
+        del edges, actor
         # Deterministic ids: item 0 = root belief, item 1 = inline websearch.
         return [root_id, websearch_id][: len(cast(list[object], items))]
 
@@ -1976,6 +2011,19 @@ def test_version_prints_server_sha(
     assert "testsha" in capsys.readouterr().out
 
 
+def test_export_writes_each_line_to_stdout(
+    client: FakeClient,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run(["export"], client)
+
+    assert [c[0] for c in client.calls] == ["export"]
+    assert capsys.readouterr().out == (
+        '{"format":"trackinizer-export","version":1,"migrations":[]}\n'
+        '{"table":"inquiries","row":{"title":"canned"}}\n'
+    )
+
+
 def test_kindless_filter_queries_every_kind(client: FakeClient) -> None:
     """A leading filter field lists across every kind.
 
@@ -2072,6 +2120,62 @@ def test_whole_collection_views_never_exceed_server_cap(client: FakeClient) -> N
         for call in (c for c in client.calls if c[0] == "list_kind"):
             kwargs = call[-1]
             assert IntCodec.coerce(kwargs["limit"], 0) <= MAX_LIST_LIMIT, verb
+
+
+def test_search_dispatches_semantic_by_default(client: FakeClient) -> None:
+    run(["search-sessions", "advisory lock"], client)
+    calls = [c for c in client.calls if c[0] == "search_sessions"]
+    assert calls
+    query, kwargs = calls[0][1][0], calls[0][2]
+    assert query == "advisory lock"
+    assert kwargs["semantic"] is True
+    assert kwargs["limit"] == 20
+
+
+def test_search_no_semantic_flag_opts_out(client: FakeClient) -> None:
+    run(["search-sessions", "lock", "--no-semantic"], client)
+    calls = [c for c in client.calls if c[0] == "search_sessions"]
+    assert calls
+    assert calls[0][2]["semantic"] is False
+
+
+def test_search_limit_is_passed_through(client: FakeClient) -> None:
+    run(["search-sessions", "lock", "--limit", "5"], client)
+    calls = [c for c in client.calls if c[0] == "search_sessions"]
+    assert calls
+    assert calls[0][2]["limit"] == 5
+
+
+def test_search_text_output_shows_hit_and_position(
+    client: FakeClient,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run(["search-sessions", "advisory lock"], client)
+    out = capsys.readouterr().out
+    assert "deploy log" in out  # The hit's session title.
+    assert "#0/3" in out  # part/idx position the console opens at.
+    assert "advisory lock acquired" in out  # The snippet.
+
+
+def test_search_text_output_flags_degradation(
+    client: FakeClient,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client.session_hits = {"hits": [], "semantic": False, "degraded": True}
+    run(["search-sessions", "lock"], client)
+    out = capsys.readouterr().out
+    assert "semantic search unavailable" in out
+
+
+def test_search_json_output_is_the_raw_body(
+    client: FakeClient,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run(["search-sessions", "lock", "--format", "json"], client)
+    out = capsys.readouterr().out
+    body = DictCodec.coerce(loads(out))
+    assert "hits" in body
+    assert body["semantic"] is True
 
 
 # Folded in from former crasher_test.py.

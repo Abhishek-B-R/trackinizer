@@ -58,12 +58,14 @@ from trackinizer.wire.routes import (
     inquiry_field_path,
 )
 from trackinizer.wire.seq_ranges import SeqRange, format_interval
+from trackinizer.wire.wire_export import EXPORT_API_PATH
 
 
 logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from types import TracebackType
 
     import pydantic
@@ -256,7 +258,7 @@ class Client:
         """Send a DELETE request."""
         return self._request("DELETE", path, body=body)
 
-    # -- Reference resolution ------------------------------------------------
+    # -- Reference resolution.
 
     def resolve_id(self, ref: Ref) -> tuple[Inquiry.InquiryKind, uuid.UUID]:
         """Resolve a ref to ``(kind, uuid)``.
@@ -334,7 +336,7 @@ class Client:
             out.append((kind, ref.uuid))
         return out
 
-    # -- Reads --------------------------------------------------------------
+    # -- Reads.
 
     def list_kind(
         self,
@@ -479,6 +481,48 @@ class Client:
             return None
         return dict(_require_mapping(payload, where))
 
+    def claim_next_issue(
+        self,
+        *,
+        owner: Inquiry.Actor,
+        actor: Inquiry.Actor | None = None,
+        reason: str = "",
+    ) -> dict[str, JSONValue] | None:
+        """Atomically claim the next available Issue for ``owner``.
+
+        ONE request, deliberately -- never :meth:`next_issue` followed by an
+        owner write. The server selects and claims in a single statement, so
+        concurrent callers receive different issues instead of all receiving
+        the first one and silently overwriting each other's claim.
+
+        ``None`` means nothing is claimable right now, not that all work is
+        finished: an eligible issue may simply be locked by another in-flight
+        claim, and a later call may succeed.
+
+        The ``Idempotency-Key`` on this POST is reused across transport
+        retries, so a retry whose first attempt already committed replays that
+        same issue instead of consuming a second one.
+
+        Args:
+          owner: Identity to record as the Issue's new owner.
+          actor: Audit actor; ``None`` defaults to the authenticated principal.
+          reason: Optional audit context, stored on the change log entry.
+
+        Returns:
+          result: The claimed Issue's fields, or None if nothing was available.
+
+        """
+        where = "/api/inquiries/next_issue"
+        body: dict[str, object] = {"owner": owner}
+        if actor is not None:
+            body["actor"] = actor
+        if reason:
+            body["reason"] = reason
+        payload = self.post(where, body=body)
+        if payload is None:
+            return None
+        return dict(_require_mapping(payload, where))
+
     def version(self) -> str:
         """Return the server's build SHA, for stale-deploy detection.
 
@@ -497,6 +541,30 @@ class Client:
         if not isinstance(payload, dict) or "sha" not in payload:
             raise ClientError(f"/api/version returned a malformed payload: {payload!r}")
         return str(payload["sha"])
+
+    def export(self) -> Iterator[str]:
+        """Stream the logical export (``wire.wire_export``), one line at a time.
+
+        Lines are yielded as they arrive, so a large graph is never held
+        whole. Not retried, unlike :meth:`_request`: a failure part-way would
+        restart the stream and hand the caller its first lines twice.
+
+        Yields:
+          line: One JSON object, without its trailing newline.
+
+        """
+        try:
+            with self._http.stream("GET", EXPORT_API_PATH) as response:
+                if response.status_code >= 400:
+                    _ = response.read()
+                    raise ClientError(
+                        f"GET {EXPORT_API_PATH} -> {response.status_code}: "
+                        f"{_truncate(response.text)}",
+                        status_code=response.status_code,
+                    )
+                yield from (line for line in response.iter_lines() if line)
+        except httpx2.TransportError as err:
+            raise ClientError(f"GET {EXPORT_API_PATH} failed: {err}") from err
 
     def wait_until_ready(
         self,
@@ -565,6 +633,42 @@ class Client:
             )
         ]
 
+    def search_sessions(
+        self,
+        query: str,
+        *,
+        semantic: bool = True,
+        limit: int = 20,
+    ) -> dict[str, JSONValue]:
+        """Search captured sessions: embeddings + full text, RRF-merged.
+
+        Args:
+          query: The search query text.
+          semantic: Request the embedding arm; the server degrades to
+            full-text-only when no session embedder is configured.
+          limit: Maximum merged hits.
+
+        Returns:
+          body: ``{"hits": [...], "semantic": bool, "degraded": bool}`` -- each
+            hit carries its ``session_id``/``part``/``idx`` position, title,
+            score, source, and snippet.
+
+        """
+        where = "/api/web/search_sessions"
+        return dict(
+            _require_mapping(
+                self.get(
+                    where,
+                    params={
+                        "q": query,
+                        "semantic": "true" if semantic else "false",
+                        "limit": limit,
+                    },
+                ),
+                where,
+            ),
+        )
+
     def cost_for(self, target_id: uuid.UUID, *, deep: bool = False) -> dict[str, float]:
         """Fetch cost breakdown by field name; optionally include related rows.
 
@@ -585,7 +689,7 @@ class Client:
             ),
         )
 
-    # -- Writes -------------------------------------------------------------
+    # -- Writes.
 
     def submit(
         self,
@@ -619,6 +723,7 @@ class Client:
         items: Sequence[tuple[Inquiry.InquiryKind, Mapping[str, object]]],
         *,
         edges: Sequence[Mapping[str, object]] = (),
+        actor: Inquiry.Actor | None = None,
     ) -> list[uuid.UUID]:
         """Create many inquiries and their edges in one atomic request.
 
@@ -631,6 +736,8 @@ class Client:
         Args:
           items: (kind, body) tuples; idempotency_key auto-minted if missing.
           edges: Edge definitions referencing item indices by name.
+          actor: Audit actor for items that do not name their own. Omit to
+            let the server default to the authenticated principal's email.
 
         Returns:
           result: Server-minted UUIDs in item order.
@@ -654,11 +761,13 @@ class Client:
                 payload["idempotency_key"] = str(uuid.uuid4())
             item_bodies.append(payload)
         where = "/api/inquiries/batch"
-        response = self._request(
-            "POST",
-            where,
-            body={"items": item_bodies, "edges": list(edges)},
-        )
+        batch_body: dict[str, object] = {
+            "items": item_bodies,
+            "edges": list(edges),
+        }
+        if actor is not None:
+            batch_body["actor"] = actor
+        response = self._request("POST", where, body=batch_body)
         return [
             _require_uuid(rid, where)
             for rid in _require_list(_require_field(response, "ids", where), where)
