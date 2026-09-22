@@ -328,8 +328,18 @@ async def test_real_model_embeds_meaningfully() -> None:
         # (~3 sig figs). halfvec(1024) storage is itself fp16, so this is the
         # real precision the column keeps -- not a looser bar to pass.
         assert abs(norm - 1.0) < 5e-3
-    # Deterministic across calls (same dtype, same math).
-    assert max(abs(a - b) for a, b in zip(vectors[0], again, strict=True)) < 1e-4
+    # Determinism is bit-exact for an IDENTICAL call: same text, same batch
+    # shape, same call reproduces the vector exactly. It is NOT asserted across
+    # batch shapes: ``embed([cat_a])`` left-pads cat_a to its own length while
+    # ``embed_batch([cat_a, cat_b, finance])`` pads it to the longest of three,
+    # so cat_a's tokens sit at different positions over a different sequence
+    # length. In bf16 the fused attention kernel then accumulates in a
+    # host-dependent order, so the two shapes agree only to bf16 precision on
+    # some CPUs and diverge (~2e-3) on others -- a false invariant that failed
+    # on a host CI never minted against. The real, portable guarantee is
+    # same-shape reproducibility.
+    repeat = await embedder.embed(cat_a)
+    assert repeat == again
 
     def cosine(a: list[float], b: list[float]) -> float:
         return sum(x * y for x, y in zip(a, b, strict=True))
