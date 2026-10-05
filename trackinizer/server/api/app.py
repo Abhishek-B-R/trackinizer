@@ -19,10 +19,11 @@ from fastapi.responses import JSONResponse
 from starlette.types import Send
 
 import asyncpg
+import fastjsonschema
 
 from trackinizer.addons.addon import ServerContext
 from trackinizer.addons.deployment import Deployment, supervise
-from trackinizer.lib.custom_json import IntCodec, SchemaError
+from trackinizer.lib.custom_json import convert
 from trackinizer.server.api import (
     addons_routes,
     admin_routes,
@@ -30,9 +31,9 @@ from trackinizer.server.api import (
     edge,
     edit,
     export_routes,
+    logout_routes,
     meta_routes,
     metrics_routes,
-    oauth_routes,
     preset_routes,
     query,
     reports_routes,
@@ -54,6 +55,7 @@ from trackinizer.server.config import (
 )
 from trackinizer.server.embedders import registry
 from trackinizer.server.inbound import InboundQueue
+from trackinizer.server.session_reaper import session_reaper_loop
 from trackinizer.server.store.core import Store
 from trackinizer.server.subscriber import push_changes_to_live_subscribers
 from trackinizer.server.visuals.catalog import default_workspace
@@ -147,9 +149,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         # Process-local routing buffer for inbound (world -> session) messages;
         # separate from event capture. The sessions routes read it off state.
         app.state.inbound = InboundQueue()
-        # Keep the resolved config on app.state so OAuth routes and the
-        # session-cookie path in current_user can read the signing secret
-        # and Google client credentials. main() mounts the SPA separately.
+        # Keep the resolved config on app.state so the session-cookie path in
+        # current_user, and any sign-in routes, can read the signing secret.
+        # main() mounts the SPA separately.
         app.state.config = config
         await app.state.store.bootstrap()
         if config.auth_disabled:
@@ -172,6 +174,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         # Authority sweep: recomputes the derived load-bearing (PageRank)
         # columns off the request path, coalescing edge-change bursts.
         authority_task = asyncio.create_task(authority_sweep_loop(app.state.store))
+        # Session reaper: closes sessions whose run went silent (killed, host
+        # crashed), so a dead agent stops showing as live.
+        reaper_task = asyncio.create_task(
+            session_reaper_loop(app.state.store, inbound=app.state.inbound),
+        )
         addon_tasks = _start_addon_services(
             deployment_of(app),
             context=ServerContext(store=app.state.store, inbound=app.state.inbound),
@@ -189,6 +196,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             authority_task.cancel()
             with suppress(asyncio.CancelledError):
                 await authority_task
+            reaper_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await reaper_task
             if warm_task is not None:
                 warm_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -271,9 +281,9 @@ ROUTERS: Final = (
     edge.router,
     edit.router,
     export_routes.router,
+    logout_routes.router,
     meta_routes.router,
     metrics_routes.router,
-    oauth_routes.router,
     preset_routes.router,
     query.router,
     reports_routes.router,
@@ -342,7 +352,7 @@ class _RequestLogSpan:
 
     async def send(self, message: Message) -> None:
         if message["type"] == "http.response.start":
-            self.status_code = IntCodec.coerce(cast(object, message["status"]))
+            self.status_code = convert(cast(object, message["status"]), int)
             self.response_start_sec = time.perf_counter() - self.started
             headers = list(cast(list[tuple[bytes, bytes]], message.get("headers", [])))
             headers = [
@@ -442,18 +452,19 @@ async def validation_handler(request: Request, exc: ValidationError) -> JSONResp
     )
 
 
-@app.exception_handler(SchemaError)
-async def schema_handler(request: Request, exc: SchemaError) -> JSONResponse:
-    """Translate a codec ``SchemaError`` into HTTP 422.
+@app.exception_handler(fastjsonschema.JsonSchemaValueException)
+async def schema_handler(
+    request: Request,
+    exc: fastjsonschema.JsonSchemaValueException,
+) -> JSONResponse:
+    """Translate a ``fastjsonschema`` validation error into HTTP 422.
 
-    A stray key in a client-supplied record ``payload`` reaches the codec
-    through ``RecordBody``'s decode on the append-records path. It is a
-    malformed request, not a server fault, but the codec raises a
-    ``ValueError`` -- which matched no handler and so surfaced as a 500.
+    A schema mismatch in a client-supplied record ``payload`` is a malformed
+    request, not a server fault, so it must surface as 422 rather than 500.
 
     Args:
       request: FastAPI Request object (unused).
-      exc: SchemaError from codec validation.
+      exc: A fastjsonschema validation error.
 
     Returns:
       response: JSON response with 422 status, detail, and code='schema'.

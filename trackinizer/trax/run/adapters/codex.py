@@ -21,7 +21,7 @@ import os
 import re
 
 from trackinizer.lib.agent.sessions import codex
-from trackinizer.lib.custom_json import StrCodec
+from trackinizer.lib.custom_json import convert
 from trackinizer.trax.run.adapters.tail import Tail
 
 
@@ -47,6 +47,7 @@ class CodexAdapter:
     name: str = "codex"
     cli_binary: str = "codex"
     whole_file: bool = False
+    parent_session_env: frozenset[str] = frozenset[str]()
 
     @property
     def _sessions_dir(self) -> Path:
@@ -103,7 +104,7 @@ class CodexAdapter:
         # Typeshed types a match group ``str | Any`` -- a group may be optional
         # in general. This one is not: it is unconditional in the pattern, so
         # the match cannot succeed without it.
-        return StrCodec.coerce(found["session_id"])
+        return convert(found["session_id"], str)
 
     def reader(self) -> Tail:
         """Return a fresh IR reader for one codex rollout file."""

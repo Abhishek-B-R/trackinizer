@@ -3,7 +3,7 @@
 
 [project]
 name = "trackinizer"
-version = "0.1.4"
+version = "0.1.5"
 description = "Centralized agent database for Inquiries (Issues + Artifacts)."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -28,6 +28,7 @@ dependencies = [
     "py-pglite[asyncpg,extensions]>=0.5.3",
     # web server / api
     "fastapi>=0.123.9",
+    "fastjsonschema>=2.22.2",
     "starlette>=0.40",
     "uvicorn>=0.30.0",
     # http client
@@ -36,6 +37,7 @@ dependencies = [
     "itsdangerous>=2.2.0",
     # data models
     "configgle>=1.4.0",
+    "msgspec>=0.22.0",
     "pydantic>=2.0",
     # trax grammar
     "lark>=1.1",
@@ -147,10 +149,31 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["trackinizer"]
-exclude = ["**/*_test.py", "**/conftest.py"]
+# The web app ships built, not as source: `npm run build` in trackinizer/web runs
+# before `uv build` (package validation and the publish workflow), and the server
+# serves this copy at /app/ by default; the sdist carries both. An artifact,
+# not a force-include: hatch applies a force-include to the editable install too,
+# so `uv sync` would fail in every checkout that has not built the app yet.
+# Package validation checks that the wheel carries it.
+exclude = ["**/*_test.py", "**/conftest.py", "trackinizer/web/**"]
+artifacts = ["trackinizer/web/dist/**"]
 
 [tool.hatch.build.targets.sdist]
-exclude = [".github/**", ".codespell-ignore"]
+# `uv build` builds the wheel from the sdist, so the sdist must carry the built
+# app too, as an artifact, since the root .gitignore ignores every dist/. Hatch
+# reads that root file only, never web/.gitignore, so the web app's other local
+# output is excluded here: left in, the staged Node's absolute `node` symlink
+# fails the wheel build from the sdist.
+exclude = [
+    ".github/**",
+    ".codespell-ignore",
+    "trackinizer/web/node_modules",
+    "trackinizer/web/.node-bin*",
+    "trackinizer/web/dist-*",
+    "trackinizer/web/test-results",
+    "trackinizer/web/playwright-report",
+]
+artifacts = ["trackinizer/web/dist/**"]
 
 [tool.pytest.ini_options]
 python_files = ["*_test.py", "test_*.py"]
@@ -161,7 +184,6 @@ markers = [
     "cuda: tests that require a real CUDA device (skipped in hosted CI)",
     "integration: tests that require networking or external deps (deselected by default)",
     "performance: timing-sensitive tests (deselected by default)",
-    "real_llm: integration tests that spawn a live LLM CLI (claude/codex); skipped unless RUN_REAL_LLM=1 is set",
     "slow: expensive local correctness test (JIT, training, full fixtures, git, bash, or a fresh interpreter); excluded from the fast unit tier and run by the pre-push slow gate",
     # Actual annotations.
     "bench_compile_time: asserts a compile-time budget or comparison",
@@ -172,8 +194,7 @@ markers = [
     "browser_chrome: drives a local Chrome/Chromium browser",
     "browser_zendriver: drives the zendriver browser backend",
     "cli_bash: shells out to bash",
-    "cli_claude: shells out to the Claude CLI; skipped unless RUN_REAL_LLM=1",
-    "cli_codex: shells out to the Codex CLI; skipped unless RUN_REAL_LLM=1",
+    "cli_real_llm: spawns a live LLM CLI (claude, codex); skipped unless RUN_REAL_LLM=1",
     "cli_docker: shells out to Docker",
     "cli_git: shells out to git or requires a real git repository",
     "cli_node: shells out to node/npm tooling",
@@ -316,8 +337,10 @@ extend-safe-fixes = [
     "F841",   # Remove unused local bindings.
     "PT006",  # Use tuple for pytest.mark.parametrize names.
     "PT007",  # Use tuple/list consistently for pytest values.
+    "PT018",  # Split composite assertions.
     "PYI034", # Annotate __enter__/__new__/__iadd__ returns as Self.
     "RET504", # Remove unnecessary local assignment directly before return.
+    "RUF007", # Prefer `itertools.pairwise()` over `zip()` when iterating over successive pairs.
     "SIM102", # Collapse nested if statements.
     "SIM105", # Use contextlib.suppress instead of try-except-pass.
     "TC",     # Type-checking import and annotation rewrites.
@@ -565,6 +588,12 @@ useLibraryCodeForTypes = false
 # `stubPath` (not `extraPaths`) is the one root that resolves ahead of an
 # installed package's inline types.
 stubPath = "typings"
+# typings/ is ALSO a source root so a stub package can ship a placeholder .py:
+# triton is linux-only (uv.lock `sys_platform == 'linux'`), so without this
+# every `import triton` fails `reportMissingModuleSource` on macOS, and an inline
+# suppression would fail `reportUnnecessaryTypeIgnoreComment` on linux. Stubs
+# still win over source, so no type changes. Mirrors [tool.ty.environment].
+extraPaths = ["typings"]
 # `rekursiv-ai-typeshed` (a `typecheck` dependency): the checkers' bundled stdlib
 # with `int`/`float` `__pow__` returning `float` rather than typeshed's `Any`,
 # which would otherwise make every `x ** 0.5` a `reportAny` violation.

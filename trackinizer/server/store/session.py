@@ -10,8 +10,8 @@ edit machinery is reused through the composed :class:`Store`.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
-from typing import TYPE_CHECKING, cast
+from datetime import datetime, timedelta
+from typing import TYPE_CHECKING, Final, cast
 from uuid import UUID
 
 
@@ -25,23 +25,20 @@ else:
 
     asyncpg = lazy_import("asyncpg")  # ~60 ms; only start_session() needs it.
 
-from trackinizer.lib.custom_json import (
-    DictCodec,
-    IntCodec,
-    JSONValue,
-    ListCodec,
-    StrCodec,
-    json_freeze,
-    loads,
-)
+from trackinizer.lib.custom_json import JSONValue, convert, json_freeze, loads_untagged
 from trackinizer.server.notify import notify_after_commit, tx
 from trackinizer.server.store.change_id_slot import (
     _peek_client_change_id,
     set_client_change_id,
 )
 from trackinizer.server.store.edit import _EditMixin
+from trackinizer.server.store.session_feed import (
+    CONVERSATION,
+    WHOLE_FEED,
+    FeedScope,
+)
 from trackinizer.server.store.submit import _SubmitMixin
-from trackinizer.server.values import manifest_bound, vetted_sql
+from trackinizer.server.values import vetted_sql
 from trackinizer.types.change_log import Snapshot
 from trackinizer.types.errors import ConflictError, NotFoundError
 from trackinizer.types.inquiries import Inquiry
@@ -51,6 +48,28 @@ from trackinizer.wire.wire_sessions import FeedEvent
 __all__ = [
     "_SessionMixin",
 ]
+
+
+_LOCK_SESSION_SQL: Final = (
+    "SELECT kind, status, agentsession_ended, agentsession_cli_session_id "
+    "FROM inquiries WHERE id = $1 FOR UPDATE"
+)
+"""Lock a session's row for a lifecycle move, reading what each move checks."""
+
+_SEEN_WRITE_EVERY: Final = timedelta(minutes=1)
+"""How stale a session's ``last_seen`` must be before a sign of life rewrites it."""
+
+# ``$3`` is the newest ``last_seen`` still worth rewriting. A poll starts watching a
+# session; any other sign of life only refreshes a session already watched.
+_SEEN_SQL: Final = (
+    "INSERT INTO session_liveness (session_id, last_seen) VALUES ($1, $2) "
+    "ON CONFLICT (session_id) DO UPDATE SET last_seen = EXCLUDED.last_seen "
+    "WHERE session_liveness.last_seen < $3"
+)
+_SEEN_AGAIN_SQL: Final = (
+    "UPDATE session_liveness SET last_seen = $2 "
+    "WHERE session_id = $1 AND last_seen < $3"
+)
 
 
 def _strip_postgres_nuls(value: JSONValue) -> JSONValue:
@@ -313,37 +332,17 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
             assert isinstance(session_id, UUID)
             # NULL for a session captured from a transcript rather than opened
             # live; resolve_live_sessions reads the column the same way.
-            owner = StrCodec.coerce(row["owner"])
+            owner = convert(row.get("owner"), str, default="")
             if row["agentsession_ended"] is not None:
-                # Re-open: move ended -> live in one statement so the lifecycle
-                # CHECK never observes (ended set, status active). Attribute the
-                # audit to the resuming caller, not the original owner.
-                await conn.execute(
-                    "UPDATE inquiries SET agentsession_ended = NULL, "
-                    "status = 'active', modified = clock_timestamp() WHERE id = $1",
-                    session_id,
-                )
-                await self._emit_field_change(
+                # Attribute the audit to the resuming caller, not the original
+                # owner.
+                await self._reopen_on_conn(
                     conn,
-                    session_id,
-                    "AgentSession",
-                    "agentsession_ended",
-                    Snapshot(agentsession_ended=_datetime(row["agentsession_ended"])),
-                    new=Snapshot(agentsession_ended=None),
+                    session_id=session_id,
+                    row=row,
                     api_key_id=api_key_id,
                     actor=actor,
                 )
-                if row["status"] != "active":
-                    await self._emit_field_change(
-                        conn,
-                        session_id,
-                        "AgentSession",
-                        "status",
-                        Snapshot(status=cast(Inquiry.Status, row["status"])),
-                        new=Snapshot(status="active"),
-                        api_key_id=api_key_id,
-                        actor=actor,
-                    )
             # Apply any new rooms from the resuming request: ``--resume --room X``
             # must join X. ``_mutate_list_field_on_conn`` is idempotent (a re-add
             # of an existing room is a no-op) and runs on this open tx.
@@ -360,6 +359,202 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
                     )
             next_seq = await self._next_event_seq(conn, session_id)
             return session_id, owner, next_seq
+
+    # A ``trax run`` polls continuously, so its row is rewritten at most once a minute:
+    # the reaper's window is many minutes, and a write per poll would be one per session
+    # per long-poll cycle.
+    async def record_session_seen(
+        self,
+        session_id: UUID,
+        *,
+        at: datetime,
+        polled: bool,
+    ) -> None:
+        """Note that ``session_id`` was heard from at ``at``.
+
+        Args:
+          session_id: AgentSession that just polled or uploaded.
+          at: When it was heard from.
+          polled: Whether it polled its inbound queue. A poll starts watching the
+            session; anything else only refreshes one already watched, so a
+            session that never polls is never closed for silence.
+
+        """
+        async with self.engine.acquire() as conn:
+            await conn.execute(
+                _SEEN_SQL if polled else _SEEN_AGAIN_SQL,
+                session_id,
+                at,
+                at - _SEEN_WRITE_EVERY,
+            )
+
+    async def silent_sessions(self, *, before: datetime) -> list[UUID]:
+        """Return each live session last heard from at or before ``before``.
+
+        Args:
+          before: The latest last-seen time that counts as silent.
+
+        Returns:
+          session_ids: Silent sessions, longest silent first.
+
+        """
+        async with self.engine.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT liveness.session_id FROM session_liveness AS liveness "
+                "JOIN inquiries ON inquiries.id = liveness.session_id "
+                "WHERE NOT liveness.reaped AND liveness.last_seen <= $1 "
+                "AND inquiries.agentsession_ended IS NULL "
+                "ORDER BY liveness.last_seen, liveness.session_id",
+                before,
+            )
+        return [_uuid(row["session_id"]) for row in rows]
+
+    async def reap_session(
+        self,
+        session_id: UUID,
+        *,
+        before: datetime,
+        actor: Inquiry.Actor,
+    ) -> datetime | None:
+        """End a session still silent since ``before``, at the time it was last seen.
+
+        Rechecked under lock, so a session heard from (or ended by its own run)
+        since :meth:`silent_sessions` listed it is left alone.
+
+        Args:
+          session_id: AgentSession to close.
+          before: The latest last-seen time that counts as silent.
+          actor: System-wide author label for the close audit.
+
+        Returns:
+          ended: The end time stamped, or ``None`` if the session was not closed.
+
+        """
+        async with (
+            notify_after_commit(),
+            self.engine.acquire() as conn,
+            tx(conn),
+        ):
+            # The session row first, then its liveness: the order ``end_session``
+            # takes them in, so a concurrent clean end cannot deadlock with this.
+            row = await conn.fetchrow(
+                _LOCK_SESSION_SQL,
+                session_id,
+            )
+            last_seen = await conn.fetchval(
+                "SELECT last_seen FROM session_liveness WHERE session_id = $1 "
+                "AND NOT reaped AND last_seen <= $2 FOR UPDATE",
+                session_id,
+                before,
+            )
+            if (
+                last_seen is None
+                or row is None
+                or row["agentsession_ended"] is not None
+            ):
+                return None
+            ended = _datetime(last_seen)
+            await self._end_on_conn(
+                conn,
+                session_id=session_id,
+                row=row,
+                ended=ended,
+                cli_session_id=None,
+                api_key_id=None,
+                actor=actor,
+            )
+            await conn.execute(
+                "UPDATE session_liveness SET reaped = TRUE WHERE session_id = $1",
+                session_id,
+            )
+            return ended
+
+    async def revive_reaped_session(
+        self,
+        session_id: UUID,
+        *,
+        actor: Inquiry.Actor,
+    ) -> bool:
+        """Reopen ``session_id`` if it was closed for silence; return whether it was.
+
+        Args:
+          session_id: AgentSession that just polled or uploaded.
+          actor: System-wide author label for the reopen audit.
+
+        Returns:
+          revived: Whether the session had been reaped and is live again; False
+            for one its own run ended, or a live one.
+
+        """
+        async with (
+            notify_after_commit(),
+            self.engine.acquire() as conn,
+            tx(conn),
+        ):
+            row = await conn.fetchrow(
+                _LOCK_SESSION_SQL,
+                session_id,
+            )
+            reaped = await conn.fetchval(
+                "SELECT reaped FROM session_liveness WHERE session_id = $1 FOR UPDATE",
+                session_id,
+            )
+            if not reaped or row is None or row["agentsession_ended"] is None:
+                return False
+            await self._reopen_on_conn(
+                conn,
+                session_id=session_id,
+                row=row,
+                api_key_id=None,
+                actor=actor,
+            )
+            return True
+
+    # One statement moves the row from ended to live, so the lifecycle CHECK (``ended``
+    # set iff ``status='complete'``) never observes ``ended`` set with ``status`` active
+    # -- the mirror of ``end_session``'s atomic live-to-ended move.
+    async def _reopen_on_conn(
+        self,
+        conn: Conn,
+        *,
+        session_id: UUID,
+        row: asyncpg.Record,
+        api_key_id: UUID | None,
+        actor: Inquiry.Actor,
+    ) -> None:
+        """Clear ``ended``, restore ``status='active'``, and audit both, on ``conn``."""
+        await conn.execute(
+            "UPDATE inquiries SET agentsession_ended = NULL, "
+            "status = 'active', modified = clock_timestamp() WHERE id = $1",
+            session_id,
+        )
+        # Live again, by a revival or a resume: reapable again, from now.
+        await conn.execute(
+            "UPDATE session_liveness SET reaped = FALSE, last_seen = clock_timestamp() "
+            "WHERE session_id = $1",
+            session_id,
+        )
+        await self._emit_field_change(
+            conn,
+            session_id,
+            "AgentSession",
+            "agentsession_ended",
+            Snapshot(agentsession_ended=_datetime(row["agentsession_ended"])),
+            new=Snapshot(agentsession_ended=None),
+            api_key_id=api_key_id,
+            actor=actor,
+        )
+        if row["status"] != "active":
+            await self._emit_field_change(
+                conn,
+                session_id,
+                "AgentSession",
+                "status",
+                Snapshot(status=cast(Inquiry.Status, row["status"])),
+                new=Snapshot(status="active"),
+                api_key_id=api_key_id,
+                actor=actor,
+            )
 
     async def resolve_live_sessions(
         self,
@@ -408,7 +603,7 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
         return [
             (
                 _uuid(row["id"]),
-                tuple(ListCodec.coerce(row["agentsession_rooms"], str)),
+                tuple(convert(row["agentsession_rooms"], list[str])),
             )
             for row in rows
         ]
@@ -419,8 +614,8 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
         after: tuple[datetime, UUID, int, int] | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
-        room: str | None = None,
-        actor: str | None = None,
+        scope: FeedScope = WHOLE_FEED,
+        conversation: bool = False,
         limit: int = 200,
         tail: bool = False,
     ) -> list[FeedEvent]:
@@ -441,8 +636,10 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
             start (distinct from ``after``, which is the exclusive resume
             cursor); combine with ``until`` to bound a fixed window.
           until: Inclusive upper bound on ``created``; bounds a window's end.
-          room: When set, only turns from sessions joined to this room.
-          actor: When set, only turns from sessions owned by this routing name.
+          scope: Which sessions and record kinds to keep.
+          conversation: Keep only conversation, the records the facets count as
+            what a person or agent said (``session_feed.CONVERSATION``), so a page
+            of ``limit`` holds that many of them.
           limit: Max turns returned; callers page by advancing ``after``.
           tail: When true, return the *newest* ``limit`` turns (the live tail's
             first page) instead of the oldest, so a large backlog does not force
@@ -469,17 +666,27 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
         if until is not None:
             params.append(until)
             clauses.append(f"e.created <= ${len(params)}")
-        if room is not None:
-            params.append(room)
-            clauses.append(f"${len(params)} = ANY(i.agentsession_rooms)")
-        if actor is not None:
-            params.append(actor)
-            clauses.append(f"i.owner = ${len(params)}")
+        clauses.extend(scope.clauses(params, kind="e.kind"))
+        if conversation:
+            # In a CASE, so the planner neither estimates the test nor scans an
+            # index for its kinds. Bare, beside the Messages level's kind filter, it
+            # took the two for independent, judged a page's worth rare, and read
+            # every message record: 21 s on a benchmark of 9 million, against 6 ms.
+            clauses.append(
+                vetted_sql("(CASE WHEN ", CONVERSATION, " THEN true ELSE false END)"),
+            )
         params.append(limit)
         # Exclude stale tail rows a compaction-restart left beyond the live
-        # manifest prefix (``idx < m.records``); see ``values.manifest_bound``.
-        manifest_join, manifest_predicate = manifest_bound("e")
-        clauses.append(manifest_predicate)
+        # manifest prefix (``idx < m.records``); see ``values.manifest_bound``. A
+        # part with no manifest reads as empty, as the join would make it. Looked
+        # up per record, not joined: joined, a page filtered by kind or to
+        # conversation was planned from every manifest, reading each part's
+        # records by primary key -- 13.6 s on a benchmark of 9 million records,
+        # against 8 ms walking ``created`` back from the newest.
+        clauses.append(
+            "e.idx < (SELECT m.records FROM session_manifests m "
+            "WHERE m.session_id = e.session_id AND m.part = e.part)",
+        )
         where = " AND ".join(clauses)
         # ``tail`` takes the newest page (DESC) then restores ascending order in
         # Python, so the wire shape is always oldest-first regardless of which
@@ -489,9 +696,7 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
             "SELECT e.session_id, e.part, e.idx, e.kind, e.created, e.timestamp, "
             "e.model, e.payload, e.text, "
             "i.owner, i.agentsession_rooms, i.agentsession_cli "
-            "FROM session_records e JOIN inquiries i ON i.id = e.session_id ",
-            manifest_join,
-            "WHERE ",
+            "FROM session_records e JOIN inquiries i ON i.id = e.session_id WHERE ",
             where,
             " ORDER BY e.created ",
             order,
@@ -558,18 +763,13 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
           ConflictError: Row is not an AgentSession, or already ended by a different key.
 
         """
-        # The only legal terminal status for an ended AgentSession; the
-        # lifecycle CHECK forbids any other once ``ended`` is set.
-        status: Inquiry.Status = "complete"
         async with (
             notify_after_commit(),
             self.engine.acquire() as conn,
             tx(conn),
         ):
             row = await conn.fetchrow(
-                "SELECT kind, status, agentsession_ended, "
-                "agentsession_cli_session_id FROM inquiries "
-                "WHERE id = $1 FOR UPDATE",
+                _LOCK_SESSION_SQL,
                 session_id,
             )
             if row is None:
@@ -617,85 +817,111 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
                 raise ConflictError(
                     f"session {session_id} has already ended; cannot end again",
                 )
-            if (
-                cli_session_id is not None
-                and cli_session_id != row["agentsession_cli_session_id"]
-            ):
-                await self._update_field(
-                    conn,
-                    session_id,
-                    "agentsession_cli_session_id",
-                    cli_session_id,
-                )
-                await self._emit_field_change(
-                    conn,
-                    session_id,
-                    "AgentSession",
-                    "agentsession_cli_session_id",
-                    Snapshot(
-                        agentsession_cli_session_id=_optional_str(
-                            row["agentsession_cli_session_id"],
-                        ),
-                    ),
-                    new=Snapshot(agentsession_cli_session_id=cli_session_id),
-                    api_key_id=api_key_id,
-                    actor=actor,
-                )
-            # Stamp ``ended`` and ``status`` in ONE statement: the lifecycle
-            # CHECK (``ended`` set iff ``status='complete'``) is evaluated per
-            # statement, so two separate UPDATEs would expose the intermediate
-            # (ended set, status still 'active') desync and violate it. One
-            # UPDATE moves the row straight from live to (ended, complete).
-            await conn.execute(
-                "UPDATE inquiries SET agentsession_ended = $1, status = $2, "
-                "modified = clock_timestamp() WHERE id = $3",
-                ended,
-                status,
-                session_id,
+            await self._end_on_conn(
+                conn,
+                session_id=session_id,
+                row=row,
+                ended=ended,
+                cli_session_id=cli_session_id,
+                api_key_id=api_key_id,
+                actor=actor,
             )
-            # Audit rows are separate change_log inserts (one change_kind per
-            # row); they don't touch the inquiries CHECK.
+            return ended
+
+    # Shared by a run's own end and the reaper's, so a session closed for silence is
+    # closed exactly as its run would have closed it.
+    async def _end_on_conn(
+        self,
+        conn: Conn,
+        *,
+        session_id: UUID,
+        row: asyncpg.Record,
+        ended: datetime,
+        cli_session_id: str | None,
+        api_key_id: UUID | None,
+        actor: Inquiry.Actor,
+    ) -> None:
+        """Stamp ``ended`` and ``status='complete'`` and audit both, on ``conn``."""
+        # The only legal terminal status for an ended AgentSession.
+        status: Inquiry.Status = "complete"
+        if (
+            cli_session_id is not None
+            and cli_session_id != row["agentsession_cli_session_id"]
+        ):
+            await self._update_field(
+                conn,
+                session_id,
+                "agentsession_cli_session_id",
+                cli_session_id,
+            )
             await self._emit_field_change(
                 conn,
                 session_id,
                 "AgentSession",
-                "agentsession_ended",
-                Snapshot(agentsession_ended=None),
-                new=Snapshot(agentsession_ended=ended),
+                "agentsession_cli_session_id",
+                Snapshot(
+                    agentsession_cli_session_id=_optional_str(
+                        row["agentsession_cli_session_id"],
+                    ),
+                ),
+                new=Snapshot(agentsession_cli_session_id=cli_session_id),
                 api_key_id=api_key_id,
                 actor=actor,
             )
-            if row["status"] != status:
-                await self._emit_field_change(
-                    conn,
-                    session_id,
-                    "AgentSession",
-                    "status",
-                    Snapshot(status=cast(Inquiry.Status, row["status"])),
-                    new=Snapshot(status=status),
-                    api_key_id=api_key_id,
-                    actor=actor,
-                )
-            return ended
+        # Stamp ``ended`` and ``status`` in ONE statement: the lifecycle
+        # CHECK (``ended`` set iff ``status='complete'``) is evaluated per
+        # statement, so two separate UPDATEs would expose the intermediate
+        # (ended set, status still 'active') desync and violate it. One
+        # UPDATE moves the row straight from live to (ended, complete).
+        await conn.execute(
+            "UPDATE inquiries SET agentsession_ended = $1, status = $2, "
+            "modified = clock_timestamp() WHERE id = $3",
+            ended,
+            status,
+            session_id,
+        )
+        # Audit rows are separate change_log inserts (one change_kind per
+        # row); they don't touch the inquiries CHECK.
+        await self._emit_field_change(
+            conn,
+            session_id,
+            "AgentSession",
+            "agentsession_ended",
+            Snapshot(agentsession_ended=None),
+            new=Snapshot(agentsession_ended=ended),
+            api_key_id=api_key_id,
+            actor=actor,
+        )
+        if row["status"] != status:
+            await self._emit_field_change(
+                conn,
+                session_id,
+                "AgentSession",
+                "status",
+                Snapshot(status=cast(Inquiry.Status, row["status"])),
+                new=Snapshot(status=status),
+                api_key_id=api_key_id,
+                actor=actor,
+            )
 
 
 def _feed_event(row: asyncpg.Record) -> FeedEvent:
     """Build one feed item from a ``session_records`` join row."""
     return FeedEvent(
         session_id=_uuid(row["session_id"]),
-        actor=StrCodec.coerce(row["owner"]),
-        rooms=ListCodec.coerce(row["agentsession_rooms"], str),
+        actor=convert(row.get("owner"), str, default=""),
+        rooms=convert(row.get("agentsession_rooms"), list[str], default=[]),
         cli=_optional_str(row["agentsession_cli"]),
-        part=IntCodec.coerce(row["part"], None),
-        seq=IntCodec.coerce(row["idx"], None),
-        kind=StrCodec.coerce(row["kind"], None),
+        part=convert(row["part"], int),
+        seq=convert(row["idx"], int),
+        kind=convert(row["kind"], str),
         created=_datetime(row["created"]),
         timestamp=_optional_datetime(row["timestamp"]),
         model=_optional_str(row["model"]),
         message=json_freeze(
-            DictCodec.coerce(loads(StrCodec.coerce(row["payload"], None))),
+            convert(loads_untagged(convert(row["payload"], str)), dict[str, object]),
         ),
-        text=StrCodec.coerce(row["text"], None),
+        text=convert(row["text"], str),
     )
 
 

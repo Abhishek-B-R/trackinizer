@@ -8,24 +8,22 @@ from uuid import UUID, uuid4
 
 import asyncio
 import logging
+import re
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 import asyncpg
+import fastjsonschema
 import pytest
 
 from trackinizer.conftest import FakeEngine, make_store
-from trackinizer.lib.custom_json import (
-    DictCodec,
-    FloatCodec,
-    IntCodec,
-    SchemaError,
-    StrCodec,
-    loads,
-)
+from trackinizer.lib.custom_json import convert, parse
+from trackinizer.server.api import app
 from trackinizer.server.api.app import (
     RequestLoggingMiddleware,
+    _RequestLogSpan,
     check_violation_handler,
     conflict_handler,
     fk_violation_handler,
@@ -42,8 +40,6 @@ from trackinizer.types.errors import (
     NotFoundError,
     ValidationError,
 )
-
-import trackinizer.server.api.app
 
 
 if TYPE_CHECKING:
@@ -79,8 +75,8 @@ class TestCLIHelpers:
             assert response.status_code == 409
             # ``response.body`` is ``bytes | memoryview``; coerce to
             # ``bytes`` for json.loads's narrower type signature.
-            body = DictCodec.coerce(loads(bytes(response.body)))
-            assert prefix in StrCodec.coerce(body["detail"])
+            body = parse(bytes(response.body), dict[str, object])
+            assert prefix in convert(body["detail"], str)
 
     def test_handlers_do_not_leak_constraint_detail(self) -> None:
         # ``asyncpg`` ``detail`` carries internal column / constraint names
@@ -102,9 +98,9 @@ class TestCLIHelpers:
             asyncio.run(unique_violation_handler(req, unique_exc)),
         ]
         for response in responses:
-            body = DictCodec.coerce(loads(bytes(response.body)))
+            body = parse(bytes(response.body), dict[str, object])
             assert response.status_code == 409
-            detail = StrCodec.coerce(body["detail"])
+            detail = convert(body["detail"], str)
             assert leak not in detail
             assert "from_id" not in detail
             assert constraint not in detail
@@ -112,38 +108,41 @@ class TestCLIHelpers:
     def test_conflict_handler_emits_error_code(self) -> None:
         req = cast(Request, Mock())
         response = asyncio.run(conflict_handler(req, ConflictError("clash")))
-        body = DictCodec.coerce(loads(bytes(response.body)))
+        body = parse(bytes(response.body), dict[str, object])
         assert response.status_code == 409
         assert body == {"detail": "clash", "code": "conflict"}
 
     def test_not_found_handler_emits_404_and_code(self) -> None:
         req = cast(Request, Mock())
         response = asyncio.run(not_found_handler(req, NotFoundError("gone")))
-        body = DictCodec.coerce(loads(bytes(response.body)))
+        body = parse(bytes(response.body), dict[str, object])
         assert response.status_code == 404
         assert body == {"detail": "gone", "code": "not_found"}
 
     def test_validation_handler_emits_422_and_code(self) -> None:
         req = cast(Request, Mock())
         response = asyncio.run(validation_handler(req, ValidationError("bad input")))
-        body = DictCodec.coerce(loads(bytes(response.body)))
+        body = parse(bytes(response.body), dict[str, object])
         assert response.status_code == 422
         assert body == {"detail": "bad input", "code": "validation"}
 
     def test_schema_handler_emits_422_and_code(self) -> None:
         req = cast(Request, Mock())
-        response = asyncio.run(schema_handler(req, SchemaError("stray key")))
-        body = DictCodec.coerce(loads(bytes(response.body)))
+        response = asyncio.run(
+            schema_handler(
+                req,
+                fastjsonschema.JsonSchemaValueException("stray key"),
+            ),
+        )
+        body = parse(bytes(response.body), dict[str, object])
         assert response.status_code == 422
         assert body == {"detail": "stray key", "code": "schema"}
 
     def test_schema_error_is_registered_not_merely_defined(self) -> None:
         # The handler function existing is not what stops the 500 -- FastAPI
-        # only consults REGISTERED handlers, and a codec ``SchemaError``
-        # reaches the app as a plain ``ValueError`` on a client-supplied
-        # body. Assert the registration, which is the part that was missing.
+        # only consults REGISTERED handlers for client-side schema failures.
         assert (
-            trackinizer.server.api.app.app.exception_handlers.get(SchemaError)
+            app.app.exception_handlers.get(fastjsonschema.JsonSchemaValueException)
             is schema_handler
         )
 
@@ -170,17 +169,18 @@ class TestRequestLogging:
             for record in caplog.records
             if getattr(record, "event", "") == "trackinizer_request_completed"
         )
-        fields = DictCodec.coerce(record.__dict__)
-        assert StrCodec.coerce(fields.get("request_id")) == str(request_id)
-        assert StrCodec.coerce(fields.get("method")) == "GET"
-        assert StrCodec.coerce(fields.get("path")) == "/api/version"
-        assert StrCodec.coerce(fields.get("outcome")) == "success"
-        assert IntCodec.coerce(fields.get("status_code"), 0) == 200
-        assert IntCodec.coerce(fields.get("worker_pid"), 0) > 0
-        assert FloatCodec.coerce(fields.get("response_start_sec"), -1) >= 0
-        assert FloatCodec.coerce(fields.get("duration_sec"), -1) >= FloatCodec.coerce(
+        fields = convert(record.__dict__, dict[str, object])
+        assert convert(fields.get("request_id"), str) == str(request_id)
+        assert convert(fields.get("method"), str) == "GET"
+        assert convert(fields.get("path"), str) == "/api/version"
+        assert convert(fields.get("outcome"), str) == "success"
+        assert convert(fields.get("status_code"), int, default=0) == 200
+        assert convert(fields.get("worker_pid"), int, default=0) > 0
+        assert convert(fields.get("response_start_sec"), float, default=-1) >= 0
+        assert convert(fields.get("duration_sec"), float, default=-1) >= convert(
             fields.get("response_start_sec"),
-            0,
+            float,
+            default=0,
         )
 
     def test_invalid_request_id_is_replaced_and_rejection_is_classified(
@@ -203,10 +203,10 @@ class TestRequestLogging:
             for record in caplog.records
             if getattr(record, "event", "") == "trackinizer_request_completed"
         )
-        fields = DictCodec.coerce(record.__dict__)
-        assert StrCodec.coerce(fields.get("request_id")) == request_id
-        assert StrCodec.coerce(fields.get("outcome")) == "rejected"
-        assert IntCodec.coerce(fields.get("status_code"), 0) == 404
+        fields = convert(record.__dict__, dict[str, object])
+        assert convert(fields.get("request_id"), str) == request_id
+        assert convert(fields.get("outcome"), str) == "rejected"
+        assert convert(fields.get("status_code"), int, default=0) == 404
 
     # Production runs at WARNING, so only a failure's line is kept there: raised to
     # WARNING, it carries the request id the web app shows beside the error.
@@ -245,6 +245,41 @@ class TestRequestLogging:
         # Encoded as uvicorn's access log does, so a path cannot forge a field.
         assert "path=/api/a%20b " in record.getMessage()
 
+    def test_a_request_logs_one_complete_line(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Every field, in the text and the structured record, exactly once."""
+        span = _RequestLogSpan(
+            downstream=AsyncMock(),
+            request_id="rid-1",
+            method="GET",
+            path="/api/version",
+            started=time.perf_counter(),
+            status_code=201,
+            response_start_sec=0.5,
+        )
+        with caplog.at_level(logging.INFO):
+            span.log(outcome="success")
+            span.log(outcome="failure", error_type="Late")
+
+        (record,) = (
+            record
+            for record in caplog.records
+            if getattr(record, "event", "") == "trackinizer_request_completed"
+        )
+        assert re.fullmatch(
+            r"event=trackinizer_request_completed stage=http_request "
+            r"outcome=success method=GET path=/api/version status_code=201 "
+            r"response_start_sec=0\.500000 duration_sec=\d+\.\d{6} "
+            r"request_id=rid-1 worker_pid=\d+ error_type=",
+            record.getMessage(),
+        )
+        fields = convert(record.__dict__, dict[str, object])
+        assert convert(fields.get("stage"), str) == "http_request"
+        assert convert(fields.get("error_type"), str, default="?") == ""
+        assert 0.0 <= convert(fields.get("duration_sec"), float, default=-1) < 60.0
+
 
 class TestAuthDisabledWarning:
     """The lifespan loudly warns when auth is disabled (synthetic-admin mode)."""
@@ -261,26 +296,26 @@ class TestAuthDisabledWarning:
         """Drive the real ``lifespan`` once with engine/store/embedder stubbed."""
         store, engine = make_store()
         monkeypatch.setattr(
-            trackinizer.server.api.app,
+            app,
             "build_engine",
             Mock(return_value=engine),
         )
         monkeypatch.setattr(
-            trackinizer.server.api.app,
+            app,
             "build_embedder",
             Mock(return_value=object()),
         )
         monkeypatch.setattr(
-            trackinizer.server.api.app,
+            app,
             "Store",
             Mock(return_value=store),
         )
         monkeypatch.setattr(store, "bootstrap", AsyncMock(return_value=None))
-        app = FastAPI()
-        app.state.config = Config(auth_disabled=auth_disabled)
+        fastapi_app = FastAPI()
+        fastapi_app.state.config = Config(auth_disabled=auth_disabled)
 
         async def _drive() -> None:
-            async with lifespan(app):
+            async with lifespan(fastapi_app):
                 pass
 
         asyncio.run(_drive())
@@ -318,26 +353,26 @@ class TestAuthDisabledWarning:
         """Drive the lifespan and report whether the no-auth user was seeded."""
         store, engine = make_store()
         monkeypatch.setattr(
-            trackinizer.server.api.app,
+            app,
             "build_engine",
             Mock(return_value=engine),
         )
         monkeypatch.setattr(
-            trackinizer.server.api.app,
+            app,
             "build_embedder",
             Mock(return_value=object()),
         )
         monkeypatch.setattr(
-            trackinizer.server.api.app,
+            app,
             "Store",
             Mock(return_value=store),
         )
         monkeypatch.setattr(store, "bootstrap", AsyncMock(return_value=None))
-        app = FastAPI()
-        app.state.config = Config(auth_disabled=auth_disabled)
+        fastapi_app = FastAPI()
+        fastapi_app.state.config = Config(auth_disabled=auth_disabled)
 
         async def _drive() -> None:
-            async with lifespan(app):
+            async with lifespan(fastapi_app):
                 pass
 
         asyncio.run(_drive())
@@ -365,23 +400,23 @@ class TestSessionEmbedderResolution:
     """``_resolve_session_embedder`` decides degrade-vs-warm without downloading."""
 
     def test_unset_knob_leaves_embedder_none(self) -> None:
-        app = FastAPI()
-        task = trackinizer.server.api.app._resolve_session_embedder(
-            app,
+        fastapi_app = FastAPI()
+        task = app._resolve_session_embedder(
+            fastapi_app,
             Config(session_embedder=""),
         )
         assert task is None
-        assert cast(object, app.state.session_embedder) is None
+        assert cast(object, fastapi_app.state.session_embedder) is None
 
     def test_stub_is_ready_without_a_warm_task(self) -> None:
         """A weightless stub is set immediately; no warm task, no download."""
-        app = FastAPI()
-        task = trackinizer.server.api.app._resolve_session_embedder(
-            app,
+        fastapi_app = FastAPI()
+        task = app._resolve_session_embedder(
+            fastapi_app,
             Config(session_embedder="stub-1024"),
         )
         assert task is None  # Nothing to warm.
-        embedder = cast("QueryEmbedder | None", app.state.session_embedder)
+        embedder = cast("QueryEmbedder | None", fastapi_app.state.session_embedder)
         assert embedder is not None
         assert embedder.name == "stub-1024"
 
@@ -392,14 +427,14 @@ class TestSessionEmbedderResolution:
     ) -> None:
         """Weights absent -> embedder None (degrade), prep command logged, NO download."""
         monkeypatch.setattr(qwen3_4b, "weights_present", lambda: False)
-        app = FastAPI()
+        fastapi_app = FastAPI()
         with caplog.at_level(logging.ERROR):
-            task = trackinizer.server.api.app._resolve_session_embedder(
-                app,
+            task = app._resolve_session_embedder(
+                fastapi_app,
                 Config(session_embedder="qwen3-embedding-4b@1024"),
             )
         assert task is None
-        assert cast(object, app.state.session_embedder) is None
+        assert cast(object, fastapi_app.state.session_embedder) is None
         assert "prep_models" in caplog.text
 
     def test_qwen_with_weights_sets_embedder_and_schedules_warm(
@@ -414,20 +449,20 @@ class TestSessionEmbedderResolution:
             await _record_warm(embedder, warmed)
 
         async def _drive() -> tuple[object, object]:
-            app = FastAPI()
+            fastapi_app = FastAPI()
             # Replace the real warm coroutine so the test never loads a model.
             monkeypatch.setattr(
-                trackinizer.server.api.app,
+                app,
                 "_warm_session_embedder",
                 _fake_warm,
             )
-            task = trackinizer.server.api.app._resolve_session_embedder(
-                app,
+            task = app._resolve_session_embedder(
+                fastapi_app,
                 Config(session_embedder="qwen3-embedding-4b@1024"),
             )
             assert task is not None
             await task
-            return cast(object, app.state.session_embedder), task
+            return cast(object, fastapi_app.state.session_embedder), task
 
         embedder, _task = asyncio.run(_drive())
         assert embedder is not None
