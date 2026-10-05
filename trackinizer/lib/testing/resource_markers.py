@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from functools import cache
+from importlib import util
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, cast
 
 import ast
-import importlib.util
 import os
 
 import pytest
@@ -196,7 +196,7 @@ def module_path(module_name: str) -> Path | None:
 
     """
     try:
-        spec = importlib.util.find_spec(module_name)
+        spec = util.find_spec(module_name)
     except (ImportError, ValueError):
         return None
     if spec is None or spec.origin is None or spec.origin in {"built-in", "frozen"}:
@@ -251,8 +251,7 @@ def resource_marker_aliases(
         ("browser_chrome", ("integration",)),
         ("browser_zendriver", ("integration",)),
         ("cli_bash", ("slow",)),
-        ("cli_claude", ("integration", "real_llm")),
-        ("cli_codex", ("integration", "real_llm")),
+        ("cli_real_llm", ("integration",)),
         ("cli_docker", ("integration",)),
         ("cli_git", ("integration",)),
         ("cli_node", ("integration",)),
@@ -331,8 +330,7 @@ def resource_marker_timeout(
     ),
     specific_timeouts: tuple[tuple[str, int], ...] = (
         ("bench_throughput", 600),
-        ("cli_claude", 1800),
-        ("cli_codex", 1800),
+        ("cli_real_llm", 1800),
         ("cli_docker", 300),
         ("cli_precommit", 300),
         # A spawned interpreter re-imports the tree it collects, which the
@@ -390,7 +388,7 @@ def apply_resource_markers(
         "network_shadeform",
         "network_together",
     ),
-    live_llm_marks: tuple[str, ...] = ("cli_claude", "cli_codex", "real_llm"),
+    live_llm_marks: tuple[str, ...] = ("cli_real_llm",),
     live_llm_env_var: str = "RUN_REAL_LLM",
 ) -> None:
     """Apply virtual family markers, timeout budgets, and skip policy.

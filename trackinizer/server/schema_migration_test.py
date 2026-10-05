@@ -191,7 +191,7 @@ async def test_the_console_feed_reads_an_index_not_the_whole_table(
     ``agent_session_events`` carried a dedicated index for exactly this; the
     IR tables that replaced it must too, or the hot path degrades to a
     sequential scan plus a sort that grows with the whole capture corpus --
-    3,081,202 rows on the deployed instance.
+    millions of rows on a busy server.
 
     Asserted against the PLANNER rather than by checking an index exists: an
     index the planner declines to use is not a fix.
@@ -450,13 +450,42 @@ async def test_migration_024_backfills_markers_from_existing_vectors(
 
 @pytest.mark.db_pglite
 @pytest.mark.asyncio(loop_scope="session")
-async def test_migration_031_matches_the_baseline_shape(
+async def test_migration_031_matches_the_baseline_metric_checks(
     scratch_engine: postgres.PostgresEngine,
 ) -> None:
-    """The ``recorded`` columns 031 adds equal the fresh-install ones.
+    """A database migrated by 031 enforces the fresh install's metric-key CHECK.
+
+    Bootstrap builds the baseline shape. This restores the pre-031 ``btrim``
+    CHECK, replays ``schema.031`` alone, and compares every
+    ``experiment_metrics`` constraint against what the baseline produced.
+    """
+    await Store(scratch_engine, embed=StubEmbedder()).bootstrap()
+    constraints = (
+        "SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint "
+        "WHERE conrelid = 'experiment_metrics'::regclass"
+    )
+    async with scratch_engine.acquire() as conn:
+        baseline = {(r["conname"], r["def"]) for r in await conn.fetch(constraints)}
+        await conn.execute(
+            "ALTER TABLE experiment_metrics "
+            "DROP CONSTRAINT experiment_metrics_key_check, "
+            "ADD CONSTRAINT experiment_metrics_key_check "
+            "CHECK (char_length(key) BETWEEN 1 AND 512 AND btrim(key) <> '')",
+        )
+        await conn.execute(load_sql("schema.031"))
+        migrated = {(r["conname"], r["def"]) for r in await conn.fetch(constraints)}
+    assert migrated == baseline
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+async def test_migration_033_matches_the_baseline_shape(
+    scratch_engine: postgres.PostgresEngine,
+) -> None:
+    """The ``recorded`` columns 033 adds equal the fresh-install ones.
 
     Bootstrap builds the baseline shape (which carries them). This drops all
-    three (as a pre-031 database lacks them), replays ``schema.031``, and
+    three (as a pre-033 database lacks them), replays ``schema.033``, and
     compares columns -- the parity check neither file can make about itself,
     since each is read by a disjoint population.
     """
@@ -476,7 +505,7 @@ async def test_migration_031_matches_the_baseline_shape(
         await conn.execute("ALTER TABLE inquiries DROP COLUMN recorded")
         await conn.execute("ALTER TABLE change_log DROP COLUMN old_recorded")
         await conn.execute("ALTER TABLE change_log DROP COLUMN new_recorded")
-        await conn.execute(load_sql("schema.031"))
+        await conn.execute(load_sql("schema.033"))
         migrated_cols = [dict(r) for r in await conn.fetch(columns)]
 
     assert migrated_cols == base_cols
@@ -484,13 +513,13 @@ async def test_migration_031_matches_the_baseline_shape(
 
 @pytest.mark.db_pglite
 @pytest.mark.asyncio(loop_scope="session")
-async def test_migration_031_gates_the_mirror_on_the_change_kind(
+async def test_migration_033_gates_the_mirror_on_the_change_kind(
     scratch_engine: postgres.PostgresEngine,
 ) -> None:
-    """031's validated gates refuse a mirror written under the wrong kind.
+    """033's validated gates refuse a mirror written under the wrong kind.
 
     The fresh install states this as an unnamed CHECK inside CREATE TABLE and
-    031 as a named one it can VALIDATE, so the rule is worth asserting rather
+    033 as a named one it can VALIDATE, so the rule is worth asserting rather
     than assumed from two spellings of it.
     """
     await Store(scratch_engine, embed=StubEmbedder()).bootstrap()
@@ -498,7 +527,7 @@ async def test_migration_031_gates_the_mirror_on_the_change_kind(
         await conn.execute("ALTER TABLE inquiries DROP COLUMN recorded")
         await conn.execute("ALTER TABLE change_log DROP COLUMN old_recorded")
         await conn.execute("ALTER TABLE change_log DROP COLUMN new_recorded")
-        await conn.execute(load_sql("schema.031"))
+        await conn.execute(load_sql("schema.033"))
 
         with pytest.raises(asyncpg.exceptions.CheckViolationError):
             await conn.execute(

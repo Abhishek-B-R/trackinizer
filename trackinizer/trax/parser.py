@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, cast, get_args
 import uuid
 
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.custom_json import FloatCodec, ListCodec
+from trackinizer.lib.custom_json import convert
 from trackinizer.trax.grammar import (
     AGAINST_RELATION_SPELLINGS,
     COST_FIELDS,
@@ -51,6 +51,7 @@ from trackinizer.wire.filters import (
     canonical_filter_field,
 )
 from trackinizer.wire.refs import Ref, SeqRef, UuidRef
+from trackinizer.wire.routes import MAX_LIST_LIMIT
 from trackinizer.wire.seq_ranges import (
     SeqRange,
     format_interval,
@@ -395,9 +396,10 @@ def parse_metric_action(tokens: Sequence[str]) -> MetricAction:
     Masks AND together in order. ``at <bareword>`` (a token not in
     ``key``/``step``/``value``) is the shorthand ``at key is <bareword>``. The
     step-axis reductions ``max``/``min`` take no value. ``sort``/``limit`` window
-    a read; combining either with a ``to`` write is an error. The parser is
-    purely structural: the ``to`` value stays a raw string (a later layer coerces
-    it and enforces finiteness).
+    a read; combining either with a ``to`` write is an error. Each of ``to`` /
+    ``sort`` / ``limit`` appears at most once, so one command is one operation.
+    The parser is purely structural: the ``to`` value stays a raw string (a
+    later layer coerces it and enforces finiteness).
 
     Args:
       tokens: The row tail after the ``metric`` keyword.
@@ -406,17 +408,25 @@ def parse_metric_action(tokens: Sequence[str]) -> MetricAction:
       action: The parsed masks, optional write target, and read options.
 
     Raises:
-      ClientError: On a malformed clause, an unknown op, a non-positive
-        ``limit``, or ``sort``/``limit`` combined with a ``to`` write.
+      ClientError: On a malformed clause, an unknown op, a ``limit`` outside
+        ``[1, MAX_LIST_LIMIT]``, a repeated ``to`` / ``sort`` / ``limit``, or
+        ``sort``/``limit`` combined with a ``to`` write.
 
     """
     masks: list[MetricMask] = []
     write: str | None = None
     sort: Literal["asc", "desc"] | None = None
     limit: int | None = None
+    seen: set[str] = set()
     index = 0
     while index < len(tokens):
         word = tokens[index].lower()
+        # A second one would silently replace the first: ``... to 0.5 ... to
+        # 0.9`` wrote only 0.9, to the AND of both writes' masks.
+        if word in seen:
+            raise ClientError(f"{word!r} may appear only once in a metric tail")
+        if word in ("to", "sort", "limit"):
+            seen.add(word)
         if word == "at":
             mask, index = _parse_metric_mask(tokens, index + 1)
             masks.append(mask)
@@ -627,7 +637,7 @@ def edge_metadata(
             # this branch handling every remaining valid field.
             if op not in ("to", "add", "del"):
                 raise ClientError("edge label uses to, add, or del")
-            labels = ListCodec.coerce(metadata.get("labels"), str)
+            labels = convert(metadata.get("labels"), list[str], default=[])
             if op == "to":
                 labels = resolve_labels((value,))
             elif op == "add":
@@ -1076,7 +1086,7 @@ def _parse_metric_sort(direction: str) -> Literal["asc", "desc"]:
 
 
 def _parse_metric_limit(token_text: str) -> int:
-    """Parse a ``limit`` operand into a positive int, raising otherwise."""
+    """Parse a ``limit`` operand into an int in ``[1, MAX_LIST_LIMIT]``."""
     try:
         limit = int(token_text)
     except ValueError:
@@ -1085,6 +1095,8 @@ def _parse_metric_limit(token_text: str) -> int:
         ) from None
     if limit <= 0:
         raise ClientError(f"limit must be a positive integer, got {token_text!r}")
+    if limit > MAX_LIST_LIMIT:
+        raise ClientError(f"limit must be at most {MAX_LIST_LIMIT}, got {limit}")
     return limit
 
 
@@ -1314,7 +1326,7 @@ def _apply_valence_alias(edge: Edge, metadata: dict[str, object]) -> dict[str, o
     if given is None:
         metadata["valence"] = edge.valence_default
         return metadata
-    value = FloatCodec.coerce(given)
+    value = convert(given, float)
     if value < 0:
         # The magnitude is non-negative; the for/against polarity is carried by
         # the spelling (plain vs ``dis*``), not by a negative value. A positive
