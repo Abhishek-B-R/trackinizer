@@ -17,7 +17,7 @@ import json
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from trackinizer.lib.custom_json import DictCodec, loads
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.server.api._deps import get_store
 from trackinizer.server.auth import AuthIdentity, require_role
 from trackinizer.wire.filters import (
@@ -98,7 +98,7 @@ def _parse_selector_param(raw: str) -> Filter:
         ) from err
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="filter must be a JSON object")
-    obj = DictCodec.coerce(payload)
+    obj = from_plain(payload, dict[str, object])
     field = obj.get("field")
     op = obj.get("op")
     # A presence op carries no operand, so a missing value is its well-formed

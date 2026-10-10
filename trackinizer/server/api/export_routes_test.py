@@ -154,7 +154,7 @@ def test_a_selector_reaches_the_store_and_the_header(
     )
 
     assert r.status_code == 200
-    header = DictCodec.coerce(loads(r.text.splitlines()[0]))
+    header = from_plain(loads(r.text.splitlines()[0]), dict[str, object])
     assert header["selector"] == [
         {"field": "labels", "op": "is", "value": "org:rekursiv"},
     ]
@@ -175,7 +175,7 @@ def test_clauses_arrive_in_the_order_they_were_sent(
         ],
     )
 
-    header = DictCodec.coerce(loads(r.text.splitlines()[0]))
+    header = from_plain(loads(r.text.splitlines()[0]), dict[str, object])
     assert header["selector"] == [
         {"field": "labels", "op": "is", "value": "org:rekursiv"},
         {"field": "labels", "op": "nre", "value": "^machine:"},
@@ -192,7 +192,7 @@ def test_an_unselectable_field_is_400_and_names_what_is_allowed(
     )
 
     assert r.status_code == 400
-    assert "labels" in str(DictCodec.coerce(r.json())["detail"])
+    assert "labels" in str(from_plain(r.json(), dict[str, object])["detail"])
 
 
 @pytest.mark.parametrize(
@@ -217,8 +217,9 @@ def test_a_malformed_clause_is_400_not_a_whole_graph(
 
 def test_no_selector_leaves_the_key_out(export_client: TestClient) -> None:
     """A whole-graph export is unchanged by this feature, header included."""
-    header = DictCodec.coerce(
+    header = from_plain(
         loads(export_client.get(EXPORT_API_PATH).text.splitlines()[0]),
+        dict[str, object],
     )
 
     assert "selector" not in header

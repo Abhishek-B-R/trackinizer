@@ -390,13 +390,15 @@ async def test_the_header_says_which_subgraph_this_is(store: Store) -> None:
     scoped = await store.export_graph(selector=selector)
     whole = await store.export_graph()
 
-    header = DictCodec.coerce(loads(next(iter(export_lines(scoped)))))
+    header = from_plain(loads(next(iter(export_lines(scoped)))), dict[str, object])
     assert header["selector"] == [
         {"field": "labels", "op": "is", "value": "org:rekursiv"},
     ]
     # Absent, not empty: a whole-graph export is byte-identical to the ones
     # written before selectors existed.
-    assert "selector" not in DictCodec.coerce(loads(next(iter(export_lines(whole)))))
+    assert "selector" not in from_plain(
+        loads(next(iter(export_lines(whole)))), dict[str, object]
+    )
 
 
 @pytest.mark.db_pglite
