@@ -94,6 +94,23 @@ children, a graph of what lies within two hops, and its activity.
 
 <img src="https://raw.githubusercontent.com/rekursiv-ai/trackinizer/main/trackinizer/docs/screenshots/experiment.webp" width="640" alt="An Experiment with its outcome, metric charts and the Belief it proves">
 
+### Chat
+
+A canvas's Chat talks to a partner, which is either the server's shared
+assistant or your own helper:
+
+1. An admin sets the shared assistant: `trackinizer --assistant ACTOR=EMAIL`.
+2. Or you pick "My local helper" in Settings, for your canvases only.
+3. Run your helper in a terminal, with your Claude or Codex CLI:
+
+```bash
+uv tool install trackinizer && trax profile url to <server URL> && trax profile token to <TOKEN>
+trax helper claude
+```
+
+With "My local helper" chosen and no helper running, Chat says so and sends
+nothing. [`docs/api.md`](docs/api.md) has the rules.
+
 ## The model
 
 Everything in the system is an `Inquiry`, which has two variants: an
@@ -384,6 +401,7 @@ trackinizer                        # pglite (default)
 trackinizer --engine pg --dsn ...  # against real Postgres
 trackinizer --no-auth              # single-user local mode: everyone is admin
 trackinizer --app-dir DIR          # the web app built in DIR at /app/
+trackinizer --assistant ACTOR=EMAIL  # the shared Chat partner (or $TRACKINIZER_ASSISTANT)
 trackinizer --no-web               # without /api/web, /app/ or the login page
 ```
 
@@ -393,6 +411,8 @@ useful on its own:
 ```bash
 trax help                          # grammar and subjects
 trax issue                         # list issues
+trax env                           # list the org's environment variables
+trax machine                       # list the machines campaigns may run on
 ```
 
 From a source checkout, both are `uv run python -m trackinizer.server`

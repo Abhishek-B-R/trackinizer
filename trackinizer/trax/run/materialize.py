@@ -25,7 +25,7 @@ gone cannot be replayed to the provider (:class:`CiphertextDroppedError`).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,7 +47,7 @@ from trackinizer.lib.agent.types.sessions import (
     Thinking,
     TurnContext,
 )
-from trackinizer.lib.custom_json import JSON, convert, json_freeze, json_unfreeze
+from trackinizer.lib.codec import PlainTree, from_plain, immutable, mutable
 from trackinizer.trax.run.adapters.claude import ClaudeAdapter
 from trackinizer.trax.run.adapters.codex import CodexAdapter
 from trackinizer.trax.run.errors import (
@@ -65,7 +65,7 @@ __all__ = [
     "Materialized",
     "identified",
     "materialize",
-    "materialize_claude",
+    "prepared",
 ]
 
 
@@ -104,7 +104,7 @@ def materialize(
     *,
     target: str,
     records: Sequence[SessionRecord],
-    encoding: JSON,
+    encoding: Mapping[str, PlainTree],
     sealed: Sequence[str | None] = (),
     session_id: UUID | None = None,
     source: str | None = None,
@@ -124,8 +124,8 @@ def materialize(
         (``None`` where a record has none). Empty means none was fetched,
         which is only correct for a session that stored none.
       session_id: The id to mint into the file; generated when omitted. Taken
-        as an argument so the caller can stamp the server BEFORE writing --
-        without that stamp a resumed run forks a second AgentSession.
+        as an argument so the caller can stamp the server after writing and
+        before the runner starts, keeping the resumed AgentSession attached.
       source: Which CLI captured ``records``. Names a CROSSING when it differs
         from ``target``, which is what decides whether a provider-sealed or
         unparsed record can be replayed; see :func:`_crossed`. Omitted means
@@ -147,13 +147,13 @@ def materialize(
             f"could re-enter. Resumable: {', '.join(sorted(_TARGETS))}.",
         )
     minted = session_id or uuid4()
-    spliced = identified(
-        target,
-        [
-            TurnContext(encoding=encoding),
-            *_crossed(_spliced(records, sealed), source, target),
-        ],
-        minted,
+    spliced = prepared(
+        target=target,
+        records=records,
+        encoding=encoding,
+        sealed=sealed,
+        source=source,
+        session_id=minted,
     )
     # The adapter names the directory, rather than this module re-deriving each
     # CLI's layout: two spellings of one rule drift, and the one that drifts
@@ -167,6 +167,44 @@ def materialize(
     # the operator a session whose selection fails.
     spec.announce(path, minted)
     return Materialized(path=path, cli_session_id=minted)
+
+
+def prepared(
+    *,
+    target: str,
+    records: Sequence[SessionRecord],
+    encoding: Mapping[str, PlainTree],
+    sealed: Sequence[str | None] = (),
+    source: str | None = None,
+    session_id: UUID,
+) -> list[SessionRecord]:
+    """Prepare the exact records shared by the resume gate and file writer.
+
+    Foreign ciphertext cannot be replayed, so only same-format records need
+    their stored seals restored before applying the target's filters.
+
+    Args:
+      target: Native format to write.
+      records: Captured records in order.
+      encoding: Source file spelling metadata.
+      sealed: Positionally aligned stored ciphertext.
+      source: Capturing format, when known.
+      session_id: Identity to state in the target.
+
+    Returns:
+      records: Encoding, replayable acts, and target identity in write order.
+
+    """
+    restored = (
+        list(records)
+        if source is not None and source != target
+        else _spliced(records, sealed)
+    )
+    return identified(
+        target,
+        [TurnContext(encoding=encoding), *_crossed(restored, source, target)],
+        session_id,
+    )
 
 
 def identified(
@@ -193,34 +231,6 @@ def identified(
     """
     spec = _TARGETS.get(target)
     return list(records) if spec is None else spec.identify(records, session_id)
-
-
-def materialize_claude(
-    *,
-    records: Sequence[SessionRecord],
-    encoding: JSON,
-    sealed: Sequence[str | None] = (),
-    session_id: UUID | None = None,
-) -> Materialized:
-    """Write ``records`` as a claude transcript the CLI can resume.
-
-    Args:
-      records: The part's records, in ``idx`` order.
-      encoding: How the source file spelled its bytes.
-      sealed: Each record's ciphertext, positionally aligned with ``records``.
-      session_id: The id to mint into the file; generated when omitted.
-
-    Returns:
-      written: The path and the id that names it.
-
-    """
-    return materialize(
-        target="claude",
-        records=records,
-        encoding=encoding,
-        sealed=sealed,
-        session_id=session_id,
-    )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -314,7 +324,7 @@ def _codex_identified(
         return stamped
     return [
         _codex_declared(
-            TurnContext(encoding=json_freeze({"newline_terminated": True})),
+            TurnContext(encoding=immutable({"newline_terminated": True})),
             session_id,
         ),
         *stamped,
@@ -353,7 +363,7 @@ def _codex_stamped(record: SessionRecord, at: str) -> SessionRecord:
 # rather than about this machine.
 def _codex_declared(record: TurnContext, session_id: UUID) -> TurnContext:
     """Return the launch settings with this machine's declaration in them."""
-    extra = dict(json_unfreeze(record.extra))
+    extra = dict(mutable(record.extra))
     stated = str(session_id)
     # The launch line's own ordinal, which is how codex numbers a rollout it
     # wrote; a session crossed in from another CLI declares none.
@@ -361,8 +371,8 @@ def _codex_declared(record: TurnContext, session_id: UUID) -> TurnContext:
     extra.setdefault("$timestamp", True)
     captured = {
         key: value
-        for key, value in json_unfreeze(
-            convert(extra.get("payload"), dict[str, object], default={}),
+        for key, value in mutable(
+            from_plain(extra.get("payload"), dict[str, object], default={}),
         ).items()
         # The thread this session forked FROM is not being materialized, so
         # naming it would point the CLI at a rollout the machine may not hold.
@@ -391,7 +401,7 @@ def _codex_declared(record: TurnContext, session_id: UUID) -> TurnContext:
     return replace(
         record,
         timestamp=record.timestamp or _stamp(),
-        extra=json_freeze(extra),
+        extra=immutable(extra),
     )
 
 
@@ -472,12 +482,12 @@ def _renamed(record: SessionRecord, session_id: UUID) -> SessionRecord:
     # Not thawed first: the values are re-frozen unchanged, so unfreezing the
     # whole residual only to freeze it again would walk every nested structure
     # twice for one replaced key.
-    residual = convert(getattr(record, "extra", None) or {}, dict[str, object])
+    residual = from_plain(getattr(record, "extra", None) or {}, dict[str, object])
     if "sessionId" not in residual:
         return record
     return replace(
         record,
-        extra=json_freeze({**residual, "sessionId": str(session_id)}),
+        extra=immutable({**residual, "sessionId": str(session_id)}),
     )
 
 
@@ -602,17 +612,10 @@ def _spliced(
         if bytes_ is not None:
             out.append(replace(record, encrypted=bytes_))
             continue
-        # No bytes came back, and the stored record always reads ``encrypted``
-        # back as ``""`` (they were split into ``session_ciphertext``). What
-        # distinguishes the two cases is READABLE reasoning: claude writes a
-        # plaintext ``content`` block, which replays as it stands; a sealed
-        # one has none, so an empty field with no bytes is retention having
-        # dropped them. ``summary`` does NOT distinguish -- codex writes one
-        # ALONGSIDE its ciphertext, so requiring it absent never fires.
-        #
-        # The record stays searchable, which is what the split buys; what it
-        # can no longer do is go back to the provider, which validates it.
-        if not record.encrypted and not record.content:
+        # Empty marks split ciphertext; None means the record was never sealed.
+        # A summary can accompany a seal, so it cannot establish replayability.
+        content = record.content or ""
+        if record.encrypted == "" and not content:
             raise CiphertextDroppedError(
                 f"record {idx} is sealed reasoning whose ciphertext is no "
                 "longer stored; the provider rejects a transcript with an "

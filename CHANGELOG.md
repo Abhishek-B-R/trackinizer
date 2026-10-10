@@ -5,6 +5,40 @@ All notable trackinizer changes are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Variables: an org stores launch variables in a `variables` table, served by
+  `/api/variables`. Secret values live in a backend chosen by
+  `TRACKINIZER_SECRETS` (a file store or AWS Secrets Manager); the table keeps
+  only the name and who set it.
+- `trax env` lists, sets and deletes the org's variables, and `Client` gains
+  `list_variables`, `put_variable` and `delete_variable`.
+- `trax run` masks the values named in `TRAX_REDACT_NAMES` in every sink it
+  writes, including multi-line and cut-off forms and base64 attachment bytes
+  of uploaded records. It exits when a named value is missing or shorter than
+  `MIN_SECRET_LENGTH`.
+- `trax machine` registers machines and their roles, labels and facts.
+  Matching `Client` methods and `/api/machines` routes cover list, get, put,
+  label changes and delete.
+- Machine credentials: an admin enrolls a machine for a one-use, 15-minute
+  token; the host joins once, heartbeats, and reads online until 180 s of
+  silence. A revoked credential answers 410, an unknown one 401.
+- `trax` takes its server and key from `TRACKINIZER_URL` and
+  `TRACKINIZER_TOKEN`. A malformed token is refused, and a lone token is
+  ignored.
+- Queued inbound messages carry `InboundDrainItem.source_role` and Chat
+  messages carry `ChatMessage.author_role`, the sender's attested role.
+- `Client.get` accepts a per-request `timeout`.
+
+### Changed
+
+- `trax env NAME del` reports success when the variable is already gone.
+  Variable rows are written before secret values.
+- `trax run` no longer masks a bare PEM armour fragment; full armour lines of
+  a configured PEM value are still masked.
+- **Breaking:** `Redactor.redact_json` and `redact_mapping` take `PlainTree`;
+  `redact_mapping` returns `Mapping[str, PlainTree]`.
+
 ### Fixed
 
 - `trax run claude -- --resume <session-id>` (also `--resume=<id>` and
@@ -16,6 +50,65 @@ All notable trackinizer changes are documented here. This project follows
   longer gets `--session-id` added, which claude rejects without
   `--fork-session`. A `--fork-session` run is given one, so its new transcript
   is captured.
+
+## 0.1.6 - 2026-10-07
+
+### Added
+
+- `Store.submit` accepts any concrete inquiry submission body, using the
+  same typed dispatcher for single submissions and mixed-kind batches.
+
+### Changed
+
+- **Breaking:** Python JSON types move from `trackinizer.lib.custom_json` to
+  `trackinizer.lib.codec`: client return annotations use `PlainTree`, and
+  session-record JSON fields use `Mapping[str, PlainTree]`. Wire-model JSON
+  aliases now live in `trackinizer.wire.json_types`.
+- Session payloads use the shared codec's record tags, while provider JSON
+  fields such as `extra` and tool arguments stay plain objects and arrays.
+  Reads still accept older plain records; the web transcript and conversation
+  feed accept both plain and tagged attachment arrays.
+- Structured Artifact snapshots no longer have a second 30 MB check after
+  citations are frozen. Publication requests remain capped at 30 MB, HTML
+  remains capped at 30 MB, and each publisher's storage remains 500 MB.
+
+### Fixed
+
+- `trax agentsession SEQ run claude|codex` writes the resumed transcript
+  before stamping its new CLI session id on the server, and stamps it before
+  starting the runner. A failed file write or missing reasoning ciphertext
+  leaves the server's session id unchanged.
+- Resume checks the records the target will actually write, including when
+  resuming in the same format, so dropped acts require `--lossy`. Native
+  runner arguments after `--` pass through unchanged.
+- `trax run` ends its session before waiting for the inbound poller to stop.
+  Ending a session releases held inbound requests immediately, instead of
+  making exit wait out the poll; queued messages are not drained to an
+  exiting runner.
+- Session search checks for locally cached weights before constructing an
+  embedder, including `model=` overrides, and falls back to full text when
+  weights are absent. Override instances are reused by resolved model name;
+  `dim` without `model` answers 400.
+- Session readers preserve malformed provider fields instead of aborting the
+  rest of a Claude, Codex or sagent transcript. Claude replay also handles
+  untyped foreign tool results and avoids duplicate calls when a result
+  precedes its call.
+- `trax` treats `run` and `metric` as literal field values unless they follow
+  a complete command subject or clause. Adding an already-present edge now
+  prints `exists:` instead of silently succeeding.
+- `GET /api/web/feed` rejects invalid time windows, and feed histograms choose
+  their starting point from records matching the requested filters.
+- Graph mirroring checks existing edges through their source inquiries,
+  instead of the newest-node graph window, so older edges are not reported
+  as newly added. Live graph replay rejects `--seed` with `--traverse` or
+  `--limit`.
+- Malformed signed session and OAuth-state cookie payloads are ignored
+  instead of raising a server error.
+
+### Removed
+
+- **Breaking:** `trackinizer.trax.run.materialize.materialize_claude`; use
+  `materialize(target="claude", ...)` instead.
 
 ## 0.1.5 - 2026-10-03
 
@@ -293,10 +386,6 @@ All notable trackinizer changes are documented here. This project follows
   `data_dir()/rekursiv-ai/trackinizer/`. Nothing migrates the old
   locations, so an existing profile or database is simply not found and
   has to be moved by hand.
-- A malformed request body returns HTTP 422 instead of 500. A stray key
-  in a client-supplied `message` raised a bare `ValueError` out of the
-  codec, which matched no handler; it is now a `SchemaError` the API
-  maps to 422, reporting both the offending and the valid field names.
 - Filters whose two evaluators would disagree are refused with a 400
   naming the spelling that works, rather than answered differently
   depending on which evaluator ran. Refused: a regex on a column with no

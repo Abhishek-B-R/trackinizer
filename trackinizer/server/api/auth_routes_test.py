@@ -10,7 +10,7 @@ import uuid
 
 import pytest
 
-from trackinizer.lib.custom_json import convert
+from trackinizer.lib.codec import from_plain
 from trackinizer.server.api.app import app
 from trackinizer.server.auth import AuthIdentity, current_user, generate_token
 
@@ -62,7 +62,7 @@ class TestCreateToken:
         r = client.post("/api/me/tokens", json={"name": "laptop"})
         assert r.status_code == 200, r.text
         raw: object = r.json()
-        body = convert(raw, dict[str, object])
+        body = from_plain(raw, dict[str, object])
         assert body["name"] == "laptop"
         # Defaults to caller's user role when ``role`` is omitted.
         assert body["role"] == "writer"
@@ -116,7 +116,7 @@ class TestCreateToken:
         engine.conn.fetchval = AsyncMock(return_value="writer")
         r = client.post("/api/me/tokens", json={"name": "ro", "role": "viewer"})
         assert r.status_code == 200, r.text
-        body = convert(r.json(), dict[str, object])
+        body = from_plain(r.json(), dict[str, object])
         assert body["role"] == "viewer"
 
     def test_scoped_key_cannot_mint_above_its_ceiling(
@@ -175,10 +175,10 @@ class TestListTokens:
         r = client.get("/api/me/tokens")
         assert r.status_code == 200, r.text
         raw: object = r.json()
-        body = convert(raw, dict[str, object])
-        token_values = convert(body["tokens"], list[object])
+        body = from_plain(raw, dict[str, object])
+        token_values = from_plain(body["tokens"], list[object])
         assert len(token_values) == 1
-        tok = convert(token_values[0], dict[str, object])
+        tok = from_plain(token_values[0], dict[str, object])
         assert tok["id"] == str(key_id)
         assert tok["prefix"] == "trax_aBcDeFgH"
         # The new ``role`` column lands in the wire shape so the UI can
@@ -388,6 +388,152 @@ class TestSetTokenRole:
             json={"role": "superuser"},
         )
         assert r.status_code == 422
+
+
+_WHEN = datetime(2026, 10, 9, 8, 0, tzinfo=UTC)
+_RULES_ID = uuid.UUID("33333333-3333-3333-3333-333333333333")
+
+
+async def _browser_identity() -> AuthIdentity:
+    """Return a signed-in browser's caller: a user with no API key."""
+    return AuthIdentity(
+        user_id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        api_key_id=None,
+        email="alice@example.com",
+        role="writer",
+    )
+
+
+def _browser_session() -> None:
+    """Serve the next requests as a signed-in browser."""
+    app.dependency_overrides[current_user] = _browser_identity
+
+
+class TestProfile:
+    def test_names_what_the_user_agreed_to_and_the_rules_in_force(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        engine.conn.fetchrow = AsyncMock(
+            side_effect=[
+                {
+                    "name": "Alice",
+                    "last_login": None,
+                    "visual_workspace_enabled": True,
+                    "acknowledged_at": _WHEN,
+                    "acknowledged_rules_version": "old",
+                },
+                {"id": str(_RULES_ID), "version": _WHEN},
+            ],
+        )
+        body = from_plain(client.get("/api/me/profile").json(), dict[str, object])
+        assert body["acknowledged_at"] == _WHEN.isoformat()
+        assert body["acknowledged_rules_version"] == "old"
+        assert body["rules_issue_id"] == str(_RULES_ID)
+        assert body["rules_version"] == _WHEN.isoformat()
+        rules_read = _sql(engine.conn.fetchrow.call_args_list[1])
+        assert rules_read == (
+            "SELECT issue.id, coalesce((SELECT max(log.created) FROM change_log AS log "
+            "WHERE log.subject_id = issue.id "
+            "AND log.kind IN ('title', 'description')), "
+            "issue.created) AS version "
+            "FROM inquiries AS issue "
+            "WHERE issue.kind = 'Issue' AND issue.seq = 1 AND issue.locked"
+        )
+
+    def test_has_no_rules_version_without_a_locked_rules_issue(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        engine.conn.fetchrow = AsyncMock(side_effect=[None, None])
+        body = from_plain(client.get("/api/me/profile").json(), dict[str, object])
+        assert body["rules_version"] is None
+        assert body["rules_issue_id"] is None
+        assert body["acknowledged_at"] is None
+        assert body["acknowledged_rules_version"] is None
+
+
+class TestAcknowledge:
+    def test_a_key_is_refused(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        r = client.put("/api/me/acknowledge", json={"rules_version": "v"})
+        assert r.status_code == 403
+        assert not engine.conn.execute.called
+        assert not engine.conn.fetchval.called
+
+    def test_a_browser_records_the_rules_version_in_force(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        _browser_session()
+        engine.conn.fetchrow = AsyncMock(
+            return_value={"id": _RULES_ID, "version": _WHEN},
+        )
+        engine.conn.fetchval = AsyncMock(return_value=_WHEN)
+        r = client.put(
+            "/api/me/acknowledge",
+            json={"rules_version": _WHEN.isoformat()},
+        )
+        assert r.status_code == 200, r.text
+        assert from_plain(r.json(), dict[str, object]) == {
+            "acknowledged_at": _WHEN.isoformat(),
+            "acknowledged_rules_version": _WHEN.isoformat(),
+        }
+        call = engine.conn.fetchval.call_args
+        assert "UPDATE users SET acknowledged_at" in _sql(call)
+        assert call.args[1:] == (
+            _WHEN.isoformat(),
+            uuid.UUID("11111111-1111-1111-1111-111111111111"),
+        )
+
+    def test_an_unknown_user_is_404(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        _browser_session()
+        engine.conn.fetchrow = AsyncMock(
+            return_value={"id": _RULES_ID, "version": _WHEN},
+        )
+        engine.conn.fetchval = AsyncMock(return_value=None)
+        r = client.put(
+            "/api/me/acknowledge",
+            json={"rules_version": _WHEN.isoformat()},
+        )
+        assert r.status_code == 404
+
+    def test_no_rules_in_force_is_409(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        _browser_session()
+        engine.conn.fetchrow = AsyncMock(return_value=None)
+        engine.conn.fetchval = AsyncMock(return_value=_WHEN)
+        r = client.put("/api/me/acknowledge", json={"rules_version": "none"})
+        assert r.status_code == 409
+        assert "no rules in force" in r.text
+        assert not engine.conn.fetchval.called
+
+    def test_rules_that_changed_since_they_were_read_are_409(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        _browser_session()
+        engine.conn.fetchrow = AsyncMock(
+            return_value={"id": _RULES_ID, "version": _WHEN},
+        )
+        engine.conn.fetchval = AsyncMock(return_value=_WHEN)
+        r = client.put("/api/me/acknowledge", json={"rules_version": "older"})
+        assert r.status_code == 409
+        assert not engine.conn.fetchval.called
 
 
 class TestRouteRequiresAuth:

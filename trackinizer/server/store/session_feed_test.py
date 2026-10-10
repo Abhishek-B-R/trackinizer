@@ -12,18 +12,25 @@ from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import itertools
+import json
 
 from asyncpg.pool import PoolConnectionProxy
 
 import pytest
 
-from trackinizer.lib.agent.types.sessions import UncategorizedRecord
-from trackinizer.lib.custom_json import json_freeze
+from trackinizer.lib.agent.types.sessions import (
+    AgentToAgentMessage,
+    Attachment,
+    UserMessage,
+)
+from trackinizer.lib.codec import mutable
 from trackinizer.server.store.session_feed import (
     WHOLE_FEED,
     BucketGrid,
     FeedScope,
+    _room_facets,
 )
+from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.wire.wire_sessions import (
     FeedActorFacet,
     FeedBucket,
@@ -43,9 +50,13 @@ _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _T0 = datetime(2026, 9, 1, tzinfo=UTC)
 _HUMAN = '{"content": "Go ahead.", "extra": {}}'
 _HARNESS = '{"content": "Stop hook feedback", "extra": {"isMeta": true}}'
-_SAID = '{"content": "Done.", "attachments": {"py/tuple": []}, "extra": {}}'
-_BLANK = '{"content": " \\n", "attachments": {"py/tuple": []}, "extra": {}}'
+_SAID = '{"content": "Done.", "attachments": [], "extra": {}}'
+_BLANK = '{"content": " \\n", "attachments": [], "extra": {}}'
 _ATTACHED = (
+    '{"content": null, "attachments": [{"mime_descriptor": "image/png"}], "extra": {}}'
+)
+# The same message as a codec-tagged row: its attachments tuple is a ``py/tuple``.
+_ATTACHED_TAGGED = (
     '{"content": null, "attachments": {"py/tuple": [{"mime_descriptor": "image/png"}]},'
     ' "extra": {}}'
 )
@@ -56,13 +67,13 @@ _QUEUED = (
 # A codex agent's message to another, in the envelope codex writes before it.
 _PEER = (
     '{"content": "Message Type: %s\\nTask name: /root\\nSender: /root/prototype'
-    '\\nPayload:\\n%s", "attachments": {"py/tuple": []}, "extra": {}}'
+    '\\nPayload:\\n%s", "attachments": [], "extra": {}}'
 )
 # What a harness writes on the user's turn, no person: codex's context, and the
 # notice Claude Code gives when a background task ends.
 _CODEX_CONTEXT = (
     '{"content": "<codex_internal_context source=\\"goal\\">\\nKeep going.\\n'
-    '</codex_internal_context>", "attachments": {"py/tuple": []}, "extra": {}}'
+    '</codex_internal_context>", "attachments": [], "extra": {}}'
 )
 _TASK_NOTICE = (
     '{"content": "<task-notification>\\n<status>completed</status>\\n'
@@ -71,6 +82,35 @@ _TASK_NOTICE = (
 
 
 # ---- The bucket grid --------------------------------------------------------
+
+
+def test_room_facets_total_each_room_largest_first() -> None:
+    """A room counts every session of each actor in it; ties order by name."""
+    seen = datetime(2026, 10, 7, tzinfo=UTC)
+    actors = [
+        FeedActorFacet(
+            actor=actor,
+            session_id=uuid4(),
+            cli=None,
+            rooms=list(rooms),
+            count=count,
+            conversation=0,
+            last=seen,
+            ended=None,
+        )
+        for actor, rooms, count in (
+            ("b", ("r1", "r2"), 2),
+            ("a", ("r2",), 3),
+            ("c", ("r3",), 2),
+            ("d", ("r2",), 1),
+        )
+    ]
+
+    assert _room_facets(actors) == [
+        FeedRoomFacet(room="r2", count=6, actors=["a", "b", "d"]),
+        FeedRoomFacet(room="r1", count=2, actors=["b"]),
+        FeedRoomFacet(room="r3", count=2, actors=["c"]),
+    ]
 
 
 def test_the_grid_is_the_finest_that_fits_on_multiples_of_its_width() -> None:
@@ -381,6 +421,7 @@ async def test_the_conversation_feed_keeps_what_the_facets_count(
         ("AgentToAgentMessage", _PEER % ("FINAL_ANSWER", "Implemented.")),
         ("UserMessage", _CODEX_CONTEXT),
         ("UserMessage", _TASK_NOTICE),
+        ("AgentToAgentMessage", _ATTACHED_TAGGED),
     )
     await _records(
         integ_store,
@@ -405,8 +446,9 @@ async def test_the_conversation_feed_keeps_what_the_facets_count(
         (4, "AgentToAgentMessage"),
         (5, "ContextState"),
         (9, "AgentToAgentMessage"),
+        (12, "AgentToAgentMessage"),
     ]
-    assert [event.seq for event in newest] == [5, 9]
+    assert [event.seq for event in newest] == [9, 12]
     assert [actor.conversation for actor in facets.actors] == [len(said)]
     assert len(await integ_store.read_feed(scope=talker)) == len(turns)
 
@@ -481,42 +523,6 @@ async def test_every_feed_read_shows_only_each_part_s_live_prefix(
     )
     for events in reads:
         assert [(event.part, event.seq) for event in events] == [(0, 0), (0, 1)]
-
-
-# Archived before tuples became plain arrays: the tag sits in an untyped payload,
-# where nothing fails on it.
-_OLD_UNCATEGORIZED = (
-    '{"kind": "attachment", "payload": {"names": {"py/tuple": ["Bash"]}}}'
-)
-
-
-@pytest.mark.db_pglite
-@pytest.mark.asyncio(loop_scope="session")
-async def test_a_row_stored_in_the_old_format_reads_back_untagged(
-    integ_store: Store,
-) -> None:
-    """A resume and the feed both see an archived row in the current shape."""
-    session = await _session(integ_store, "archivist")
-    await _records(
-        integ_store,
-        session,
-        [("UncategorizedRecord", _T0, _OLD_UNCATEGORIZED)],
-    )
-
-    (row,) = await integ_store.read_session_records(session, part=0)
-    events = [
-        event for event in await integ_store.read_feed() if event.session_id == session
-    ]
-
-    assert row.record() == UncategorizedRecord(
-        kind="attachment",
-        payload=json_freeze({"names": ["Bash"]}),
-    )
-    assert [
-        event.model_dump(mode="json")["message"]["payload"] for event in events
-    ] == [
-        {"names": ["Bash"]},
-    ]
 
 
 # ---- The histogram ----------------------------------------------------------
@@ -650,6 +656,75 @@ async def test_an_empty_feed_is_one_empty_bucket(integ_store: Store) -> None:
         scope=WHOLE_FEED,
     )
     assert histogram.counts == [FeedBucket(start=_T0, count=0)]
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("peer", [False, True])
+async def test_typed_attachment_only_messages_are_conversation(
+    integ_store: Store,
+    peer: bool,
+) -> None:
+    session_id = await _session(integ_store, "attached")
+    attachments = (Attachment(mime_descriptor="image/png", data=b"image"),)
+    record = (
+        AgentToAgentMessage(
+            content="Message Type: MESSAGE\nTask name: /root\nSender: /peer\nPayload:\n",
+            attachments=attachments,
+        )
+        if peer
+        else UserMessage(attachments=attachments)
+    )
+    row = SessionRecordRow.of(session_id=session_id, part=0, idx=0, record=record)
+    await _records(
+        integ_store,
+        session_id,
+        [(row.kind, _T0, json.dumps(mutable(row.payload)))],
+    )
+    facets = await integ_store.read_feed_facets(
+        since=None,
+        until=None,
+        scope=WHOLE_FEED,
+    )
+    assert [(actor.count, actor.conversation) for actor in facets.actors] == [(1, 1)]
+    events = await integ_store.read_feed(conversation=True)
+    assert [(event.session_id, event.kind) for event in events] == [
+        (session_id, row.kind),
+    ]
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize(
+    "scope",
+    [
+        FeedScope(actors=("picked",)),
+        FeedScope(clis=("codex",)),
+        FeedScope(kinds=("UserMessage",)),
+        FeedScope(rooms=("picked-room",)),
+    ],
+)
+async def test_histogram_without_since_uses_scoped_first_record(
+    integ_store: Store,
+    scope: FeedScope,
+) -> None:
+    first = await _session(integ_store, "outside")
+    picked = await _session(integ_store, "picked", cli="codex", rooms=("picked-room",))
+    await _records(integ_store, first, [("ToolCall", _T0, "{}")])
+    await _records(
+        integ_store,
+        picked,
+        [("UserMessage", _T0 + timedelta(hours=5.5), _HUMAN)],
+    )
+    histogram = await integ_store.read_feed_histogram(
+        since=None,
+        until=_T0 + timedelta(hours=7),
+        earliest=_T0,
+        buckets=2,
+        scope=scope,
+    )
+    assert histogram.start == _T0 + timedelta(hours=4)
+    assert [bucket.count for bucket in histogram.counts] == [1, 0]
 
 
 # ---- Helpers ----------------------------------------------------------------

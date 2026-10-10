@@ -17,7 +17,7 @@ import pytest
 
 from trackinizer.client.client import Client, EdgeWrite
 from trackinizer.lib.absent import Absent
-from trackinizer.lib.custom_json import JSONValue, convert
+from trackinizer.lib.codec import PlainTree, from_plain
 from trackinizer.trax import cli
 from trackinizer.types.inquiries import Inquiry
 from trackinizer.wire.filters import (
@@ -51,7 +51,7 @@ from trackinizer.wire.wire_sessions import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
     from types import TracebackType
 
@@ -409,7 +409,7 @@ class FakeClient:
         offset: int = 0,
         seq_ranges: Sequence[SeqRange] = (),
         filters: Sequence[Filter] = (),
-    ) -> list[dict[str, JSONValue]]:
+    ) -> list[dict[str, PlainTree]]:
         """List kind."""
         self.calls.append(
             (
@@ -435,7 +435,10 @@ class FakeClient:
                 row
                 for row in rows
                 if any(
-                    _seq_in_interval(convert(row.get("seq"), int, default=0), interval)
+                    _seq_in_interval(
+                        from_plain(row.get("seq"), int, default=0),
+                        interval,
+                    )
                     for interval in seq_ranges
                 )
             ]
@@ -462,7 +465,7 @@ class FakeClient:
         for filt in filters:
             rows = [row for row in rows if bool(match_filter(_storage_view(row), filt))]
         return cast(
-            list[dict[str, JSONValue]],
+            list[dict[str, PlainTree]],
             cast(
                 object,
                 rows[offset : offset + limit],
@@ -476,7 +479,7 @@ class FakeClient:
         status: Inquiry.Status | None = None,
         seq_ranges: Sequence[SeqRange] = (),
         filters: Sequence[Filter] = (),
-    ) -> list[dict[str, JSONValue]]:
+    ) -> list[dict[str, PlainTree]]:
         """Page past the cap, mirroring the real client's whole-collection fetch.
 
         Records a ``list_kind_all`` call, then pages via ``list_kind`` in
@@ -495,7 +498,7 @@ class FakeClient:
                 },
             ),
         )
-        rows: list[dict[str, JSONValue]] = []
+        rows: list[dict[str, PlainTree]] = []
         offset = 0
         while True:
             page = self.list_kind(
@@ -514,7 +517,7 @@ class FakeClient:
     def get_inquiry(
         self,
         ref: Ref,
-    ) -> tuple[Inquiry.InquiryKind, uuid.UUID, dict[str, JSONValue]]:
+    ) -> tuple[Inquiry.InquiryKind, uuid.UUID, dict[str, PlainTree]]:
         """Get inquiry."""
         self.calls.append(("get_inquiry", (ref,), {}))
         if isinstance(ref, UuidRef):
@@ -544,7 +547,7 @@ class FakeClient:
         detail = dict(self.detail)
         detail["self"] = row
         return cast(
-            tuple[Inquiry.InquiryKind, uuid.UUID, dict[str, JSONValue]],
+            tuple[Inquiry.InquiryKind, uuid.UUID, dict[str, PlainTree]],
             cast(
                 object,
                 (
@@ -555,11 +558,11 @@ class FakeClient:
             ),  # -- fake detail payload is JSON-shaped.
         )
 
-    def next_issue(self) -> dict[str, JSONValue] | None:
+    def next_issue(self) -> dict[str, PlainTree] | None:
         """Next issue."""
         self.calls.append(("next_issue", (), {}))
         return cast(
-            dict[str, JSONValue] | None,
+            dict[str, PlainTree] | None,
             self.next_payload,  # -- fake payload is JSON-shaped.
         )
 
@@ -569,7 +572,7 @@ class FakeClient:
         owner: Inquiry.Actor,
         actor: Inquiry.Actor | None = None,
         reason: str = "",
-    ) -> dict[str, JSONValue] | None:
+    ) -> dict[str, PlainTree] | None:
         """Record a claim; the fake hands back its canned next-issue row."""
         self.calls.append(
             (
@@ -579,7 +582,7 @@ class FakeClient:
             ),
         )
         return cast(
-            dict[str, JSONValue] | None,
+            dict[str, PlainTree] | None,
             self.next_payload,  # -- fake payload is JSON-shaped.
         )
 
@@ -621,11 +624,11 @@ class FakeClient:
             ),
         )
 
-    def recent_changes(self, *, limit: int = 50) -> list[dict[str, JSONValue]]:
+    def recent_changes(self, *, limit: int = 50) -> list[dict[str, PlainTree]]:
         """Recent changes."""
         self.calls.append(("recent_changes", (), {"limit": limit}))
         return cast(
-            list[dict[str, JSONValue]],
+            list[dict[str, PlainTree]],
             cast(object, list(self.changes)),  # -- fake changes are JSON-shaped.
         )
 
@@ -635,12 +638,12 @@ class FakeClient:
         *,
         semantic: bool = True,
         limit: int = 20,
-    ) -> dict[str, JSONValue]:
+    ) -> dict[str, PlainTree]:
         """Search sessions."""
         self.calls.append(
             ("search_sessions", (query,), {"semantic": semantic, "limit": limit}),
         )
-        return cast("dict[str, JSONValue]", cast(object, dict(self.session_hits)))
+        return cast("dict[str, PlainTree]", cast(object, dict(self.session_hits)))
 
     def cost_for(self, target_id: uuid.UUID, *, deep: bool = False) -> dict[str, float]:
         """Cost for."""
@@ -703,6 +706,7 @@ class FakeClient:
         # carry it on the upsert (the store collapses empty), so it threads the
         # clear through ``annotate_edge`` after the POST. Mirror that here so a
         # test sees the same two-call shape (TRAX-CLI-004).
+        label_tuple = tuple(labels or ())
         self.calls.append(
             (
                 "add_edge",
@@ -712,7 +716,7 @@ class FakeClient:
                     "priority": priority,
                     "note": note,
                     "valence": valence,
-                    "labels": () if labels is None else tuple(labels),
+                    "labels": label_tuple,
                     "reason": reason,
                 },
             ),
@@ -730,8 +734,8 @@ class FakeClient:
             supplied["note"] = note
         if valence is not None:
             supplied["valence"] = valence
-        if labels:
-            supplied["labels"] = tuple(labels)
+        if label_tuple:
+            supplied["labels"] = label_tuple
         created = key not in self._edges
         if created:
             self._edges[key] = supplied
@@ -985,6 +989,47 @@ class FakeClient:
         """Send message."""
         self.calls.append(("send_message", (actor, text), {"room": room}))
         return [self.target_id]
+
+    def read_workspace(self, workspace_id: uuid.UUID) -> dict[str, PlainTree]:
+        """Read workspace."""
+        self.calls.append(("read_workspace", (workspace_id,), {}))
+        return {"id": str(workspace_id), "revision": 0, "visuals": []}
+
+    def apply_workspace_operation(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        operation: Mapping[str, object],
+    ) -> dict[str, PlainTree]:
+        """Apply workspace operation."""
+        self.calls.append(
+            (
+                "apply_workspace_operation",
+                (workspace_id,),
+                {"operation": dict(operation)},
+            ),
+        )
+        return {"id": str(workspace_id), "revision": 1, "visuals": []}
+
+    def navigate(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        route: str,
+    ) -> dict[str, PlainTree]:
+        """Navigate."""
+        self.calls.append(("navigate", (workspace_id,), {"route": route}))
+        return {"id": str(workspace_id), "revision": 0, "visuals": []}
+
+    def highlight(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        ids: Sequence[uuid.UUID],
+    ) -> dict[str, PlainTree]:
+        """Highlight."""
+        self.calls.append(("highlight", (workspace_id,), {"ids": list(ids)}))
+        return {"id": str(workspace_id), "revision": 0, "visuals": []}
 
     def add_subscriber(
         self,

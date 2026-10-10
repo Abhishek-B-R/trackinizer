@@ -25,11 +25,13 @@ import os
 import re
 
 from trackinizer.lib.agent.sessions import claude
-from trackinizer.trax.run.adapters.tail import Tail
+from trackinizer.lib.agent.sessions.tail import Tail
 
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    from trackinizer.types.streams import TraxRecord
 
 
 _NOT_KEPT: Final = re.compile(r"[^A-Za-z0-9-]")
@@ -59,8 +61,10 @@ class ClaudeAdapter:
         # loaded. ``$CLAUDE_CONFIG_DIR`` is where claude itself keeps its
         # config root -- hermetic launchers point it at a throwaway dir -- so
         # honor it, else ``~/.claude``.
-        root = os.environ.get("CLAUDE_CONFIG_DIR")
-        return (Path(root) if root else Path.home() / ".claude") / "projects"  # noqa: TID251 -- vendor fixed path, not ours (AGENTS.md rule 3)  # house-ignore[xdg-literal] -- Vendor CLI's fixed home path, not ours (AGENTS.md rule 3).
+        root = os.environ.get("CLAUDE_CONFIG_DIR", "")
+        if root:
+            return Path(root) / "projects"
+        return Path.home() / ".claude" / "projects"  # noqa: TID251 -- vendor fixed path, not ours (AGENTS.md rule 3)  # house-ignore[xdg-literal] -- Vendor CLI's fixed home path, not ours (AGENTS.md rule 3).
 
     def session_dirs(self) -> Iterable[Path]:
         """Return the directories this CLI writes sessions under."""
@@ -118,6 +122,6 @@ class ClaudeAdapter:
             return None
         return path.stem or None
 
-    def reader(self) -> Tail:
+    def reader(self) -> Tail[TraxRecord]:
         """Return a fresh IR reader for one claude session file."""
         return Tail(claude.normalize)

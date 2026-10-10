@@ -12,9 +12,12 @@ from urllib.parse import parse_qs, urlparse
 
 import json
 import os
+import time
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.routing import APIRoute
+from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
 
 
@@ -33,7 +36,7 @@ import pytest
 import pytest_asyncio
 
 from trackinizer.conftest import FakeEngine, make_conn, make_store, new_uuid
-from trackinizer.lib.custom_json import convert, parse
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.lib.postgres import Conn
 from trackinizer.lib.postgres.testing import reset_schema
 from trackinizer.server import web
@@ -145,6 +148,7 @@ def _inquiry_row(**overrides: object) -> dict[str, object]:
         "subscribers": ["bob"],
         "marginal_cost_agent_usd": 1.5,
         "marginal_cost_resource_usd": 2.5,
+        "locked": False,
         "created": now,
         "modified": now,
         "belief_judgement": None,
@@ -181,6 +185,7 @@ def _null_row(kind: Inquiry.InquiryKind) -> dict[str, object]:
         "title": "title",
         "marginal_cost_agent_usd": 0.0,
         "marginal_cost_resource_usd": 0.0,
+        "locked": False,
         "created": now,
         "modified": now,
     }
@@ -894,6 +899,10 @@ class TestRoutes:
         response = client.get("/static/report.html")
         assert response.status_code == 200
         assert response.text == "<html>report</html>"
+        # The mount is named, so a template can ask for a static file by name.
+        assert (
+            str(app.url_path_for("static", path="report.html")) == "/static/report.html"
+        )
 
     def test_attach_is_idempotent(self, tmp_path: Path) -> None:
         # ``server.py`` calls ``attach`` on the module-global app; a second
@@ -1098,7 +1107,7 @@ class TestFeedReads:
         response = client.get("/api/web/feed/histogram", params={"kind": "ToolCall"})
 
         assert response.status_code == 200, response.text
-        assert convert(response.json(), dict[str, object])["counts"] == [
+        assert from_plain(response.json(), dict[str, object])["counts"] == [
             {"start": "2026-10-01T00:00:00Z", "count": 3},
         ]
         kwargs = store.read_feed_histogram.call_args.kwargs
@@ -1195,6 +1204,40 @@ class TestRouteBounds:
         r = c.get("/api/web/recent_changes", params={"limit": 5000})
         assert r.status_code == 400
 
+    @pytest.mark.parametrize(
+        "zone",
+        ["Pacific/Kiritimati", "America/Los_Angeles", "Europe/Berlin"],
+    )
+    def test_feed_reads_a_naive_window_as_utc(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        zone: str,
+    ) -> None:
+        """Read a naive ``since`` and ``until`` as UTC whatever the zone is."""
+        store = AsyncMock()
+        read_feed = AsyncMock(return_value=[])
+        store.read_feed = read_feed
+        app = FastAPI()
+        app.state.engine = FakeEngine()
+        app.state.store = store
+        app.include_router(web.router, prefix="/api/web")
+        c = self._client(app)
+        monkeypatch.setenv("TZ", zone)
+        time.tzset()
+        try:
+            c.get(
+                "/api/web/feed",
+                params={"since": "2024-12-10T00:00:00", "until": "2024-12-11T00:00:00"},
+            )
+        finally:
+            monkeypatch.undo()
+            time.tzset()
+        kwargs = cast("dict[str, datetime]", read_feed.call_args.kwargs)
+        assert kwargs["since"].tzinfo is not None
+        assert kwargs["until"].tzinfo is not None
+        assert kwargs["since"] == datetime(2024, 12, 10, tzinfo=UTC)
+        assert kwargs["until"] == datetime(2024, 12, 11, tzinfo=UTC)
+
     def test_search_rejects_invalid_regex(self) -> None:
         engine = FakeEngine()
         store = AsyncMock()
@@ -1221,7 +1264,7 @@ class TestRouteBounds:
         # return wrong matches.
         r = c.get("/api/web/search", params={"q": 'title:"unclosed'})
         assert r.status_code == 400
-        body = convert(r.json(), dict[str, object])
+        body = from_plain(r.json(), dict[str, object])
         detail = body["detail"]
         assert isinstance(detail, str)
         assert "quot" in detail
@@ -1238,7 +1281,7 @@ class TestRouteBounds:
         # token search for ``%title:%``; now it is a 400.
         r = c.get("/api/web/search", params={"q": "title:"})
         assert r.status_code == 400
-        body = convert(r.json(), dict[str, object])
+        body = from_plain(r.json(), dict[str, object])
         detail = body["detail"]
         assert isinstance(detail, str)
         assert "empty" in detail
@@ -1265,7 +1308,7 @@ class TestRouteBounds:
             ],
         )
         assert r.status_code == 200, r.text
-        assert [set(hit) for hit in convert(r.json(), list[dict[str, object]])] == [
+        assert [set(hit) for hit in from_plain(r.json(), list[dict[str, object]])] == [
             {"id", "title"},
         ]
         r = c.get("/api/web/search", params=[*query, ("fields", "bogus")])
@@ -1328,7 +1371,7 @@ class TestLoginPage:
         (google,) = (
             attrs
             for tag, attrs in _login_page_tags()
-            if tag == "a" and (attrs.get("href") or "").startswith("/auth/login")
+            if tag == "a" and attrs.get("href", "").startswith("/auth/login")
         )
         assert "hidden" in google
 
@@ -1376,6 +1419,55 @@ def _build_app_dir_app(tmp_path: Path, app_dir: Path) -> FastAPI:
     return app
 
 
+class TestAttachedRoutes:
+    def test_every_route_is_get_only_and_off_the_schema(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        # The UI's pages and redirects are not API; a stray method or schema entry
+        # would publish them as endpoints.
+        assets = tmp_path / "pages"
+        assets.mkdir()
+        (assets / "login.html").write_text("LOGIN")
+        app = FastAPI()
+        web.attach(app, assets_dir=assets, app_dir=tmp_path / "missing")
+        routes = {
+            r.path: r
+            for r in app.routes
+            if isinstance(r, APIRoute) and not r.path.startswith("/api/web")
+        }
+        assert set(routes) == {
+            "/app/{path:path}",
+            "/",
+            "/me",
+            "/admin",
+            "/graph",
+            "/console",
+            "/auth/login_page",
+        }
+        for route in routes.values():
+            assert route.methods == {"GET"}
+            assert route.include_in_schema is False
+
+    def test_app_files_skip_the_directory_check(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Starlette ignores a falsy ``check_dir`` of any spelling, so only the
+        # argument itself shows the server may start before a build exists.
+        seen: list[bool] = []
+
+        class Spy(StaticFiles):
+            def __init__(self, *, directory: Path, check_dir: bool) -> None:
+                seen.append(check_dir)
+                super().__init__(directory=directory, check_dir=check_dir)
+
+        monkeypatch.setattr(web, "StaticFiles", Spy)
+        web._app_files(tmp_path / "missing")
+        assert seen == [False]
+
+
 class TestAppDir:
     def test_signed_out_page_redirects_to_login_with_next(
         self,
@@ -1392,6 +1484,18 @@ class TestAppDir:
             location = urlparse(r.headers["location"])
             assert location.path == "/auth/login_page"
             assert parse_qs(location.query)["next"] == [path]
+
+    def test_the_app_and_its_redirects_stay_out_of_the_api_schema(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        app = _build_app_dir_app(tmp_path, _write_build(tmp_path / "b", marker="a"))
+        schema = from_plain(app.openapi(), dict[str, object])
+        paths = set(from_plain(schema["paths"], dict[str, object]))
+        assert paths.isdisjoint(
+            {"/", "/me", "/admin", "/graph", "/console", "/app/{path}"},
+        )
+        assert "/api/web/get/{target_id}" in paths
 
     def test_signed_out_asset_is_401(self, tmp_path: Path) -> None:
         # A script or stylesheet cannot follow a redirect to the login page,
@@ -1778,26 +1882,26 @@ async def test_peers_carry_their_own_created_and_priority_on_a_real_engine(
     request = cast(Request, _request(pglite_store, pglite_store.engine))
     parent_view = await web.web_get(parent, request, identity=_TEST_IDENTITY)
     child_view = await web.web_get(child, request, identity=_TEST_IDENTITY)
-    (child_ref,) = convert(
-        convert(parent_view["backlinks"], dict[str, object])["narrows"],
+    (child_ref,) = from_plain(
+        from_plain(parent_view["backlinks"], dict[str, object])["narrows"],
         list[object],
     )
-    (parent_ref,) = convert(
-        convert(child_view["edges"], dict[str, object])["narrows"],
+    (parent_ref,) = from_plain(
+        from_plain(child_view["edges"], dict[str, object])["narrows"],
         list[object],
     )
     child_ref, parent_ref = (
-        convert(child_ref, dict[str, object]),
-        convert(parent_ref, dict[str, object]),
+        from_plain(child_ref, dict[str, object]),
+        from_plain(parent_ref, dict[str, object]),
     )
     assert (
         parent_ref["peer_created"]
-        == convert(parent_view["self"], dict[str, object])["created"]
+        == from_plain(parent_view["self"], dict[str, object])["created"]
     )
     assert parent_ref["peer_priority"] == 10
     assert (
         child_ref["peer_created"]
-        == convert(child_view["self"], dict[str, object])["created"]
+        == from_plain(child_view["self"], dict[str, object])["created"]
     )
     # Neither the child nor the edge has a priority, so the ref carries neither.
     assert "peer_priority" not in child_ref
@@ -1824,11 +1928,52 @@ async def test_web_get_breaks_change_time_ties_by_id_on_a_real_engine(
     request = cast(Request, _request(pglite_store, pglite_store.engine))
     detail = await web.web_get(target_id, request, identity=_TEST_IDENTITY)
     change_ids = [
-        convert(convert(change, dict[str, object])["id"], str)
-        for change in convert(detail["changes"], list[object])
+        from_plain(from_plain(change, dict[str, object])["id"], str)
+        for change in from_plain(detail["changes"], list[object])
     ]
     assert len(change_ids) == 5
     assert change_ids == sorted(change_ids, reverse=True)
+
+
+def test_graph_node_keeps_an_empty_title_empty_and_a_belief_verdict() -> None:
+    row = {
+        **_inquiry_row(title=None),
+        "belief_judgement": "proven",
+        "belief_confidence": 0.5,
+    }
+    node = web._graph_node(cast("asyncpg.Record", row))
+    assert node["title"] == ""
+    assert (node["judgement"], node["confidence"]) == ("proven", 0.5)
+    plain = web._graph_node(
+        cast(
+            "asyncpg.Record",
+            {**_inquiry_row(), "belief_judgement": None, "belief_confidence": None},
+        ),
+    )
+    assert plain["title"] == "title"
+    assert "judgement" not in plain
+    assert "confidence" not in plain
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+async def test_web_get_reports_whether_the_row_is_locked(
+    pglite_store: Store,
+) -> None:
+    """The detail view carries ``locked`` beside ``self``, true only once set."""
+    target_id = await pglite_store.submit_issue(
+        SubmitIssue(account="alice@example.com", title="rules"),
+    )
+    request = cast(Request, _request(pglite_store, pglite_store.engine))
+    before = await web.web_get(target_id, request, identity=_TEST_IDENTITY)
+    async with pglite_store.engine.acquire() as conn:
+        await conn.execute(
+            "UPDATE inquiries SET locked = TRUE WHERE id = $1",
+            target_id,
+        )
+    after = await web.web_get(target_id, request, identity=_TEST_IDENTITY)
+
+    assert (before["locked"], after["locked"]) == (False, True)
 
 
 @pytest.mark.db_pglite
@@ -1902,8 +2047,8 @@ async def test_web_graph_returns_at_most_limit_nodes_on_a_real_engine(
     ):
         graph = await web.web_graph(request, identity=_TEST_IDENTITY, limit=limit)
         nodes = [
-            convert(n, dict[str, object])["id"]
-            for n in convert(graph["nodes"], list[object])
+            from_plain(n, dict[str, object])["id"]
+            for n in from_plain(graph["nodes"], list[object])
         ]
         assert nodes == [str(n) for n in kept], limit
         assert _edge_ids(graph) == {
@@ -1965,7 +2110,8 @@ async def test_web_graph_draws_a_focus_neighbourhood_on_a_real_engine(
             hops=hops,
         )
         nodes = [
-            convert(n, dict[str, object]) for n in convert(graph["nodes"], list[object])
+            from_plain(n, dict[str, object])
+            for n in from_plain(graph["nodes"], list[object])
         ]
         # Oldest first, as without a focus.
         assert [(n["id"], n["hops"]) for n in nodes] == [
@@ -2012,8 +2158,8 @@ async def test_web_graph_draws_60_nodes_round_a_focus_and_1000_without(
         )
     request = cast(Request, _request(pglite_store, pglite_store.engine))
     around = await web.web_graph(request, identity=_TEST_IDENTITY, focus=hub)
-    assert len(convert(around["nodes"], list[object])) == 60
-    whole = convert(
+    assert len(from_plain(around["nodes"], list[object])) == 60
+    whole = from_plain(
         (await web.web_graph(request, identity=_TEST_IDENTITY))["nodes"],
         list[dict[str, object]],
     )
@@ -2046,7 +2192,7 @@ class TestSubscribeProbe:
         if status != 200:
             return status, headers, []
         frames = [
-            parse(frame.removeprefix(b"data: "), dict[str, object])
+            from_plain(loads(frame.removeprefix(b"data: ")), dict[str, object])
             for frame in body.split(b"\n\n")[:-1]
         ]
         return status, headers, frames
@@ -2061,8 +2207,8 @@ class TestSubscribeProbe:
         assert headers["content-type"].startswith("text/event-stream")
         assert "no-transform" not in headers.get("cache-control", "")
         # Frames at 0.02, 0.04, 0.06 and 0.08 s; none at or after for_sec.
-        assert [convert(f["seq"], int) for f in frames] == [0, 1, 2, 3]
-        elapsed = [convert(f["t"], float) for f in frames]
+        assert [from_plain(f["seq"], int) for f in frames] == [0, 1, 2, 3]
+        elapsed = [from_plain(f["t"], float) for f in frames]
         assert elapsed[0] >= 0.02
         assert elapsed == sorted(elapsed)
         assert elapsed[-1] < 0.09
@@ -2070,7 +2216,7 @@ class TestSubscribeProbe:
     def test_one_frame_without_an_interval(self) -> None:
         # One byte, then silence until for_sec: the idle-cut experiment.
         _, _, frames = self._get(first_after_sec=0, for_sec=0.05)
-        assert [convert(f["seq"], int) for f in frames] == [0]
+        assert [from_plain(f["seq"], int) for f in frames] == [0]
 
     def test_no_bytes_when_the_first_is_due_after_the_end(self) -> None:
         # Headers only: the experiment for a proxy that holds them.
@@ -2109,12 +2255,13 @@ def _edge_ids(graph: web.WebView) -> set[tuple[object, object]]:
     return {
         (edge["from_id"], edge["to_id"])
         for edge in (
-            convert(e, dict[str, object]) for e in convert(graph["edges"], list[object])
+            from_plain(e, dict[str, object])
+            for e in from_plain(graph["edges"], list[object])
         )
     }
 
 
-def _login_page_tags() -> list[tuple[str, dict[str, str | None]]]:
+def _login_page_tags() -> list[tuple[str, dict[str, str]]]:
     """Fetch the shipped login page; return its start tags and their attributes."""
     app = FastAPI()
     web.attach(app)
@@ -2130,11 +2277,11 @@ class _StartTags(HTMLParser):
 
     def __init__(self) -> None:
         super().__init__()
-        self.tags: list[tuple[str, dict[str, str | None]]] = []
+        self.tags: list[tuple[str, dict[str, str]]] = []
 
     @override
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.tags.append((tag, dict(attrs)))
+        self.tags.append((tag, {name: value or "" for name, value in attrs}))
 
 
 if __name__ == "__main__":

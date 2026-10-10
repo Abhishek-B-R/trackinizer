@@ -21,7 +21,7 @@ import re
 import pytest
 import pytest_asyncio
 
-from trackinizer.lib.custom_json import convert, json_unfreeze
+from trackinizer.lib.codec import from_plain, mutable
 from trackinizer.server.embedders.stub import StubEmbedder
 from trackinizer.server.store import legacy_retype_runner
 from trackinizer.server.store.core import Store
@@ -160,7 +160,7 @@ async def test_ciphertext_rekeys_to_the_thinking_record(store: Store) -> None:
         await retype_session(conn, session_id)
 
     rows = await store.read_session_records(session_id, part=-1, limit=500)
-    sealed = {row.kind: row.ciphertext for row in rows if row.ciphertext}
+    sealed = {row.kind: row.ciphertext for row in rows if row.ciphertext is not None}
     assert sealed == {"Thinking": _ENCRYPTED + _SIGNATURE}
 
 
@@ -186,7 +186,7 @@ async def test_unknown_message_survives_byte_for_byte(store: Store) -> None:
     unknown_before = next(
         row
         for row in before
-        if convert(row.payload, dict[str, object]).get("kind")
+        if from_plain(row.payload, dict[str, object]).get("kind")
         == "legacy/UnknownMessage"
     )
 
@@ -195,8 +195,8 @@ async def test_unknown_message_survives_byte_for_byte(store: Store) -> None:
 
     after = await store.read_session_records(session_id, part=-1, limit=500)
     unknown_after = next(row for row in after if row.kind == "UncategorizedRecord")
-    assert json.dumps(json_unfreeze(unknown_after.payload)) == json.dumps(
-        json_unfreeze(unknown_before.payload),
+    assert json.dumps(mutable(unknown_after.payload)) == json.dumps(
+        mutable(unknown_before.payload),
     )
     assert unknown_after.text == unknown_before.text
 
@@ -390,6 +390,29 @@ def test_a_malformed_row_names_the_field(
     rows = _Rows([_row("UserMessage", "{}", **{field: value})])
     with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
         _read(rows, uuid4())
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+async def test_slash_command_without_timestamp_uses_capture_time(store: Store) -> None:
+    session_id = await _legacy_session(store)
+    async with store.engine.acquire() as conn:
+        await conn.execute(
+            "UPDATE session_records SET timestamp = NULL WHERE session_id = $1 "
+            "AND payload::jsonb ->> 'kind' = 'legacy/SlashCommand'",
+            session_id,
+        )
+        created = await conn.fetchval(
+            "SELECT created FROM session_records WHERE session_id = $1 "
+            "AND payload::jsonb ->> 'kind' = 'legacy/SlashCommand'",
+            session_id,
+        )
+        await retype_session(conn, session_id)
+        timestamp = await conn.fetchval(
+            "SELECT timestamp FROM session_slash_commands WHERE session_id = $1",
+            session_id,
+        )
+    assert timestamp == created
 
 
 if __name__ == "__main__":

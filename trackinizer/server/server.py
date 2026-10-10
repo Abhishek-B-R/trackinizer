@@ -307,6 +307,17 @@ def _parse_args(
         ),
     )
     parser.add_argument(
+        "--assistant",
+        default=os.environ.get("TRACKINIZER_ASSISTANT", ""),
+        metavar="ACTOR=EMAIL",
+        help=(
+            "The shared Chat partner: a live session whose granted actor is "
+            "ACTOR (or ACTOR#N) and whose API key belongs to the account EMAIL "
+            "is the Chat partner of every canvas "
+            "(default: $TRACKINIZER_ASSISTANT; empty means none)."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -353,7 +364,7 @@ def _session_ttl_default() -> int:
 # the registered default dim, or pairs with ``--session-embedder-dim``).
 def _session_embedder_choices() -> list[str]:
     """Return the ``--session-embedder`` choices: empty, stubs, models, bare slugs."""
-    slugs = {key.split("@", 1)[0] for key in EMBEDDERS}
+    slugs = {key.partition("@")[0] for key in EMBEDDERS}
     return ["", "stub", "stub-1024", *sorted(EMBEDDERS), *sorted(slugs)]
 
 
@@ -369,7 +380,7 @@ def _positive_session_ttl(value: str) -> int:
 
 def _configure_logging(level: str | None) -> int | None:
     """Set the package log level from the flag or ``TRACKINIZER_LOG_LEVEL``."""
-    raw = level or os.environ.get("TRACKINIZER_LOG_LEVEL")
+    raw = level or os.environ.get("TRACKINIZER_LOG_LEVEL", "")
     if not raw:
         return None
     value = getattr(logging, raw.upper(), None)

@@ -9,7 +9,6 @@ edit machinery is reused through the composed :class:`Store`.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Final, cast
 from uuid import UUID
@@ -25,7 +24,7 @@ else:
 
     asyncpg = lazy_import("asyncpg")  # ~60 ms; only start_session() needs it.
 
-from trackinizer.lib.custom_json import JSONValue, convert, json_freeze, loads_untagged
+from trackinizer.lib.codec import from_plain
 from trackinizer.server.notify import notify_after_commit, tx
 from trackinizer.server.store.change_id_slot import (
     _peek_client_change_id,
@@ -37,6 +36,7 @@ from trackinizer.server.store.session_feed import (
     WHOLE_FEED,
     FeedScope,
 )
+from trackinizer.server.store.session_ir import _decoded_payload
 from trackinizer.server.store.submit import _SubmitMixin
 from trackinizer.server.values import vetted_sql
 from trackinizer.types.change_log import Snapshot
@@ -70,22 +70,6 @@ _SEEN_AGAIN_SQL: Final = (
     "UPDATE session_liveness SET last_seen = $2 "
     "WHERE session_id = $1 AND last_seen < $3"
 )
-
-
-def _strip_postgres_nuls(value: JSONValue) -> JSONValue:
-    """Drop non-displayable NUL artifacts that PostgreSQL JSONB cannot store."""
-    if isinstance(value, str):
-        return value.replace("\0", "")
-    if isinstance(value, Mapping):
-        mapping = value
-        return {
-            key.replace("\0", ""): _strip_postgres_nuls(item)
-            for key, item in mapping.items()
-        }
-    if isinstance(value, Sequence):
-        sequence = value
-        return [_strip_postgres_nuls(item) for item in sequence]
-    return value
 
 
 class _SessionMixin(_SubmitMixin, _EditMixin):
@@ -126,8 +110,9 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
             taken = {
                 row["owner"]
                 for row in await conn.fetch(
-                    "SELECT owner FROM inquiries "
-                    "WHERE kind = 'AgentSession' AND owner IS NOT NULL",
+                    "SELECT owner FROM inquiries WHERE kind = 'AgentSession' "
+                    "AND (owner = $1 OR starts_with(owner, $1 || '#'))",
+                    requested,
                 )
             }
         if requested not in taken:
@@ -158,9 +143,9 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
         AgentSession's ``agentsession_cli_session_id``, re-attach that session
         instead of minting a new one -- same id, same granted handle -- and
         re-open it if ended (clear ``ended``, status back to ``active``), so the
-        resumed run continues the original log. ``next_seq`` is the event log's
-        continuation point (``max(seq)+1``, or 0 for a fresh session) so the
-        caller seeds its sequence and appends rather than colliding at seq 0.
+        resumed run continues the original log. ``next_seq`` is always 0: record
+        keys derive from their position in the source file, so a resumed run
+        re-derives the same keys and needs no continuation point.
 
         Idempotent: when this request reuses a prior start's idempotency key,
         the original session id AND its granted owner are replayed -- the
@@ -332,7 +317,7 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
             assert isinstance(session_id, UUID)
             # NULL for a session captured from a transcript rather than opened
             # live; resolve_live_sessions reads the column the same way.
-            owner = convert(row.get("owner"), str, default="")
+            owner = from_plain(row.get("owner"), str, default="")
             if row["agentsession_ended"] is not None:
                 # Attribute the audit to the resuming caller, not the original
                 # owner.
@@ -346,17 +331,16 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
             # Apply any new rooms from the resuming request: ``--resume --room X``
             # must join X. ``_mutate_list_field_on_conn`` is idempotent (a re-add
             # of an existing room is a no-op) and runs on this open tx.
-            if req.rooms:
-                for room in req.rooms:
-                    await self._mutate_list_field_on_conn(
-                        conn,
-                        session_id,
-                        room,
-                        column="agentsession_rooms",
-                        api_key_id=api_key_id,
-                        actor=actor,
-                        include=True,
-                    )
+            for room in req.rooms or ():
+                await self._mutate_list_field_on_conn(
+                    conn,
+                    session_id,
+                    room,
+                    column="agentsession_rooms",
+                    api_key_id=api_key_id,
+                    actor=actor,
+                    include=True,
+                )
             next_seq = await self._next_event_seq(conn, session_id)
             return session_id, owner, next_seq
 
@@ -603,7 +587,7 @@ class _SessionMixin(_SubmitMixin, _EditMixin):
         return [
             (
                 _uuid(row["id"]),
-                tuple(convert(row["agentsession_rooms"], list[str])),
+                tuple(from_plain(row["agentsession_rooms"], list[str], default=[])),
             )
             for row in rows
         ]
@@ -909,19 +893,17 @@ def _feed_event(row: asyncpg.Record) -> FeedEvent:
     """Build one feed item from a ``session_records`` join row."""
     return FeedEvent(
         session_id=_uuid(row["session_id"]),
-        actor=convert(row.get("owner"), str, default=""),
-        rooms=convert(row.get("agentsession_rooms"), list[str], default=[]),
+        actor=from_plain(row.get("owner"), str, default=""),
+        rooms=from_plain(row.get("agentsession_rooms"), list[str], default=[]),
         cli=_optional_str(row["agentsession_cli"]),
-        part=convert(row["part"], int),
-        seq=convert(row["idx"], int),
-        kind=convert(row["kind"], str),
+        part=from_plain(row["part"], int),
+        seq=from_plain(row["idx"], int),
+        kind=from_plain(row["kind"], str),
         created=_datetime(row["created"]),
         timestamp=_optional_datetime(row["timestamp"]),
         model=_optional_str(row["model"]),
-        message=json_freeze(
-            convert(loads_untagged(convert(row["payload"], str)), dict[str, object]),
-        ),
-        text=convert(row["text"], str),
+        message=_decoded_payload(from_plain(row["payload"], str)),
+        text=from_plain(row["text"], str),
     )
 
 

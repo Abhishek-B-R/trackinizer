@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from io import StringIO
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Final
 
 import json
 
@@ -12,6 +13,7 @@ import pytest
 
 from trackinizer.lib.agent.sessions import codex
 from trackinizer.lib.agent.sessions.codex import _grouped
+from trackinizer.lib.agent.sessions.testdata.mistype import mistyped, unread, without
 from trackinizer.lib.agent.sessions.udiff import parse_udiff, render_udiff
 from trackinizer.lib.agent.types.sessions import (
     AgentToAgentMessage,
@@ -41,11 +43,14 @@ from trackinizer.lib.agent.types.sessions import (
     WebSearchResult,
     WebSearchResults,
 )
-from trackinizer.lib.custom_json import MutableJSONValue, convert, parse
+from trackinizer.lib.codec import MutablePlainTree, from_plain, loads
 
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+
+_CWD: Final = Path(__file__).resolve().parent
 
 
 META = '{"type":"session_meta","payload":{"session_id":"s1","cwd":"/workspace"}}\n'
@@ -54,6 +59,14 @@ CONTEXT = (
     '"model":"gpt-5.6-sol","effort":"medium","summary":"auto",'
     '"approval_policy":"never"}}\n'
 )
+
+FIXTURE: Final = (
+    (_CWD / "testdata" / "codex_main.jsonl").read_text().splitlines(keepends=True)
+)
+"""A real rollout, one line per element."""
+
+_KEPT_AS_TEXT: Final = frozenset({"payload.call_id", "payload.item.id"})
+"""Fields whose wrong value only the line's own text can write back."""
 
 
 def _item(payload: str) -> str:
@@ -81,7 +94,7 @@ def test_a_session_declares_its_context_and_identity() -> None:
     # follows. The per-turn settings then supersede it.
     launch = records[0]
     assert isinstance(launch, TurnContext)
-    declaration = convert(launch.extra.get("payload"), dict[str, object])
+    declaration = from_plain(launch.extra.get("payload"), dict[str, object])
     assert declaration["cwd"] == "/workspace"
     assert declaration["session_id"] == "s1"
     assert isinstance(records[1], ContextClear)
@@ -126,13 +139,58 @@ def test_provider_dollar_keys_round_trip(line: str) -> None:
     assert output.getvalue() == native
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"type":7,"payload":{}}\n',
+        '{"type":"session_meta","payload":{"session_id":7,"base_instructions":7}}\n',
+        '{"type":"turn_context","payload":{"effort":7,"summary":[1]}}\n',
+        '{"type":"response_item","payload":{"type":7}}\n',
+        '{"type":"response_item","payload":{"type":"function_call","call_id":7}}\n',
+        '{"type":"event_msg","payload":{"type":"item_completed","item":7}}\n',
+    ],
+    ids=["outer", "repeat-meta", "context", "item-type", "call-id", "event-item"],
+)
+def test_a_line_with_a_malformed_field_round_trips(line: str) -> None:
+    # One malformed field raised ``ReadError`` out of ``normalize`` and lost
+    # the whole rollout.
+    native = META + line
+    output = StringIO()
+
+    codex.denormalize(codex.normalize(StringIO(native)), output)
+
+    assert output.getvalue() == native
+
+
+def test_a_malformed_launch_line_keeps_its_bytes() -> None:
+    native = '{"type":"session_meta","payload":{"session_id":"s"},"ordinal":"x"}\n'
+    output = StringIO()
+
+    codex.denormalize(codex.normalize(StringIO(native)), output)
+
+    assert output.getvalue() == native
+
+
+def test_a_compacted_line_with_an_empty_history_round_trips() -> None:
+    # Presence was tested after the key was popped, so an empty history read as
+    # "not stated" and the line came back as ``{"message":null}``.
+    native = META + (
+        '{"type":"compacted","payload":{"message":"","replacement_history":[]}}\n'
+    )
+    output = StringIO()
+
+    codex.denormalize(codex.normalize(StringIO(native)), output)
+
+    assert output.getvalue() == native
+
+
 def test_order_table_does_not_create_a_stamp_module_global() -> None:
     assert "_STAMP" not in vars(codex)
 
 
 def test_template_precedence_does_not_consume_legacy_blocks() -> None:
-    legacy: list[MutableJSONValue] = [{"type": "future", "value": 1}]
-    extra: dict[str, MutableJSONValue] = {
+    legacy: list[MutablePlainTree] = [{"type": "future", "value": 1}]
+    extra: dict[str, MutablePlainTree] = {
         "$templates": [{"type": "input_text"}],
         "$blocks": legacy,
         "$order": ["text"],
@@ -183,6 +241,23 @@ def test_reasoning_normalizes_to_a_summary_beside_its_sealed_half() -> None:
     assert thinking.encrypted == "sealed"
 
 
+def test_a_record_before_any_turn_names_the_opening_context() -> None:
+    native = META + _item(
+        '{"type":"message","role":"user",'
+        '"content":[{"type":"input_text","text":"hi"}]}',
+    )
+
+    records = list(codex.normalize(StringIO(native)))
+
+    [message] = [record for record in records if isinstance(record, UserMessage)]
+    assert message.context_id is not None
+    assert isinstance(records[message.context_id], TurnContext)
+
+
+def test_an_empty_rollout_reads_as_no_records() -> None:
+    assert list(codex.normalize(StringIO(""))) == []
+
+
 def test_a_function_call_decodes_its_nested_arguments() -> None:
     native = META + _item(
         '{"type":"function_call","call_id":"c1","name":"Read",'
@@ -195,6 +270,19 @@ def test_a_function_call_decodes_its_nested_arguments() -> None:
     assert isinstance(call, ToolCall)
     assert call.name == "Read"
     assert call.arguments == {"path": "/a"}
+
+
+def test_a_call_whose_arguments_nest_objects_round_trips_byte_exact() -> None:
+    """The argument string is re-encoded from the call's own nested values."""
+    native = META + _item(
+        '{"type":"function_call","call_id":"c1","name":"update_plan",'
+        '"arguments":"{\\"plan\\":[{\\"step\\":\\"read\\",\\"status\\":\\"done\\"}]}"}',
+    )
+    output = StringIO()
+
+    codex.denormalize(codex.normalize(StringIO(native)), output)
+
+    assert output.getvalue() == native
 
 
 def test_a_malformed_argument_string_does_not_abort_the_file() -> None:
@@ -275,8 +363,8 @@ def test_a_foreign_subtype_is_not_written_as_a_codex_role() -> None:
 
     codex.denormalize([SystemMessage(content="", subtype="turn_duration")], out)
 
-    outer = parse(out.getvalue().splitlines()[0], dict[str, object])
-    payload = convert(outer["payload"], dict[str, object])
+    outer = from_plain(loads(out.getvalue().splitlines()[0]), dict[str, object])
+    payload = from_plain(outer["payload"], dict[str, object])
     assert payload["role"] == "system"
 
 
@@ -829,7 +917,7 @@ def test_the_launch_payload_is_stored_once() -> None:
     assert isinstance(launch, TurnContext)
     extra = dict(launch.extra)
 
-    assert "payload" not in convert(extra.get("$outer"), dict[str, object])
+    assert "payload" not in from_plain(extra.get("$outer"), dict[str, object])
     # The stamp the opening context's own field already carries.
     assert "$launch_timestamp_raw" not in extra
 
@@ -917,9 +1005,9 @@ def test_a_legacy_patch_diff_is_stored_once() -> None:
     # answer this: the needle holds a real newline and the haystack holds the
     # escaped ``\\n``, so the search misses a diff that is plainly there --
     # which is how this assertion passed against a 100%-duplicated corpus.
-    stored = convert(dict(record.extra).get("changes"), dict[str, object])
+    stored = from_plain(dict(record.extra).get("changes"), dict[str, object])
     assert [
-        convert(entry, dict[str, object]).get("unified_diff")
+        from_plain(entry, dict[str, object]).get("unified_diff")
         for entry in stored.values()
     ] == [None], "the diff is on the record already"
 
@@ -1526,6 +1614,36 @@ def test_codex_line_state_preserves_noncanonical_records() -> None:
         IncompleteRecord(text="x"),
         {"payload": {}},
     ) == IncompleteRecord(text="x")
+
+
+@pytest.mark.parametrize("index", range(len(FIXTURE)))
+def test_a_mistyped_field_aborts_neither_the_read_nor_the_write(index: int) -> None:
+    """A log field of the wrong type reads as absent, as a missing one does.
+
+    The rest of the rollout stays as written, so a line read in context -- a
+    result after its call, an item after its turn -- meets its wrong field there.
+    """
+    record = from_plain(loads(FIXTURE[index]), dict[str, object])
+    failed: list[str] = []
+    for path, changed in mistyped(record):
+        records = list(codex.normalize(StringIO(_swapped(index, changed))))
+        missing = _swapped(index, without(record, path))
+        try:
+            codex.denormalize(records, StringIO())
+        except TypeError as error:
+            failed.append(f"{path}: {error}")
+        if path not in _KEPT_AS_TEXT and unread(records) > unread(
+            codex.normalize(StringIO(missing)),
+        ):
+            failed.append(f"{path}: the line reads worse than without the field")
+
+    assert failed == [], "\n".join(failed)
+
+
+def _swapped(index: int, record: object) -> str:
+    """Return the rollout with line ``index`` replaced by ``record``."""
+    line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+    return "".join([*FIXTURE[:index], line, *FIXTURE[index + 1 :]])
 
 
 if __name__ == "__main__":

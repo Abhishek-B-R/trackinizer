@@ -35,7 +35,6 @@ import argparse
 import asyncio
 import contextlib
 import hashlib
-import json
 import logging
 import os
 import re
@@ -48,7 +47,6 @@ import time
 import uuid
 
 from trackinizer.client.client import Client
-from trackinizer.lib.custom_json import convert, loads
 from trackinizer.lib.posix.follow import follow_dir, follow_tree
 from trackinizer.lib.posix.host import HostSpec
 from trackinizer.lib.posix.relay import ThreadedRelay
@@ -60,6 +58,8 @@ from trackinizer.trax.run.adapters.codex import CodexAdapter
 from trackinizer.trax.run.adapters.custom_types import Adapter, StreamAdapter
 from trackinizer.trax.run.adapters.gemini import GeminiAdapter
 from trackinizer.trax.run.adapters.iostream import IOStreamAdapter, LineCapture
+from trackinizer.trax.run.inbound import render_inbound
+from trackinizer.trax.run.redact import Redactor, redactor_from_environ
 from trackinizer.trax.run.sink import (
     FileSink,
     LockedSink,
@@ -113,17 +113,14 @@ _QUEUE_DRAIN_SEC: Final = 0.05
 # How long each inbound request asks the server to hold. Must not exceed the
 # route's own ceiling, or the server returns first and the extra is wasted.
 # Longer means fewer re-arms; it does not affect delivery latency, which is
-# whenever the message is enqueued.
+# whenever the message is enqueued, nor exit latency, since ending the session
+# ends the request.
 _INBOUND_WAIT_SEC: Final = 25.0
 
-# Total time the worker threads get to stop before the runner proceeds to
-# ``sink.close``. Shared across every join rather than granted per thread: two
-# sequential 30s budgets plus the sink's own 5s lock timeout made a wedged exit
-# take 65s, which reads as a hang. One deadline bounds the whole teardown.
-#
-# It has to exceed ``_INBOUND_WAIT_SEC``: the poll thread only re-checks
-# ``stop`` between requests, so on a perfectly healthy exit it can still be
-# parked in one for that long, and a shorter budget would warn every time.
+# Total time the worker threads get to stop at teardown. Shared across every
+# join rather than granted per thread: two sequential 30s budgets plus the
+# sink's own 5s lock timeout made a wedged exit take 65s, which reads as a hang.
+# One deadline bounds the whole teardown.
 _JOIN_DEADLINE_SEC: Final = 30.0
 
 
@@ -505,7 +502,7 @@ def resume_argv(cli_name: str, cli_session_id: str | None) -> tuple[str, ...]:
         run, and for a CLI with no resume spelling at all.
 
     """
-    if not cli_session_id:
+    if cli_session_id is None:
         return ()
     if cli_name == "codex":
         return ("resume", cli_session_id)
@@ -612,13 +609,25 @@ def _run_flags(
 # The sink is wrapped in a :class:`ResilientSink`: a server failure must not crash the
 # drain thread or corrupt the wrapped CLI's terminal, so the run degrades to a local
 # JSONL file instead.
-def _open_trackinizer_sink(config: RunConfig, adapter: Adapter) -> Sink:
+def _open_trackinizer_sink(
+    config: RunConfig,
+    adapter: Adapter,
+    *,
+    redactor: Redactor | None,
+) -> Sink:
     """Build a fault-tolerant :class:`TrackinizerSink` for ``sync`` runs."""
     client = config.client or Client(base_url=LOCALHOST_FALLBACK_URL)
     sys.stderr.write(f"[trax run] syncing events to {client.base_url}\n")
     return ResilientSink(
-        TrackinizerSink(client, adapter.name, actor=config.actor, rooms=config.rooms),
+        TrackinizerSink(
+            client,
+            adapter.name,
+            actor=config.actor,
+            rooms=config.rooms,
+            redactor=redactor,
+        ),
         fallback_path=_default_out_path(adapter.name),
+        redactor=redactor,
     )
 
 
@@ -644,15 +653,20 @@ def _open_sink(config: RunConfig, adapter: Adapter) -> Sink:
     # so wrap it in a LockedSink to serialize their access (R2R-024). The
     # dry-run / local-file paths run single-threaded today, but the lock keeps
     # the sink boundary uniformly thread-safe and is effectively free there.
+    # Built before any file opens, so a named secret the environment lacks stops the
+    # run before it records anything. Redaction is in the sinks, not in
+    # ``LockedSink``: ``LockedSink.feed`` calls the inner sink's ``feed``, so a mask
+    # there would miss every fed chunk.
+    redactor = redactor_from_environ(os.environ)
     if config.syncing:
-        return LockedSink(_open_trackinizer_sink(config, adapter))
+        return LockedSink(_open_trackinizer_sink(config, adapter, redactor=redactor))
     out_path = config.out_path or _default_out_path(adapter.name)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # Line-buffered so an interrupted run still leaves parseable lines.
     handle = out_path.open("a", buffering=1, encoding="utf-8")
     if config.out_path is None:
         sys.stderr.write(f"[trax run] capturing events to {out_path}\n")
-    return LockedSink(FileSink(handle))
+    return LockedSink(FileSink(handle, redactor=redactor))
 
 
 # The CLI runs on a pseudo-terminal the wrapper owns (the relay), so the server can
@@ -855,6 +869,11 @@ def _spawn_and_drain(
         # deadlocking against a straggler that outlived the deadline.
         deadline = time.monotonic() + _JOIN_DEADLINE_SEC
         _join_with_watchdog(drain_thread, "drain", deadline=deadline)
+        # Closed BEFORE the poller is joined: it is parked in a request the server
+        # holds until a message arrives or the session ends, and this close ends the
+        # session. Joined first, every exit would wait out the whole hold. ``run``
+        # closes again on every path; the second close is a no-op.
+        sink.close()
         if poll_thread is not None:
             _join_with_watchdog(poll_thread, "inbound poll", deadline=deadline)
     return rc
@@ -1006,7 +1025,7 @@ def _join_with_watchdog(
 def _enqueue_stream_line(queue: deque[bytes], stats: _Stats, raw: bytes) -> None:
     """Queue one framed stream line for the drain thread, overflow VISIBLE."""
     if len(queue) == queue.maxlen:
-        if not stats.counts.get("StreamEventDropped"):
+        if stats.counts.get("StreamEventDropped", 0) == 0:
             _logger.warning(
                 "stream capture queue full (%d); dropping oldest lines until "
                 "the sink drains",
@@ -1024,7 +1043,7 @@ def _enqueue_stream_line(queue: deque[bytes], stats: _Stats, raw: bytes) -> None
 # ``poll_interval`` is no longer the delivery latency -- only the gap before re-arming
 # after a FAILURE, and the wait for a session id that has not been minted yet (it
 # appears on the first captured event). ``stream`` says what kind of child consumes the
-# submissions (see :func:`_render_inbound`'s envelope shaping).
+# submissions (see ``render_inbound``'s envelope shaping).
 #
 # Server errors are swallowed: a flaky back-channel must not crash the run or corrupt
 # the terminal, exactly like the capture sink's resilience.
@@ -1088,7 +1107,7 @@ def _deliver_one(
     """Submit one inbound message; a failure is logged, not propagated."""
     try:
         relay.submit(
-            _render_inbound(text, source, room, context=context, stream=stream),
+            render_inbound(text, source, room, context=context, stream=stream),
         )
     except Exception:
         _logger.warning(
@@ -1096,72 +1115,6 @@ def _deliver_one(
             "continuing with the rest of the batch",
             exc_info=True,
         )
-
-
-# A single PTY interleaves every room's messages into one input stream, so the agent
-# needs the room and sender to know who is steering it. Renders ``[room] sender: text``
-# (dropping whichever of room/sender is absent), so a direct session-id enqueue with no
-# attested sender injects the bare text.
-#
-# Change envelopes are shaped per consumer HERE, at the client -- the server pushes one
-# uniform JSON envelope to every session. A model-CLI session (``stream=False``)
-# receives only the envelope's ``agent_message`` line: the remaining fields would spend
-# the model's context on metadata it can fetch on demand (the line itself names the
-# ``trax`` command). An IO-stream session (``stream=True``) receives the whole envelope
-# to parse itself -- behind the same room/sender prefix as any other message, since a
-# line-reading child needs to know who sent it just as much. Only the route-attested
-# ``trackinizer`` sender unwraps -- ``source`` is stamped server-side from the
-# principal, so another sender's JSON-looking text renders as a plain message.
-def _render_inbound(
-    text: str,
-    source: str | None,
-    room: str | None,
-    *,
-    context: WorkspaceMessageContext | None = None,
-    stream: bool = False,
-) -> str:
-    """Decorate an inbound message with its routing context for injection."""
-    if context is None and source == "trackinizer" and not stream:
-        agent_message = _envelope_agent_message(text)
-        if agent_message is not None:
-            return agent_message
-    prefix = ""
-    if room:
-        prefix += f"[{room}] "
-    if source:
-        prefix += f"{source}: "
-    rendered = f"{prefix}{text}"
-    if context is not None:
-        rendered += (
-            f"\nTrackinizer context (verify with trax): {context.model_dump_json()}"
-        )
-        rendered += f"\nCanvas commands: trax workspace {context.workspace_id}"
-        if context.artifact_content is not None:
-            rendered += (
-                f"; Artifact: trax artifact {context.artifact_content.artifact_id}; "
-                "full content: GET /api/artifacts/"
-                f"{context.artifact_content.artifact_id}/content"
-            )
-        if context.record_id is not None:
-            rendered += (
-                "; to show the context graph for this record, run "
-                f"trax workspace {context.workspace_id} "
-                "show trax.subgraph "
-                f"--record {context.record_id} --placement side"
-            )
-    return rendered
-
-
-def _envelope_agent_message(text: str) -> str | None:
-    """Return the ``agent_message`` line of a change envelope, or None if not one."""
-    try:
-        payload = loads(text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    message = convert(payload, dict[str, object]).get("agent_message")
-    return message if isinstance(message, str) else None
 
 
 # ``TRAX_ACTOR`` is the session's granted routing handle and ``TRAX_ROOMS`` its comma-
@@ -1180,7 +1133,7 @@ def _routing_env(
 ) -> dict[str, str]:
     """Return the routing identity to export into the wrapped CLI's environment."""
     env: dict[str, str] = {}
-    actor = granted_actor or config.actor
+    actor = granted_actor or config.actor or ""
     if actor:
         env["TRAX_ACTOR"] = actor
     if config.rooms:

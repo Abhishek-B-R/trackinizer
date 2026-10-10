@@ -17,7 +17,7 @@ from uuid import UUID
 
 import itertools
 
-from trackinizer.lib.custom_json import convert
+from trackinizer.lib.codec import from_plain
 from trackinizer.server.notify import tx
 from trackinizer.server.store.shared import _StoreShared
 from trackinizer.server.values import manifest_bound, vetted_sql
@@ -109,12 +109,19 @@ WHOLE_FEED: Final = FeedScope()
 # (``peerPayload`` in the web app). ``payload`` is ``json``, which each ``->``
 # parses again, so the kind tests come first and only messages and context state
 # are parsed.
+_ATTACHMENT_COUNT: Final = (
+    "coalesce(json_array_length(CASE"
+    " WHEN json_typeof(e.payload -> 'attachments') = 'array'"
+    " THEN e.payload -> 'attachments'"
+    " ELSE e.payload -> 'attachments' -> 'py/tuple' END), 0)"
+)
+
 CONVERSATION: Final = (
     "((e.kind IN ('UserMessage', 'AssistantMessage', 'AgentToAgentMessage')"
     " AND (e.payload ->> 'content' ~ '[^[:space:]]'"
     " AND (e.kind <> 'AgentToAgentMessage' OR e.payload ->> 'content' !~"
     " '^Message Type: [A-Z_]+\\nTask name: [^\\n]*\\nSender: [^\\n]*\\nPayload:\\s*$')"
-    " OR json_array_length(e.payload -> 'attachments' -> 'py/tuple') > 0)"
+    f" OR {_ATTACHMENT_COUNT} > 0)"
     " AND (e.kind <> 'UserMessage'"
     " OR (e.payload -> 'extra' ->> 'isMeta') IS DISTINCT FROM 'true'"
     " AND coalesce(e.payload ->> 'content', '') !~ '^\\s*<(codex_internal_context( [a-z_]+=\"[^\"]*\")*"
@@ -132,7 +139,7 @@ UNREADABLE: Final = (
     " AND coalesce(e.payload ->> 'summary', '') = '')"
     " OR (e.kind = 'AgentToAgentMessage' AND e.payload ->> 'content' ~"
     " '^Message Type: [A-Z_]+\\nTask name: [^\\n]*\\nSender: [^\\n]*\\nPayload:\\s*$'"
-    " AND coalesce(json_array_length(e.payload -> 'attachments' -> 'py/tuple'), 0) = 0))"
+    f" AND {_ATTACHMENT_COUNT} = 0))"
 )
 """SQL true of a record, aliased ``e``, that has nothing to read."""
 
@@ -294,8 +301,8 @@ class _SessionFeedMixin(_StoreShared):
         kinds = sorted(
             (
                 FeedKindFacet(
-                    kind=convert(row["kind"], str),
-                    count=convert(row["records"], int),
+                    kind=from_plain(row["kind"], str),
+                    count=from_plain(row["records"], int),
                 )
                 for row in rows
                 if row["session_id"] is None
@@ -340,20 +347,26 @@ class _SessionFeedMixin(_StoreShared):
 
         """
         end = until.astimezone(UTC) if until is not None else datetime.now(UTC)
+        params: list[object] = [earliest, end]
+        clauses = ["r.created >= $1", "r.created <= $2"]
+        clauses.extend(scope.clauses(params, kind="r.kind"))
+        joined = (
+            "JOIN inquiries i ON i.id = r.session_id " if scope.names_sessions else ""
+        )
+        first_sql = vetted_sql(
+            "SELECT min(r.created) FROM session_records r ",
+            joined,
+            "WHERE ",
+            " AND ".join(clauses),
+        )
         async with self.engine.acquire() as conn:
             first = (
                 since
                 if since is not None
                 else (
                     end
-                    if (
-                        value := await conn.fetchval(
-                            "SELECT min(created) FROM session_records WHERE created >= $1",
-                            earliest,
-                        )
-                    )
-                    is None
-                    else convert(value, datetime)
+                    if (value := await conn.fetchval(first_sql, *params)) is None
+                    else from_plain(value, datetime)
                 )
             )
             earliest = earliest.astimezone(UTC)
@@ -436,7 +449,7 @@ async def _count_buckets(
         " GROUP BY 1",
     )
     rows = await conn.fetch(sql, *params)
-    return {row["bucket"]: convert(row["records"], int) for row in rows}
+    return {row["bucket"]: from_plain(row["records"], int) for row in rows}
 
 
 def _actor_facet(counted: asyncpg.Record, session: asyncpg.Record) -> FeedActorFacet:
@@ -445,17 +458,17 @@ def _actor_facet(counted: asyncpg.Record, session: asyncpg.Record) -> FeedActorF
     assert isinstance(session_id, UUID)
     assert isinstance(last, datetime)
     return FeedActorFacet(
-        actor=convert(session.get("owner"), str, default=""),
+        actor=from_plain(session.get("owner"), str, default=""),
         session_id=session_id,
-        cli=convert(session.get("agentsession_cli"), str, default="") or None,
-        rooms=convert(session.get("agentsession_rooms"), list[str], default=[]),
-        count=convert(counted["records"], int),
-        conversation=convert(counted["conversation"], int),
+        cli=from_plain(session.get("agentsession_cli"), str, default="") or None,
+        rooms=from_plain(session.get("agentsession_rooms"), list[str], default=[]),
+        count=from_plain(counted["records"], int),
+        conversation=from_plain(counted["conversation"], int),
         last=last,
         ended=(
             None
             if session["agentsession_ended"] is None
-            else convert(session["agentsession_ended"], datetime)
+            else from_plain(session["agentsession_ended"], datetime)
         ),
     )
 

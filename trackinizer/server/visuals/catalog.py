@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 __all__ = [
+    "ContextGraphVisual",
     "ParameterDescription",
     "StaticVisual",
     "TimelineVisual",
@@ -81,6 +82,8 @@ class VisualDescription(BaseModel):
     requires: list[Literal["record", "session"]]
     default_size: Literal["compact", "wide"]
     parameter_schema: dict[str, ParameterDescription]
+    record_kinds: list[str] | None = None
+    """Kinds of record a show may target: none means any kind, empty means no record."""
 
 
 class VisualCatalogBody(BaseModel):
@@ -122,6 +125,9 @@ class StaticVisual:
         default_size: Literal["compact", "wide"] = "wide"
         """Pane shape used when a show operation names no placement."""
 
+        record_kinds: list[str] | None = None
+        """Kinds of record a show may target; none means any, empty means no record."""
+
     def __init__(self, config: Config) -> None:
         """Keep the configured entry until projection."""
         self.config = config
@@ -141,14 +147,15 @@ class StaticVisual:
             requires=self.config.requires,
             default_size=self.config.default_size,
             parameter_schema={},
+            record_kinds=self.config.record_kinds,
         )
 
 
 class TimelineVisual:
-    """A bounded chronology of an Issue's directions and evidence."""
+    """A bounded lineage and chronology of any record: leads, directions, evidence."""
 
     class Config(Fig["TimelineVisual"]):
-        title: str = "Evidence timeline"
+        title: str = "Lineage and timeline"
         """Name shown in the Configure panel."""
 
         direction_limit: int = 12
@@ -178,7 +185,10 @@ class TimelineVisual:
             type="trax.timeline",
             version=1,
             title=self.config.title,
-            description="Follow dated directions, results, and signed evidence.",
+            description=(
+                "Any record by date, under its lead issues, over its directions, "
+                "results, and signed evidence."
+            ),
             requires=["record"],
             default_size="wide",
             parameter_schema={
@@ -198,6 +208,53 @@ class TimelineVisual:
         )
 
 
+class ContextGraphVisual:
+    """A record in its graph: what lies near it lit, the ring past that dimmed."""
+
+    class Config(Fig["ContextGraphVisual"]):
+        title: str = "Context graph"
+        """Name shown in the Configure panel."""
+
+        default_hops: int = 2
+        """Edges out from the record lit when the request names no reach."""
+
+    def __init__(self, config: Config) -> None:
+        """Keep the configured title and reach until projection."""
+        self.config = config
+
+    def describe(self) -> VisualDescription:
+        """Describe the window and the reach and highlight a caller may set.
+
+        Returns:
+          description: Inert catalog entry carrying the window's bounds.
+
+        """
+        return VisualDescription(
+            type="trax.subgraph",
+            version=1,
+            title=self.config.title,
+            description="See a record in context: what lies near it, in the graph.",
+            requires=["record"],
+            default_size="wide",
+            parameter_schema={
+                # The window reads its ring through `/api/web/graph?focus=`,
+                # which walks at most 3 hops.
+                "hops": ParameterDescription(
+                    type="integer",
+                    default=self.config.default_hops,
+                    minimum=1,
+                    maximum=3,
+                ),
+                # Inquiry ids, comma-separated: 512 holds 13.
+                "highlight": ParameterDescription(
+                    type="string",
+                    default="",
+                    max_length=512,
+                ),
+            },
+        )
+
+
 class Workspace:
     """The trusted composition of visual configs and its initial selection."""
 
@@ -208,26 +265,23 @@ class Workspace:
                     type="trax.browse",
                     title="Browse",
                     description="Browse trax records by kind and query.",
+                    record_kinds=[],
                 ),
                 StaticVisual.Config(
                     type="trax.chat",
                     title="Chat",
-                    description="Talk with a connected trax run session.",
+                    description="Talk with the assistant or a trax run session.",
                     requires=["session"],
                     default_size="compact",
                 ),
-                StaticVisual.Config(
-                    type="trax.subgraph",
-                    title="Context graph",
-                    description="Explore a selected record and its issue lineage.",
-                    requires=["record"],
-                ),
+                ContextGraphVisual.Config(),
                 TimelineVisual.Config(),
                 StaticVisual.Config(
                     type="trax.artifact",
                     title="Artifact",
                     description="Read immutable shared Artifact content.",
                     requires=["record"],
+                    record_kinds=["Artifact"],
                 ),
             ],
         )

@@ -35,7 +35,7 @@ import argparse
 import json
 
 from trackinizer.client.client import Client, server_url
-from trackinizer.lib.custom_json import convert, parse
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.trax.profile import load_profile
 from trackinizer.types.edges import EDGE_POLICIES, Edge
 from trackinizer.types.inquiries import KIND_TO_CLASS, Inquiry
@@ -60,7 +60,7 @@ def main() -> int:
 
     """
     parser = argparse.ArgumentParser(
-        description=(__doc__ or "").split("\n", 2)[2],
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_arguments(parser)
@@ -68,7 +68,7 @@ def main() -> int:
     profile = load_profile()
     url = server_url(flags.source or profile.url, "--from")
     with Client(url, api_key=source_token(url, profile), timeout_sec=120.0) as client:
-        graph = convert(
+        graph = from_plain(
             ReadOnlySource(client).get("/api/web/graph", limit=flags.limit),
             dict[str, object],
         )
@@ -126,11 +126,11 @@ def scrub(graph: Mapping[str, object]) -> Structure:
 
     """
     rows = sorted(
-        enumerate(convert(graph.get("nodes"), list[dict[str, object]], default=[])),
-        key=lambda row: (convert(row[1].get("created"), str, default=""), row[0]),
+        enumerate(from_plain(graph.get("nodes"), list[dict[str, object]], default=[])),
+        key=lambda row: (from_plain(row[1].get("created"), str, default=""), row[0]),
     )
     index = {
-        convert(row.get("id"), str, default=""): n for n, (_, row) in enumerate(rows)
+        from_plain(row.get("id"), str, default=""): n for n, (_, row) in enumerate(rows)
     }
     nodes = tuple(
         Node(
@@ -143,12 +143,12 @@ def scrub(graph: Mapping[str, object]) -> Structure:
         sorted(
             (
                 Link(
-                    from_index=index[convert(edge.get("from_id"), str, default="")],
-                    to_index=index[convert(edge.get("to_id"), str, default="")],
+                    from_index=index[from_plain(edge.get("from_id"), str, default="")],
+                    to_index=index[from_plain(edge.get("to_id"), str, default="")],
                     kind=_known(edge.get("edge_kind"), _EDGE_KINDS),
                     sign=_sign(edge.get("valence")),
                 )
-                for edge in convert(
+                for edge in from_plain(
                     graph.get("edges"),
                     list[dict[str, object]],
                     default=[],
@@ -204,25 +204,26 @@ def load(text: str) -> Structure:
 
     Raises:
       ValueError: A kind, status or edge kind outside trackinizer's vocabulary,
-        or an edge whose end is not a node.
+        an index outside the list it indexes, or an edge whose end is not a node.
 
     """
-    columns = parse(text, dict[str, object])
-    kinds = convert(columns.get("kinds"), list[str], default=[])
-    statuses = convert(columns.get("statuses"), list[str], default=[])
-    edge_kinds = convert(columns.get("edge_kinds"), list[str], default=[])
+    columns = from_plain(loads(text), dict[str, object])
+    kinds = from_plain(columns.get("kinds"), list[str], default=[])
+    statuses = from_plain(columns.get("statuses"), list[str], default=[])
+    edge_kinds = from_plain(columns.get("edge_kinds"), list[str], default=[])
     nodes = tuple(
         Node(
-            kind=_known(kinds[kind], _KINDS),
-            status=_known(statuses[status], _STATUSES),
+            kind=_known(_at(kinds, kind, of="kinds"), _KINDS),
+            status=_known(_at(statuses, status, of="statuses"), _STATUSES),
         )
         for kind, status in _rows(columns.get("nodes"), width=2)
     )
+    ends = range(len(nodes))
     edges = tuple(
         Link(
-            from_index=_node_index(source, len(nodes)),
-            to_index=_node_index(target, len(nodes)),
-            kind=_known(edge_kinds[kind], _EDGE_KINDS),
+            from_index=_at(ends, source, of="nodes"),
+            to_index=_at(ends, target, of="nodes"),
+            kind=_known(_at(edge_kinds, kind, of="edge kinds"), _EDGE_KINDS),
             sign=_known(sign, (-1, 0, 1)),
         )
         for source, target, kind, sign in _rows(columns.get("edges"), width=4)
@@ -265,25 +266,25 @@ def _known[T: str | int](value: object, vocabulary: Sequence[T]) -> T:
 
 
 def _sign(valence: object) -> int:
-    """Return the sign of ``valence``: 0 when the edge has none."""
-    if valence is None:
-        return 0
-    return -1 if convert(valence, float) < 0 else 1
+    """Return the sign of ``valence``: 0 when the edge has none or it is neutral."""
+    value = from_plain(valence, float, default=0.0)
+    return (value > 0) - (value < 0)
 
 
 def _rows(value: object, *, width: int) -> list[list[int]]:
     """Return ``value``'s rows, each ``width`` ints, or raise ``ValueError``."""
-    rows = [convert(row, list[int]) for row in convert(value, list[object])]
+    rows = [from_plain(row, list[int]) for row in from_plain(value, list[object])]
     for row in rows:
         if len(row) != width:
             raise ValueError(f"row {row} is not {width} ints")
     return rows
 
 
-def _node_index(index: int, count: int) -> int:
-    if index < 0 or index >= count:
-        raise ValueError(f"edge end {index} is not one of {count} nodes")
-    return index
+def _at[T](items: Sequence[T], index: int, *, of: str) -> T:
+    """Return ``items[index]``, or raise ``ValueError``: no negative index wraps."""
+    if index < 0 or index >= len(items):
+        raise ValueError(f"{index} is not one of {len(items)} {of}")
+    return items[index]
 
 
 if __name__ == "__main__":
