@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from trackinizer.server.api._deps import get_store
+from trackinizer.server.api.locks import require_unlocked
 from trackinizer.server.auth import AuthIdentity, require_role
 from trackinizer.server.visuals.reports import (
     ArtifactContentConflictError,
@@ -46,6 +47,12 @@ async def publish_artifact_content_route(
       revision: Immutable Artifact content shared with signed-in teammates.
 
     """
+    # The publication adds a ``produced_by`` edge into the Issue and a ``supersedes``
+    # edge into the previous Artifact, so a lock on either refuses it.
+    linked = [body.issue_id]
+    if body.previous_artifact_id is not None:
+        linked.append(body.previous_artifact_id)
+    await require_unlocked(request, identity, linked)
     try:
         return await publish_artifact_content(
             get_store(request),
@@ -121,6 +128,10 @@ async def read_artifact_html_route(
     # Claude Sites works here. ``connect-src 'none'`` keeps ``fetch`` from
     # reaching anything, and ``frame-ancestors 'self'`` lets only Trackinizer
     # embed it. ``private``: no shared cache may keep team content.
+    # ``no-transform``: without it Cloudflare rewrites email-shaped text such as
+    # ``user:%s@github.com`` into "[email protected]" and injects decoder and
+    # bot-detection scripts this policy blocks, so viewers see and copy broken
+    # text. Compression survives: caddy compresses before Cloudflare.
     return HTMLResponse(
         artifact.html,
         headers={
@@ -150,6 +161,6 @@ async def read_artifact_html_route(
             ),
             "X-Content-Type-Options": "nosniff",
             "Referrer-Policy": "no-referrer",
-            "Cache-Control": "private",
+            "Cache-Control": "private, no-transform",
         },
     )

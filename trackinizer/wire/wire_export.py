@@ -72,14 +72,24 @@ Left out on purpose, and why:
   ``session_embeddings``.
 * ``session_ciphertext``, ``session_bodies`` -- encrypted / cold replay-only
   blobs, which retention exists to drop.
-* ``users``, ``api_keys``, ``allowlist`` -- credentials and access control,
-  not the graph.
+* ``users``, ``api_keys``, ``allowlist``, ``inquiry_lock_log`` -- credentials
+  and access control, not the graph. A row's ``locked`` flag is a column of
+  ``inquiries`` and is exported; who set it is not.
+* ``variables`` -- launch configuration, not graph records; a secret row names
+  a value that lives outside the database, so a restored export could not
+  carry it.
 * ``visual_workspaces``, ``visual_workspace_operations``,
-  ``visual_workspace_presets`` -- per-user canvas state, saved workflows, and
-  operation receipts, not account-agnostic graph records.
+  ``visual_workspace_presets`` -- per-user canvas state, saved workflows and
+  operation receipts, not account-agnostic graph records. A Chat conversation is an
+  AgentSession, so its lines export with the sessions.
 * ``visual_reports``, ``visual_report_revisions`` -- shared report presentation
   and author identity; the linked Artifact and graph citations export above.
 * ``session_liveness`` -- when each live session was last heard from, which
   the session reaper keeps; runtime state, meaningless once restored elsewhere.
+* ``variables``, ``machines`` -- deployment configuration (the launch
+  environment, and where campaigns may run), not graph records; a secret's
+  value is not in the database at all.
+* ``machine_enrollments``, ``machine_credentials`` -- hashes of the secrets a
+  host joins and authenticates with: access control, like ``api_keys``.
 * ``applied_migrations`` -- carried in the header instead.
 """

@@ -7,6 +7,7 @@ from pydantic import ValidationError
 import pytest
 
 from trackinizer.server.visuals.catalog import (
+    ContextGraphVisual,
     ParameterDescription,
     StaticVisual,
     TimelineVisual,
@@ -47,10 +48,62 @@ def test_static_visual_is_configured_by_data() -> None:
     assert described.parameter_schema == {}
 
 
+def test_browse_is_the_page_and_takes_no_record_or_parameter() -> None:
+    """Browse draws the page: no record, no parameters, version unchanged."""
+    browse = default_workspace().visual("trax.browse")
+    assert browse is not None
+    assert browse.version == 1
+    assert browse.record_kinds == []
+    assert browse.parameter_schema == {}
+
+
+def test_record_visuals_name_the_kinds_they_accept() -> None:
+    """The catalog says what each visual can draw, so a show can be refused early."""
+    kinds = {visual.type: visual.record_kinds for visual in default_catalog().visuals}
+    assert kinds == {
+        "trax.browse": [],
+        "trax.chat": None,
+        "trax.subgraph": None,
+        "trax.timeline": None,
+        "trax.artifact": ["Artifact"],
+    }
+
+
 def test_default_visual_requiring_a_record_is_rejected() -> None:
     """A new canvas cannot open on a tile that has no record to render."""
     with pytest.raises(ValueError, match="record"):
         Workspace.Config(default_visual="trax.subgraph").make()
+
+
+def test_context_graph_bounds_its_reach_and_its_highlight() -> None:
+    """The window lights 1 to 3 hops, 2 unless asked, and marks ids it lists."""
+    described = ContextGraphVisual.Config().make().describe()
+    assert (described.type, described.requires, described.default_size) == (
+        "trax.subgraph",
+        ["record"],
+        "wide",
+    )
+    hops = described.parameter_schema["hops"]
+    assert (hops.type, hops.default, hops.minimum, hops.maximum) == (
+        "integer",
+        2,
+        1,
+        3,
+    )
+    highlight = described.parameter_schema["highlight"]
+    assert (highlight.type, highlight.default, highlight.max_length) == (
+        "string",
+        "",
+        512,
+    )
+
+
+def test_context_graph_default_reach_past_three_hops_is_a_config_error() -> None:
+    """The neighbourhood read walks at most 3 hops, so no default may ask more."""
+    config = ContextGraphVisual.Config()
+    config.default_hops = 4
+    with pytest.raises(ValueError, match="outside its bounds"):
+        config.make().describe()
 
 
 def test_timeline_config_raises_the_descriptor_bound_instead_of_failing() -> None:

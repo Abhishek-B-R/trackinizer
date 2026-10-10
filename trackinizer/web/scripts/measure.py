@@ -10,7 +10,8 @@ in parallel, a 50-Issue list, Mine across every kind at 20 and 50 per kind,
 details of the newest Issues and of a hub, each Activity tab and a `since`
 refetch, search one kind at a time, every kind in parallel as the palette sends
 it, and all kinds in one request, a seq-range refetch of 50 rows, a membership
-check of 13 ids, and the live stream's frame rate. Times run to the last byte.
+check of up to 13 ids, and the live stream's frame rate; the reads of the newest
+Issues are skipped when there are none. Times run to the last byte.
 Sizes are the JSON's and the body's on the wire, compressed as the server's proxy
 sends them (zstd, gzip). An answer that is an error (a 400 over the search budget, a
 proxy's 502) is kept with its status and message, but never timed as a read:
@@ -19,9 +20,10 @@ medians are of successful answers only. The report goes to
 it lists every row whose median time or JSON size moved more than 2x from an
 earlier report.
 
-The server is the active trax profile's by default, read with its token. Any
-other --url gets no token, which suits the local preview (--no-auth), so the
-profile's token never leaves for another host.
+The server is the active trax profile's by default, read with its token. A --url
+that names another server (host, port and path, as mirror_local.py compares
+them) gets no token, which suits the local preview (--no-auth), so the profile's
+token never leaves for another host.
 
 Examples:
   ./measure.py                                  # the profile's server, read-only
@@ -51,12 +53,15 @@ import time
 import httpx2
 
 from trackinizer.lib import zstd_compat
-from trackinizer.lib.custom_json import JSONValue, convert, loads, parse
+from trackinizer.lib.codec import PlainTree, ReadError, from_plain, loads
 from trackinizer.trax.profile import load_profile
+from trackinizer.web.scripts.mirror_local import source_token
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
+
+    from trackinizer.trax.profile import Profile
 
 
 # How to undo each `Content-Encoding` the client offers: the body is read raw so
@@ -113,22 +118,23 @@ def main() -> int:
 
     """
     parser = argparse.ArgumentParser(
-        description=(__doc__ or "").split("\n", 2)[2],
+        description=__doc__.split("\n", 2)[2] if __doc__ else None,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     _add_arguments(parser)
     flags = cast(_Flags, parser.parse_args())
     profile = load_profile()
     url = (flags.url or profile.url).rstrip("/")
-    headers = {"Accept-Encoding": ", ".join(_DECODERS)}
-    if url == profile.url.rstrip("/") and profile.api_key:
-        headers["Authorization"] = f"Bearer {profile.api_key}"
     queries = flags.query or ["trackinizer", "membership check", "title:^web"]
-    with httpx2.Client(base_url=url, headers=headers, timeout=30.0) as http:
-        version = convert(_read(http, "/api/version"), dict[str, object])
+    with httpx2.Client(
+        base_url=url,
+        headers=_headers(url, profile),
+        timeout=30.0,
+    ) as http:
+        version = from_plain(_read(http, "/api/version"), dict[str, object])
         rows = measure(http, repeats=flags.repeats, queries=queries, hub=flags.hub)
         stream = sample_stream(http, seconds=flags.stream_sec)
-    sha = convert(version.get("sha"), str)
+    sha = from_plain(version.get("sha"), str)
     now = datetime.now(UTC).astimezone()
     folder = Path("/opt/scratch/artifacts/trackinizer-web/measure") / f"{now:%Y-%m-%d}"
     path = _write(report(rows, stream=stream, url=url, sha=sha), url=url, folder=folder)
@@ -137,7 +143,7 @@ def main() -> int:
     if flags.baseline:
         changes = moved(
             rows,
-            parse(flags.baseline.read_text(), dict[str, object]),
+            from_plain(loads(flags.baseline.read_text()), dict[str, object]),
         )
         print(f"\nmoved more than 2x from {flags.baseline}: {len(changes) or 'none'}")
         for name, what, before, after in changes:
@@ -165,13 +171,13 @@ def measure(
       rows: One per measurement, in the order of the plan's table.
 
     """
-    kinds = convert(
-        convert(_read(http, "/api/meta/enums"), dict[str, object]).get(
+    kinds = from_plain(
+        from_plain(_read(http, "/api/meta/enums"), dict[str, object]).get(
             "inquiry_kind_all",
         ),
         list[str],
     )
-    issues = convert(
+    issues = from_plain(
         _read(http, "/api/inquiries", (("kind", "Issue"), ("limit", 50))),
         list[dict[str, object]],
     )
@@ -213,11 +219,11 @@ def sample_stream(http: httpx2.Client, *, seconds: float) -> Stream:
                 return Stream(seconds=0.0, frames=0, distinct_ids=0, status=status)
             for line in response.iter_lines():
                 if line.startswith("data:"):
-                    frame = parse(
-                        line.removeprefix("data:"),
+                    frame = from_plain(
+                        loads(line.removeprefix("data:")),
                         dict[str, object],
                     )
-                    ids.append(convert(frame.get("id"), str))
+                    ids.append(from_plain(frame.get("id"), str))
                 if time.perf_counter() - start >= seconds:
                     break
     except httpx2.ReadTimeout:
@@ -237,7 +243,7 @@ def report(
     stream: Stream,
     url: str,
     sha: str,
-) -> dict[str, JSONValue]:
+) -> dict[str, PlainTree]:
     """Build the JSON report of one run.
 
     Args:
@@ -286,8 +292,8 @@ def moved(
 
     """
     before = {
-        convert(old.get("name"), str): old
-        for old in convert(baseline.get("rows"), list[dict[str, object]], default=[])
+        from_plain(old.get("name"), str): old
+        for old in from_plain(baseline.get("rows"), list[dict[str, object]], default=[])
     }
     changes: list[tuple[str, str, float, float]] = []
     for row in rows:
@@ -298,19 +304,25 @@ def moved(
         pairs = (
             (
                 "median seconds",
-                convert(old.get("median_seconds"), float),
+                from_plain(old.get("median_seconds"), float, default=None),
                 now_seconds,
             ),
             (
                 "median JSON bytes",
-                convert(old.get("median_json_bytes"), float),
+                from_plain(old.get("median_json_bytes"), float, default=None),
                 now_bytes,
             ),
         )
         changes.extend(
             (row.name, what, then, now)
             for what, then, now in pairs
-            if then and now and max(then / now, now / then) > 2
+            if (
+                then is not None
+                and now is not None
+                and then != 0
+                and now != 0
+                and max(then / now, now / then) > 2
+            )
         )
     return changes
 
@@ -322,6 +334,14 @@ class _Flags(Protocol):
     hub: str
     stream_sec: float
     baseline: Path | None
+
+
+def _headers(url: str, profile: Profile) -> dict[str, str]:
+    """Return the request headers: every coding decoded, and the token on its server."""
+    headers = {"Accept-Encoding": ", ".join(_DECODERS)}
+    if token := source_token(url, profile):
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -384,12 +404,12 @@ def _list_rows(
     kinds: Sequence[str],
     repeats: int,
 ) -> list[Row]:
-    profile = convert(_read(http, "/api/me/profile"), dict[str, object])
+    profile = from_plain(_read(http, "/api/me/profile"), dict[str, object])
     mine = json.dumps(
         {
             "field": "account",
             "op": "is",
-            "value": convert(profile.get("email"), str),
+            "value": from_plain(profile.get("email"), str),
         },
     )
     every: Params = tuple(("kind", kind) for kind in kinds)
@@ -422,25 +442,28 @@ def _detail_rows(
     hub: str,
     repeats: int,
 ) -> list[Row]:
-    newest = [convert(row.get("id"), str) for row in issues[:5]]
-    rows = [
-        _row(
-            "detail: newest Issues",
-            *(partial(_get, http, f"/api/web/get/{id_}") for id_ in newest),
-            repeats=repeats,
-            note=f"{len(newest)} Issues",
-        ),
-    ]
+    newest = [from_plain(row.get("id"), str) for row in issues[:5]]
+    rows: list[Row] = []
+    # With no Issues the row would take no sample, and report an empty median.
+    if newest:
+        rows.append(
+            _row(
+                "detail: newest Issues",
+                *(partial(_get, http, f"/api/web/get/{id_}") for id_ in newest),
+                repeats=repeats,
+                note=f"{len(newest)} Issues",
+            ),
+        )
     hub_id = _hub_id(http, issues=issues, hub=hub)
     if hub_id:
-        view = convert(_read(http, f"/api/web/get/{hub_id}"), dict[str, object])
-        head = convert(view.get("self"), dict[str, object])
+        view = from_plain(_read(http, f"/api/web/get/{hub_id}"), dict[str, object])
+        head = from_plain(view.get("self"), dict[str, object])
         relations = sum(
-            len(convert(peers, list[object]))
+            len(from_plain(peers, list[object]))
             for side in ("edges", "backlinks")
-            for peers in convert(view.get(side), dict[str, object]).values()
+            for peers in from_plain(view.get(side), dict[str, object]).values()
         )
-        ref = f"{convert(head.get('kind'), str)}#{convert(head.get('seq'), int)}"
+        ref = f"{from_plain(head.get('kind'), str)}#{from_plain(head.get('seq'), int)}"
         rows.append(
             _row(
                 "detail: hub",
@@ -461,12 +484,19 @@ def _hub_id(
     """Return the id of `hub` (`Kind#seq`), or of the parent most `issues` narrow."""
     if hub:
         kind, _, seq = hub.partition("#")
-        found = convert(_read(http, f"/api/inquiries/{kind}/{seq}"), dict[str, object])
-        return convert(found.get("id"), str)
+        found = from_plain(
+            _read(http, f"/api/inquiries/{kind}/{seq}"),
+            dict[str, object],
+        )
+        return from_plain(found.get("id"), str)
     parents = Counter(
-        convert(parent.get("id"), str)
+        from_plain(parent.get("id"), str)
         for row in issues
-        for parent in convert(row.get("narrows"), list[dict[str, object]], default=[])
+        for parent in from_plain(
+            row.get("narrows"),
+            list[dict[str, object]],
+            default=[],
+        )
     )
     return parents.most_common(1)[0][0] if parents else ""
 
@@ -482,11 +512,11 @@ def _activity_rows(http: httpx2.Client, *, repeats: int) -> list[Row]:
         )
         for tab in tabs
     ]
-    newest = convert(
+    newest = from_plain(
         _read(http, "/api/change_log", (("kind", "status"), ("limit", 1))),
         list[dict[str, object]],
     )
-    since = convert(newest[0].get("created"), str) if newest else "1970-01-01"
+    since = from_plain(newest[0].get("created"), str) if newest else "1970-01-01"
     rows.append(
         _row(
             "activity: status since the newest",
@@ -542,12 +572,16 @@ def _live_rows(
     issues: Sequence[Mapping[str, object]],
     repeats: int,
 ) -> list[Row]:
+    # With no Issues, both reads would ask for nothing (no seq_range, `^()$`) and time
+    # an empty answer as if it were the live layer's refetch.
+    if not issues:
+        return []
     spans: Params = tuple(
         ("seq_range", span)
-        for span in _spans(sorted(convert(row.get("seq"), int) for row in issues))
+        for span in _spans(sorted(from_plain(row.get("seq"), int) for row in issues))
     )
-    ids = "|".join(convert(row.get("id"), str) for row in issues[:13])
-    check = json.dumps({"field": "id", "op": "re", "value": f"^({ids})$"})
+    ids = [from_plain(row.get("id"), str) for row in issues[:13]]
+    check = json.dumps({"field": "id", "op": "re", "value": f"^({'|'.join(ids)})$"})
     three: Params = tuple(("kind", kind) for kind in kinds[:3])
     return [
         _row(
@@ -562,7 +596,7 @@ def _live_rows(
             note=f"{len(spans)} ranges",
         ),
         _row(
-            "membership: 13 ids, three kinds",
+            f"membership: {len(ids)} ids, three kinds",
             partial(_get, http, "/api/inquiries", (*three, ("filter", check))),
             repeats=repeats,
             note=", ".join(kinds[:3]),
@@ -599,25 +633,29 @@ def _get(http: httpx2.Client, path: str, params: Params = ()) -> Sample:
         raw = b"".join(response.iter_raw())
     seconds = time.perf_counter() - start
     body = _decoded(raw, response.headers.get("content-encoding", ""))
-    message = ""
-    if response.is_error:
-        # A proxy's error page is not JSON; its start says enough.
-        try:
-            detail = convert(
-                parse(body, dict[str, object]).get("detail"),
-                object,
-                default="",
-            )
-        except ValueError:
-            detail = body[:200].decode(errors="replace")
-        message = convert(detail, str)
     return Sample(
         seconds=seconds,
         status=response.status_code,
         json_bytes=len(body),
         wire_bytes=len(raw),
-        message=message,
+        message=_message(body) if response.is_error else "",
     )
+
+
+# FastAPI's `detail` is a string for a refusal and a list for a 422; a proxy answers
+# JSON of its own shape, or an HTML page.
+def _message(body: bytes) -> str:
+    """Return an error body's `detail`, else its JSON, else the start of its text."""
+    try:
+        value = loads(body)
+    except ValueError:
+        return body[:200].decode(errors="replace")
+    try:
+        fields = from_plain(value, dict[str, object])
+    except ReadError:
+        fields = {}
+    detail = fields.get("detail", value)
+    return detail if isinstance(detail, str) else json.dumps(detail)
 
 
 def _serial(http: httpx2.Client, reads: Iterable[tuple[str, Params]]) -> Sample:
@@ -657,12 +695,14 @@ def _decoded(raw: bytes, content_encoding: str) -> bytes:
     return raw
 
 
-def _read(http: httpx2.Client, path: str, params: Params = ()) -> JSONValue:
+def _read(http: httpx2.Client, path: str, params: Params = ()) -> PlainTree:
     """GET untimed, for what the measurements need to know first."""
-    return loads(http.get(path, params=params).raise_for_status().content)
+    return loads(
+        http.get(path, params=params).raise_for_status().content.decode(),
+    )
 
 
-def _summary(row: Row) -> dict[str, JSONValue]:
+def _summary(row: Row) -> dict[str, PlainTree]:
     ok = _ok(row)
     seconds = [sample.seconds for sample in ok]
     median_seconds, median_bytes = _medians(row)
@@ -709,7 +749,7 @@ def _medians(row: Row) -> tuple[float | None, float | None]:
 
 # Two runs in one second against one server share a name, so the file is made only if it
 # is not there (``"x"``), and a later one takes the next number.
-def _write(document: Mapping[str, JSONValue], *, url: str, folder: Path) -> Path:
+def _write(document: Mapping[str, PlainTree], *, url: str, folder: Path) -> Path:
     """Write `document` in `folder`, named for the server and time, never over another."""
     now = datetime.now(UTC).astimezone()
     host = (urlsplit(url).netloc or url).replace(":", "-")

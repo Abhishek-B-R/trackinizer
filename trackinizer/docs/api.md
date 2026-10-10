@@ -238,6 +238,7 @@ and the page puts it back on `next`, so signing in returns to the same view.
 ```
 GET  /api/me/profile
 PUT  /api/me/visual-workspace
+PUT  /api/me/acknowledge
 GET  /api/me/tokens
 POST /api/me/tokens
 POST /api/me/tokens/<uuid>/revoke
@@ -247,6 +248,7 @@ PUT  /api/me/tokens/<uuid>/role
 ### 1.18 Admin users
 
 ```
+PUT    /api/admin/inquiries/<uuid>/lock
 GET    /api/admin/users
 PUT    /api/admin/users/<uuid>/role
 POST   /api/admin/users/<uuid>/disable
@@ -449,6 +451,11 @@ GET    /api/sessions/<uuid>/inbound
 POST   /api/messages
 ```
 
+Each drained message carries the sender the server attested as `source` and,
+beside it, `source_role`, that sender's effective role (`viewer`, `writer` or
+`admin`) as the server saw it when the message was sent. Neither is taken from
+the request, and a message the server generates has no `source_role`.
+
 Inbound messages whose attested `source` is `trackinizer` are subscriber
 push envelopes -- JSON metadata for a committed change, generated
 server-side (no HTTP surface produces them). Shape and client-side
@@ -498,48 +505,330 @@ any read. Read-only; nothing imports it yet. Line shape: section 3.24.
 GET  /api/visuals
 POST /api/workspaces
 GET  /api/workspaces/<uuid>
-GET  /api/workspaces/sessions/connectable
-PUT  /api/workspaces/<uuid>/connection
 POST /api/workspaces/<uuid>/operations
 ```
 
 `GET /api/visuals` returns safe descriptors and the default visual type. It
 does not fetch graph data or start a session. Each descriptor has a stable
-`type`, `version`, title, description, requirements, default size, and bounded
-parameter schema.
+`type`, `version`, title, description, requirements, default size, bounded
+parameter schema, and `record_kinds`: the kinds of record a show may name
+(`null` for any, an empty list for none). `trax.browse` is the page itself: it
+takes no record and no parameter, and it cannot be hidden. `trax.timeline`
+shows an Issue or an Experiment, `trax.artifact` an Artifact, `trax.subgraph`
+any record.
+
+`GET /api/visuals/timeline/<record-uuid>` is the one bounded read behind the
+`trax.timeline` visual (Lineage and timeline). The record may be of any kind;
+an Experiment is shown on the Issue that produced it, and any other kind
+stays the record and takes the nearest `produced_by` Issue as its anchor
+(none: the record is returned alone). The response carries `target`, the
+anchor `issue`, `leads` (the anchor's `narrows` ancestors, at most three,
+farthest first; for a non-Issue record the anchor is itself the nearest lead),
+the record's `root_results` with signed evidence, and up to `direction_limit`
+directions with `results_per_direction` results each. The two limits come from
+the catalog descriptor; an out-of-range value returns 422, a missing record
+404.
 
 `PUT /api/me/visual-workspace` sets the signed-in user's canvas opt-in from
 an interactive browser session. API keys cannot change that choice.
-`GET /api/me/profile` includes `visual_workspace_enabled`; its default is
-false. Canvas routes return 403 while it is false.
+`GET /api/me/profile` includes `visual_workspace_enabled`; it defaults to true. It
+also names `api_key_id`, the key the request used, or null for a browser session.
 
-`POST /api/workspaces` creates or reopens the signed-in user's default canvas.
-The response has `id`, `revision`, `visuals`, `focused_instance`, and
-`connected_session_id`.
-`GET /api/workspaces/<uuid>` returns that state only to its owner.
+`PUT /api/me/acknowledge` with `{"rules_version": "<version shown>"}` records that
+the signed-in user agreed to the alpha rules, from an interactive browser session;
+API keys are refused with 403. The rules are Issue#1 and their version is when its
+title or description last changed (its creation until then), so editing the words
+makes every recorded agreement stale and a cascade or cost roll-up under it does not.
+A version that is no longer the current one answers 409: the user read other rules.
+`GET /api/me/profile` returns
+`acknowledged_at` and `acknowledged_rules_version` (null before the user agrees), the
+current `rules_version` and `rules_issue_id`, both null unless Issue#1 exists and is
+locked: rules are in force only then, so a deployment turns the welcome flow on by
+locking its rules Issue. With no rules in force the acknowledge call answers 409.
 
-The browser pairs a live AgentSession with `PUT /connection`, supplying the
-current `revision` and `session_id`. Null disconnects. The session must have
-been opened by an unrevoked API key owned by that account. API keys cannot
-change the pairing. A stale revision returns 409 with the current workspace.
-`GET /api/workspaces/sessions/connectable` lists at most 100 such live
-sessions for the interactive browser's picker; API keys cannot call it.
+`PUT /api/admin/inquiries/<uuid>/lock` with `{"locked": true | false}` is admin
+only. While an inquiry is locked, only an admin may set, patch or clear its
+fields, add or remove its edges (an edge write is refused when either end is
+locked), name it in a create (a parent, a prerequisite, a citation, a batch edge),
+or purge it or a row linked to it, or publish an Artifact for it or as a revision of
+a locked Artifact (`POST /api/artifacts/content`); any other writer gets 403 naming
+the row. The lock covers fields, edges and delete only: a session's lifecycle
+(`/api/sessions/<id>/end`), its metrics and its records are not edits of the row and
+stay open to the session's owner. `POST /api/inquiries/next_issue` skips a locked
+Issue. Locking records no change and leaves `modified` alone; `inquiry_lock_log`
+holds who set or cleared each lock and when. Migration `schema.038.sql` locks nothing;
+an admin locks Issue#1 so that no writer rewrites the rules, and unlocks it to
+edit them.
+`GET /api/web/get/<uuid>` carries `locked` beside
+`self`.
+
+`POST /api/workspaces` creates or reopens the signed-in user's default canvas,
+which starts with `trax.browse` in the main pane and `trax.chat` at the side.
+The response has `id`, `revision`, `visuals`, `focused_instance`, `assistant`,
+and `partner`.
+`GET /api/workspaces/<uuid>` returns that state to its owner, and to an
+assistant's key (below).
+
+**The assistant and the partner.** The server's `--assistant ACTOR=EMAIL`, or
+`$TRACKINIZER_ASSISTANT`, names one assistant. A live AgentSession is the
+assistant's when its granted actor is `ACTOR` (or `ACTOR#N`, the suffix the
+server adds once a name has been used) and the API key that opened it belongs to
+the account `EMAIL`, compared lowercase. Every canvas talks to the assistant's
+newest live session. `assistant` in the state is its actor, or null when none is
+configured. `partner` is computed on every read and never stored: `session_id`,
+`actor`, the configured name, `cli`, `status`, `live` or `unavailable`, and
+`kind`, `shared` or `local`.
+
+**The local choice.** A canvas starts `shared`. Its owner's browser can send the
+operation `{"kind": "partner", "choice": "local"}` (or `"shared"`), which is
+stored as `partner_choice` in the canvas state and bumps the revision as any
+operation does; an API key sending it is 422. With `local`, the partner is the
+owner's newest live `trax helper` session (CLI `trax-helper`) that an unrevoked
+key of the owner's own account opened and that is polling its inbound queue, and
+`actor` is that session's granted actor. Another user's helper never qualifies,
+and the shared assistant never stands in. With none running the partner is `kind`
+`local`, `unavailable`, with a null `session_id`, `actor` and `cli`, and a Chat
+send is 409. The owner needs no `--assistant`: a server with none can still serve
+`local` canvases. Opening a preset keeps the canvas's choice.
+
+Any session can be the assistant. `trax helper claude` (or `codex`) `--as
+ACTOR`, run with a key of the account `EMAIL`, opens one and answers each science
+chat line by a turn of that CLI, resuming the chat's own CLI conversation. Its
+service session takes messages only from Chat: a direct or routed send to it is
+403.
+
+The partner's key may read and operate a canvas while that canvas's partner
+is the session the key opened, and a live science chat that key opened has the
+canvas's owner as its account or a poster (section 1.25). The check is per
+person, not per canvas. Any other canvas is 404, so a user who never talked to
+the partner gives it nothing; the owner's own key is 403 unless the partner is
+the owner's local helper, which that key opened. Only the key that opened a
+partner or science-chat session may drain its inbound queue, whatever the role.
 
 An operation body has `revision` and one `operation`: `show`, `hide`, `focus`,
-or `place`. The caller supplies a UUID `Idempotency-Key` header. The server
-locks the workspace, checks the revision, validates the visual type and
-parameters, and returns the new state. Retrying a recent body with the same
-key returns the original state. The latest 64 receipts are retained; an older
-retry receives a stale-revision 409 after its receipt expires. Reusing a
-retained key for another body returns 409.
-Both that conflict and a stale revision include `current` with the live
-workspace. An API key can operate only while its own live session is paired;
-that check also runs before replaying an idempotency receipt.
-The current browser polls the workspace every two seconds; workspace events
-are planned for a later slice.
+`place`, `partner`, `navigate`, or `highlight`. The caller supplies a UUID `Idempotency-Key`
+header. The
+server locks the workspace, checks the revision, validates the visual type,
+parameters and record kind, and returns the new state. Retrying a recent body
+with the same key returns the original state and publishes nothing. The latest 64
+receipts are retained; an older retry receives a stale-revision 409 after its
+receipt expires. Reusing a retained key for another body returns 409. Both that
+conflict and a stale revision include `current` with the live workspace. An API
+key can operate only as the partner above; that check also runs before
+replaying an idempotency receipt.
+
+`navigate` is `{"kind": "navigate", "route": "#/..."}` with a route of at most
+512 characters and no space or control character. Only an agent key may send it.
+It changes no visual and no revision: the server pushes a `navigate` frame, and
+the browser goes there when it accepts the route. A navigation made while no tab
+listens is not replayed.
+
+`highlight` is `{"kind": "highlight", "ids": [uuid, ...]}` with at most 50 ids;
+an empty list clears. It is an event as `navigate` is: only an agent key may
+send it, it changes no visual and no revision, and the server pushes a
+`highlight` frame, which the browser marks the inquiries from. It is never
+stored and not replayed.
 
 Viewer access is enough to change one's own canvas. Workspace operations do
 not edit trax records or add entries to `change_log`.
+
+### 1.25 Science chat and canvas events
+
+```
+POST   /api/chats
+GET    /api/chats
+GET    /api/chats/<uuid>
+GET    /api/workspaces/<uuid>/events
+```
+
+A canvas Chat conversation is one AgentSession the assistant opens: label
+`science-chat`, `cli_session_id` `chat:<conversation id>`, actor
+`chat-<12 hex>`, account the person who started it. Its records are the
+conversation (a person's line is an agent message from its poster, then the
+assistant's tool calls, results and answers), read with the ordinary session
+routes. There is no separate chat store and no delete: chats are public to
+every user.
+
+`POST /api/chats` (browser only, writer role, with an `Idempotency-Key`) posts a
+line. The body is `{kind: "science", workspace_id, text, chat_instance_id,
+expected_record_id, conversation_id, page, trail}`; `text` holds a non-space
+character and at most 16,384 characters, and `workspace_id` is the poster's own
+canvas. `page` is the `#/...` address the sender is on and `trail` the addresses
+they came through before it, oldest first, at most 8; a malformed address or a
+longer trail is 422. The server resolves them to records in the context. A
+`conversation_id` continues a chat, and any signed-in writer in the starter's
+organisation may post into it (see Forking below). None starts one, and the key
+names it, so a retry names the same conversation. `fork: {session_id, part, idx}`
+instead starts a new conversation from that line of another chat; it and
+`conversation_id` together are 422. The line's poster is the attested account,
+never the body. The server builds the typed canvas context (checking the Chat instance and that the
+record still matches `expected_record_id`, else 409 before queueing) and queues
+the line for the conversation's own session when the canvas's partner has it open
+and some poller drains it, and for the partner's service session otherwise (a
+`trax helper` does not poll its chats, so it hears every line there). The
+receipt is `{conversation_id, session_id}` at once; `session_id` is null until
+the assistant has the session open. The same key again returns the original receipt and queues nothing; a key
+reused for another line is 409. The de-duplication is in memory, so a retry after
+a server restart queues the line again. No live assistant is 409; a full queue is
+409 `partner busy`, and nothing is queued.
+
+`GET /api/chats` lists the chats the caller started or posted in (account is the
+caller, or label `poster:<email>`), newest first, at most 50, as
+`{conversation_id, session_id, title, account, modified}`. `GET
+/api/chats/<uuid>` returns `{conversation_id, session_id, title, account, live,
+forks, forked_from, forks_on_typing}` and is 404 until the assistant has opened the session; any signed-in user may
+read it, which is how a chat opens by link. Both are browser only. A chat that
+the caller's own `trax helper` opened (the local choice) is listed and found for
+the caller only.
+
+Forking. A fork is a new science chat that starts from a line of another: its
+`account` is the forker, it has its own conversation id (the key), and the
+assistant that serves it (or `trax helper`) opens its session with
+copies of the original's lines up to and including that line, read from the
+original's session, and adds a `produced_by` edge from the fork's session to the
+original's, labelled `chat-fork` and `fork-at:<part>:<idx>`. The original is not
+written, and a fork point is dropped for a conversation that already has lines. Spend,
+campaigns and History belong to the forker. `forks` on the original's head counts
+the conversations with such an edge to it, counting only an edge that the key that
+opened the fork's session added with the fork label; `forked_from` on a fork's
+head is the original's conversation (the earliest such edge). A helper's forks
+count for the forker alone, since the head counts what the viewer may find. Who
+may join a chat or must fork it is the server's `TRACKINIZER_CHAT_ORGS`:
+`domain` (the default, also when unset) makes each verified email domain one
+organisation, except the consumer domains (`gmail.com`, `googlemail.com`, `outlook.com`, `hotmail.com`,
+`live.com`, `yahoo.com`, `icloud.com`, `me.com`, `proton.me`, `protonmail.com`),
+which are none; `single` makes every user one organisation, and only a server
+whose users are all one organisation sets it. A person always joins their own
+chat. Anyone else's post into a chat of another organisation is 403 and queues
+nothing, whether the conversation is named by `conversation_id` or by the
+`Idempotency-Key` of a post that names none; the chat's starter is the account of
+its oldest session (the assistant's first), or, before any session carries the
+id, the sender of the post that began it. A `fork` whose key names a conversation
+someone else began is 409. The head's `forks_on_typing` says a post is refused,
+and the browser then forks at the latest line instead (or on the 403, if it
+posted before the head was read). A `fork` is allowed to anyone, in a chat of their
+organisation too.
+
+When a session ends with Chat lines it never drained, the unread lines of a
+science chat are queued again for the assistant's service session, which
+reopens the conversation's session. The unread lines of an assistant or
+`trax-helper` service session that names itself (a `cli_session_id`) stay queued
+for the session its next start resumes; one that does not is released, and the
+lines it held are logged with their senders.
+
+Only the key that opened a science chat writes or drains it, whoever that is and
+whether or not an assistant is configured (a session under a `chat:` id is one, a
+user's own `trax helper` chats included; a `trax-helper` session is drained by its
+key alone): appending records, ending it,
+editing any of its fields (its labels and account decide who sees it in History
+and which canvases the assistant may use) and purging it are 403 from any other
+key, a writer's included, and `POST /api/sessions/<uuid>/inbound` and
+`/api/messages` refuse it with 409 because a line sent that way names no
+conversation. A conversation has one session per assistant key that has spoken in
+it, since a session resumes only for the key that opened it; `GET /api/chats/<uuid>`
+and History name the live one, else the newest.
+
+`GET /api/workspaces/<uuid>/events` streams the owner's canvas as server-sent
+events (browser only), and is the tab's one stream. Each frame is `data: <json>`
+with `t`, the server's epoch milliseconds: `{type: "workspace", state, shown}`
+on open, after every applied operation, and when the partner changes (a
+session starts or ends, or its poller lease lapses), where `shown` is the
+instance an agent's `show` brought up and null for any other change;
+`{type: "navigate", route}`; `{type: "highlight", ids}`; and
+`{type: "changed", id}` for each inquiry
+id `/api/web/subscribe` relays. A record appended to a science chat's session
+changes that session, so every viewer of it gets a `changed` frame and reads
+what the session gained. A comment goes out on open and after 25 s without a
+frame, and on each the server checks the user is still active and ends
+the stream if not. A subscriber more than 256 frames behind is dropped and
+reconnects from the `workspace` frame.
+
+### 1.26 Variables
+
+```
+GET    /api/variables
+PUT    /api/variables/<name>
+DELETE /api/variables/<name>
+```
+
+The environment variables an agent launch exports, plain and secret. Only the
+org layer has routes; the store also keys machine and user layers. `GET` is
+writer role and `PUT` / `DELETE` are admin role. Bodies: section 3.25.
+
+A plain value is stored and listed. A secret's value goes to the server's
+secret backend, which `TRACKINIZER_SECRETS` selects (`file`, `file:/abs/path`,
+or `none`); no route returns it, so a listed secret has `value: null`. A name
+stored as a secret stays secret: a plain `PUT` on it answers 409 until the
+variable is deleted. Without a secret backend, a secret `PUT` and the `DELETE`
+of a secret answer 503. A name must match `^[A-Za-z_][A-Za-z0-9_]{0,127}$`
+and a value is 1 to 65536 bytes of UTF-8 with no NUL; anything else answers
+422, and a 422 under `/api/variables` never echoes the rejected input, not
+even as a body key. The same holds behind a path prefix.
+
+### 1.26 Machines
+
+```
+GET    /api/machines
+GET    /api/machines/<name>
+PUT    /api/machines/<name>
+PATCH  /api/machines/<name>/labels
+DELETE /api/machines/<name>
+POST   /api/machines/enroll
+POST   /api/machines/join
+POST   /api/machines/<uuid>/heartbeat
+POST   /api/machines/<name>/revoke
+```
+
+The registry of machines a campaign may run on: a name, a role, a `how`
+line telling an agent how to use the machine, and labels. It never reaches a
+machine, so `DELETE` only unregisters. Both `GET`s are writer role; `PUT`,
+`PATCH`, `DELETE`, `enroll` and `revoke` are admin role. `join` and
+`heartbeat` take no role: the secret they carry is the credential. Bodies:
+section 3.26.
+
+`PUT` creates the machine when the name is new. A field the body leaves out
+keeps its value (a new machine starts with it empty) and `""` clears it.
+`PATCH` adds the `add` labels, then removes the `remove` labels; adding a
+label already present and removing one that is absent are no-ops. Labels are
+stripped and deduplicated, as an Issue's are, and a blank label answers 422.
+`PATCH` and `DELETE` answer 404 for an unregistered name, as does `GET`.
+
+A name must match `^[a-z0-9][a-z0-9-]{0,62}$` and must not be `enroll`, `join`,
+`init`, `import`, `check`, `connect`, `leave` or `top`, which are, or will be,
+route segments and CLI words. A role is empty or matches
+`^[a-z][a-z0-9-]{0,31}$`; `how` is at most 2000 characters with no NUL.
+Anything else, on any of the five registry routes, answers 422.
+
+A machine that runs a host connects in three steps. An admin calls `enroll`
+with the machine's name, which registers the machine if it is new and returns a
+one-use enrollment token (`enr_...`) valid for 15 minutes; a new `enroll`
+supersedes any open token. The host calls `join` with the token, once, and
+receives the machine's id and its machine credential (`trax_machine_...`).
+A token that is malformed, unknown, used, expired, issued for another name, or
+issued by an account that is no longer an active admin answers 401 with one
+body. Joining a machine that already has a live credential revokes that
+credential first. Both responses are `Cache-Control: no-store`, and a 422 on
+`join` never echoes the token, not even as a body key.
+
+The host then calls `heartbeat` with the credential as its bearer token, about
+every 15 seconds, naming its `instance` (its own id, kept across restarts). One
+instance holds a machine at a time: a different instance answers 409 until the
+first has been silent for 180 seconds, and then takes over. A heartbeat whose
+credential was revoked while it was in flight answers 410 and writes nothing.
+A machine's `status` is derived, never stored: `online` within 180 seconds of
+its last heartbeat, `offline` after, `never` before the first, and `revoked`
+once every credential it had was revoked. `GET /api/machines/<name>` adds
+`last_heartbeat`, `host_version` and `facts`.
+
+A machine credential is checked by its own dependency, not by the user roles. It
+never authenticates any other route (those answer 401), and an API key never
+authenticates `heartbeat` (401). A credential for machine A on machine B's path
+answers 404. `revoke` keeps the credential's row and closes any unused token; the
+host's next request then answers 410 `machine_revoked`, while an unknown
+credential answers 401, so only a holder of a once-valid secret learns of the
+revoke. Revoking a revoked machine, or one that never joined, is a no-op.
+`DELETE` answers 409 `machine_in_service` while the machine holds a live
+credential; revoke it first.
 
 ## 2. Glossary
 
@@ -1043,6 +1332,53 @@ Not exported: `inquiry_embeddings` (derived), `session_ciphertext`
 (encrypted, retention-managed), and `users` / `api_keys` / `allowlist`
 (credentials and access control).
 
+### 3.25 Variables
+
+```
+PUT /api/variables/<name>   {"value": "<text>", "secret": false}
+GET /api/variables          {"variables": [{"layer": "org", "owner": "", "name": "<name>", "secret": false, "value": "<text>", "updated_by": "<email>", "updated": "<timestamp>"}, ...]}
+```
+
+`secret` defaults to false. The list is sorted by name. A secret's `value` is
+`null`. `PUT` and `DELETE` answer `204` with no body, so a secret is never
+echoed. `updated_by` is the email of the principal who last set the variable.
+
+### 3.26 Machines
+
+```
+PUT   /api/machines/<name>          {"role": "<role>", "how": "<text>"}
+PATCH /api/machines/<name>/labels   {"add": ["<label>"], "remove": ["<label>"]}
+GET   /api/machines                 {"machines": [{"name": "<name>", "role": "<role>", "how": "<text>", "labels": ["<label>"], "updated_by": "<email>", "updated": "<timestamp>"}, ...]}
+GET   /api/machines/<name>          {"name": "<name>", "role": "<role>", "how": "<text>", "labels": ["<label>"], "updated_by": "<email>", "updated": "<timestamp>"}
+```
+
+Every `PUT` field is optional; `add` and `remove` default to empty. The list
+is sorted by name in byte order and labels keep the order they were added in.
+`PUT`, `PATCH` and `DELETE` answer `204` with no body. `updated_by` is the
+email of the principal who last changed the machine. Each listed machine also
+carries `"status": "never|online|offline|revoked"` and `"last_heartbeat":
+"<timestamp>"` (`null` before the first); `GET /api/machines/<name>` adds
+`"host_version": "<text>"` and `"facts": {"<key>": <value>, ...}`.
+
+```
+POST /api/machines/enroll             {"name": "<name>"}
+                                      -> 201 {"token": "enr_...", "expires_at": "<timestamp>"}
+POST /api/machines/join               {"name": "<name>", "token": "enr_...", "instance": "<uuid>",
+                                       "host_version": "<text>", "facts": {"<key>": <value>}}
+                                      -> 201 {"machine_id": "<uuid>", "credential": "trax_machine_..."}
+POST /api/machines/<uuid>/heartbeat   {"instance": "<uuid>", "host_version": "<text>",
+                                       "facts": {"<key>": <value>}}
+                                      -> 200 {"server_time": "<timestamp>"}
+POST /api/machines/<name>/revoke      -> 204 with no body
+```
+
+`facts` is optional on `join` (default empty) and on `heartbeat`, where leaving
+it out keeps the stored facts and sending it replaces them. A key matches
+`^[a-z][a-z0-9_]{0,31}$`; a value is a string of at most 256 characters with no
+NUL, an integer within 64 bits, a boolean, or a list of such strings; at most 64
+keys and 4096 bytes as compact JSON. `host_version` is at most 64 characters
+with no NUL. Anything else answers 422.
+
 ## 4. Other details
 
 ### 4.1 HTTP status codes
@@ -1052,13 +1388,18 @@ Not exported: `inquiry_embeddings` (derived), `session_ciphertext`
 201  create success
 302  auth redirect
 400  invalid body, invalid field for kind, invalid projected edge mutation
-401  missing or invalid auth
+401  missing or invalid auth; an unusable enrollment token or machine credential
 403  role too low
 404  row not found
-409  idempotency conflict, expected mismatch, immutable field, edge cycle, citation kind mismatch
+409  idempotency conflict, expected mismatch, immutable field, edge cycle, citation kind mismatch, plain value for a secret variable, machine in service, another host connected
+410  machine credential revoked
 422  well-formed body rejected by domain validation (e.g. self-loop edge, priority on a non-priority edge kind)
 500  server fault
+503  secret variable requested and no secret backend is configured
 ```
+
+Variable and machine `PUT`, `PATCH` and `DELETE`, and machine `revoke`, return `204`
+with no body.
 
 Inquiry and edge mutations -- including `DELETE` (field unset, inquiry
 purge, edge remove) -- return `200` with a body carrying the `change_id`
@@ -1068,11 +1409,16 @@ Workspace mutations return canvas state; they do not produce a graph change.
 ### 4.2 Roles
 
 ```
-viewer  GET /api/**, GET /api/web/**, GET /api/me/**, GET /app/**,
+viewer  GET /api/** except GET /api/variables and GET /api/machines/**, GET /api/web/**, GET /api/me/**, GET /app/**,
         PUT /api/me/visual-workspace,
         POST /api/workspaces, POST /api/workspaces/<uuid>/operations
-writer  viewer + inquiry/edge create/mutate/delete
-admin   writer + /api/admin/**
+writer  viewer + inquiry/edge create/mutate/delete, GET /api/variables,
+        GET /api/machines/**
+admin   writer + /api/admin/**, PUT/DELETE /api/variables/<name>,
+        PUT/PATCH/DELETE /api/machines/**, POST /api/machines/enroll,
+        POST /api/machines/<name>/revoke
+none    POST /api/machines/join, POST /api/machines/<uuid>/heartbeat (the
+        enrollment token or machine credential in the request is the credential)
 ```
 
 ### 4.3 Filters and pagination

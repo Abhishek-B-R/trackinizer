@@ -20,8 +20,11 @@ anyone when it runs with `--no-auth`. Any other browser gets the sign-in page.
   `src/live/` the stream layer, `src/writes/` the write layer, `src/debug/` the
   logger and Copy details (see [debugging](#debugging)), and the other
   directories one view or control each.
-- `test/testdata/` holds the server's real answer to every call the API
-  modules make (see [response shapes](#response-shapes-and-fixtures)).
+- `test/testdata/` holds the server's real answer to the calls of the
+  modules in `fixtures_test.py`'s table (see
+  [response shapes](#response-shapes-and-fixtures)); the canvas's and Chat's
+  calls (`workspaces`, `chats`, and the visuals, presets, timeline and Artifact
+  modules) have none.
 - `e2e/` is the Playwright suite, `e2e/live/` its live and responsiveness part.
 - `scripts/` holds the schema dump, the local preview, the seed and writer
   scripts, the production timing script, the bundle-size check, and the
@@ -80,12 +83,17 @@ anyone when it runs with `--no-auth`. Any other browser gets the sign-in page.
 
 ### The calls
 
-Each call's fixture is `test/testdata/<module>/<function>.json`.
+Each call's fixture, where it has one, is
+`test/testdata/<module>/<function>.json`. The `workspaces` and `chats` calls have
+none: the schema types them (`tsc` against `openapi.json`, kept in step by
+`openapi_drift_test.py`), and their API-module tests check what each sends and
+how it reads a frame.
 
 | Module | Function | Route |
 |---|---|---|
 | `meta` | `getEnums`, `getFieldOwners`, `getEdgeTopology` | `GET /api/meta/enums`, `/fields`, `/edges` |
 | `me` | `getProfile` | `GET /api/me/profile` |
+| | `acknowledgeRules` | `PUT /api/me/acknowledge` |
 | | `listTokens`, `createToken` | `GET`, `POST /api/me/tokens` |
 | | `setTokenRole`, `revokeToken` | `PUT /api/me/tokens/{id}/role`, `POST .../revoke` |
 | | `signOut` | `POST /auth/logout` (302 to `/`) |
@@ -112,7 +120,8 @@ Each call's fixture is `test/testdata/<module>/<function>.json`.
 | | `readFeedFacets` | `GET /api/web/feed/facets?since=&until=&actor=&room=&cli=&kind=` |
 | | `sendRoutedMessage` | `POST /api/messages` (header `Idempotency-Key`) |
 | `histogram` | `readHistogram` | `GET /api/web/feed/histogram?since=&until=&buckets=&actor=&room=&cli=&kind=` |
-| `admin` | `listUsers` | `GET /api/admin/users` |
+| `admin` | `setInquiryLock` | `PUT /api/admin/inquiries/{id}/lock` |
+| | `listUsers` | `GET /api/admin/users` |
 | | `setUserRole` | `PUT /api/admin/users/{id}/role` |
 | | `disableUser`, `enableUser` | `POST /api/admin/users/{id}/disable`, `/enable` |
 | | `deleteUser` | `DELETE /api/admin/users/{id}` (204) |
@@ -121,6 +130,10 @@ Each call's fixture is `test/testdata/<module>/<function>.json`.
 | | `removeAllowlistEntry` | `DELETE /api/admin/allowlist/{entry}` |
 | `graph` | `getGraph` | `GET /api/web/graph?limit=` |
 | `stream` | `openStream` | `GET /api/web/subscribe` (server-sent events) |
+| `workspaces` | `openWorkspaceEvents` | `GET /api/workspaces/{id}/events` (server-sent events) |
+| `chats` | `listChats` | `GET /api/chats` |
+| | `getChatHead` | `GET /api/chats/{id}` (404 until the assistant opens the session: `null`) |
+| | `sendChatLine` | `POST /api/chats` (header `Idempotency-Key`; `conversationId` null starts a conversation; `fork` starts one from a line of another) |
 
 Edges are stored child to parent: `from` is the child, which `narrows` its
 parent or `proves` its Belief. `/api/web/get` returns `edges` (this row is the
@@ -262,6 +275,112 @@ with one response shape, so the fixtures take one per verb.
   each a history entry; j and k move within the deepest column, and Enter opens
   its selection. A click leaves the focus where it was, as a list's buttons do,
   so Enter after a click still opens the selection.
+- The canvas is on for everyone (`visual_workspace_enabled` defaults true;
+  Settings' Agent workspace opts out). It wraps every view but Settings and
+  Admin, so Chat stays while an agent moves the page. Its chunk loads only for a
+  user who has it on, together with Chat's, the renderer it shows first, so the
+  canvas's first render suspends on nothing (a suspended renderer holds its
+  fallback for React's 300 ms throttle, which cost a cold first load of a page
+  250 to 300 ms); until both are in, the shell holds its busy frame, and the view
+  then mounts once, inside the canvas.
+- The page is `trax.browse`: it has no record or parameters, it cannot be
+  dismissed (no ×, and Configure's box is fixed), and a crash in it shows the
+  app's crash screen (Copy details, Reload) inside the canvas, which clears when
+  the page moves. The record the canvas's Chat button means is the one the
+  address names (`#/lookup/<id>`, or `#/ref/<Kind>/<seq>` resolved), never a
+  visual's.
+- Navigation is an event. An agent's `navigate` frame moves the page when
+  `parseHash` accepts its `#/...` route (any other is ignored), and writes
+  nothing. The browser's own links, Chat's, the record context, the context
+  graph's nodes and the timeline's only set the address, and write nothing to
+  the canvas. Panes share the stage and shrink to a floor (a page or main visual
+  300 px, a side visual 260 px, the side's share 30% up to 360 px), so three of
+  them fit 1280 px beside the sidebar with no sideways scroll; at 900 px and
+  narrower they stack, each 400 px or 48% of the screen high, and the stage
+  scrolls up and down.
+- Chat talks to the server's assistant (`src/visuals/Chat.tsx`). A conversation is
+  a science chat: an AgentSession (label `science-chat`, `cli_session_id`
+  `chat:<conversation id>`) that the assistant opens. Chat reads the session's
+  records; there is no chat store. Its header names the partner
+  (`workspace.partner`) and has History and Clear chat. The History menu has the
+  `menu` role, its items `menuitemradio` with the current one checked, and Escape
+  closes it. History lists `GET /api/chats` (the chats the user started or posted
+  in: title, age, starter) on each open; picking one opens it. Any other science
+  chat opens by link: a session's page, or the Console line, offers Continue in
+  Chat (`useContinueInChat`, `src/visuals/continueChat.ts`), which leaves a
+  request on the shell's `ChatFeed` and shows Chat; Chat resolves the session
+  (`cli_session_id`, label) and opens its conversation, or says "That session is
+  not a science chat." Clear chat starts an empty conversation and keeps the old
+  one: the next send goes with `conversationId: null`, and the receipt's id
+  becomes the open one, unless the user has picked another conversation since.
+  The open conversation is held by the shell (`ChatFeed`), so Chat mounting again
+  keeps it, and in `localStorage` under `trackinizer.v2.chat.<workspace id>`, so
+  a reload reopens it; with storage refused it lasts until the page does.
+- Chat sends the page it is on: each line carries `page`, the `#/...` hash as it
+  is sent, and `trail`, the up to 8 hashes before it, oldest first (routes only;
+  the server resolves their records). `src/router/trail.ts` records them from
+  `main.tsx` on, so pages visited before Chat opened count. With no record
+  pinned, Chat shows `On screen: Kind#seq title` for the record a
+  `#/lookup/<id>` or `#/ref/<Kind>/<seq>` page shows, and follows the page.
+- The partner is the shared assistant, or the owner's own `trax helper` when the
+  canvas chooses `local`; with none live, Chat says how to start one
+  (`ChatOff`, `HelperCommands`) and the box is off.
+- A chat is joined by typing in it, or forked. Every stored line has a "Fork from
+  here" button (not a line still sending, and not for a viewer): it picks the
+  line, a banner says so with a Cancel, and the next message is sent with
+  `fork: {sessionId, part, idx}` instead of a `conversationId`. The server makes the
+  fork a new conversation, named by the idempotency key, and Chat opens it. A chat
+  whose head says `forks_on_typing` (the server's call, from the verified email
+  domains; see `chat_orgs` in `server/config.py`) forks the same way at its latest
+  line whatever the user types, since the server refuses a post into it; the
+  composer is off until the head is read, and a post the server still refuses
+  (403) is sent again as a fork at the latest stored line. A fork
+  opens with the original's lines up to the one picked, so mine among them are
+  not waited for as a new line (`linesThrough`). The head also says how often a chat
+  was forked and which chat a fork came from.
+- The composer says chats are public to every user and cannot be deleted. Chat has
+  no delete.
+- An answer that arrives lights up the rows it cites at once, through the tab's
+  highlight store, as the agent's Highlight does, with no server round trip beyond
+  `GET /api/inquiries/{Kind}/{seq}` for a ref not seen before (`useAnswerHighlights`,
+  `src/visuals/chatHighlights.ts`; the lookups run together and are kept, since a
+  seq never moves). The newest answer that cites any replaces the marks; one that
+  cites none leaves them. A cited row is a `Kind#seq` of a known kind or a UUID
+  (`namedRows`, `chatRefs.ts`), read as the page links one: a ref in a code span
+  or block is quoted, not cited, and a link's text cites its ref but its target
+  does not. The answers there when a conversation opens are history and light
+  nothing. Settings' "Highlight rows the assistant mentions", in this browser, per
+  user, on by default (`settings/highlightMentions.ts`), turns it off at once,
+  a lookup under way included.
+- A conversation's lines are the session's records (`src/visuals/chatRecords.ts`):
+  parts and records are read incrementally, part by part, and
+  `readTranscript` (`chatLines.ts`) turns them into lines. A person's line
+  (`AgentToAgentMessage`) shows its sender when it is not the signed-in user's;
+  an `AssistantMessage` with content is an answer. `useLiveChat` registers on the
+  live hub and reads what the session gained when the canvas stream's `changed`
+  ids include the session (or on a gap), so every viewer of a chat sees a
+  teammate's line. The reads use the app's read retry.
+- A sent line shows at once, right-aligned and pending ("Sending…"). The send
+  returns the conversation id at once; the session does not exist until the
+  assistant opens it, so Chat polls `GET /api/chats/{id}` (every 1.5 s, up to 30
+  s) and shows "Waiting for the assistant…". When the session appears, the line
+  is its record and the pending one gives way (matched by counts of that text
+  before the send). If none appears, Chat says the assistant has not opened the
+  chat and the line can be sent again. "Working: <tool>…" shows while the last
+  record is a tool call or a line with no answer after it. Should the partner go
+  away (`workspace.partner.status` not live), the working line gives way to
+  "<actor> has ended." or "is unavailable.", and the box is disabled. A viewer
+  reads a chat but the box is disabled for them.
+  The partner's lines are left-aligned Markdown, without images. The box stays
+  open to typing while a line sends, and what is typed meanwhile stays. It
+  refuses a blank message and one over 16,384 characters. A send the server
+  refused (4xx) shows the server's reason and offers no Retry; one that got no
+  answer, or a 5xx, keeps the draft with Retry under one idempotency key. The
+  transcript follows the newest row, the working row too, unless the reader has
+  scrolled up. Chat shows no write error of its own: the canvas shows it once. A
+  Chat about a record links to it and has Clear context, which returns Chat to
+  the side. The canvas toolbar's Chat button shows Chat at the side, or focuses
+  it when it is shown.
 - The graph is the home view. It draws the newest 1,000 inquiries by default,
   or 100, 5,000, all of them, or any count typed into the Nodes menu (a typed
   count picks exactly that count: 50 is 50, and 1,000 the 1k preset), each
@@ -511,9 +630,62 @@ with one response shape, so the fixtures take one per verb.
   `trackinizer.v2.<origin>.<email>` (`src/state/`): stars, saved views
   (`{id, name, request}`, the exact list request), aliases, people added by hand,
   notification read state (`{boundary, marks}`) and UI state
-  (`{collapsed, lens}`). Settings exports it and imports another browser's: an
+  (`{collapsed, lens, tiles}`). Settings exports it and imports another browser's: an
   import never deletes, views merge by id, and UI state stays this browser's.
-  Tabs see each other's changes through the `storage` event.
+  Tabs see each other's changes through the `storage` event. The value is
+  version 2; a version 1 value reads as version 2 with no tiles.
+- A tile's bar is how it is placed; there is no Focus button and no placement
+  menu. A press on the bar focuses the tile. A drag floats it, or docks it at
+  the edge of the stage it is dropped on: the left or right 48 px for the
+  column at that side, the top 12 px for the main strip beside the page, with
+  an outline of where it will stand shown before the release. A docked tile
+  leaves its place only after 24 px, so a click that slips still focuses; it
+  stays in its strip while dragged (the strip would clip it) and a card with
+  its name follows the pointer. Every visual but the page also has two dock
+  buttons, ◧ and ◨, the same docking by one press or by the keyboard. The page
+  stays the page: docked, its bar only focuses. Chat dragged out floats as it
+  does standing aside (below), open under the pointer that dropped it.
+- Every boundary on the canvas resizes what it bounds, as a desktop's windows
+  and an editor's panes do. A floating window resizes by any of its four edges
+  and four corners: the opposite sides stay, it never goes under 280 by 220 px,
+  and no side leaves the stage. The edge between a side column and the page
+  resizes the column, by the pointer or the arrow keys (16 px, 48 with Shift),
+  between 260 px and seven tenths of the stage. The divider between two docked
+  tiles, across the main strip or down a column, moves room from one to the
+  other, down to each one's least size. The sizes are this browser's, kept in
+  `localStorage` (`trackinizer.v2.canvas.sizes`): a column's width per side, a
+  window's size per visual type, and a docked tile's share of its strip per
+  visual type (an even share is 1). Opening a saved view forgets the windows'
+  sizes, as it forgets their places, and shows the view's.
+- Chat is docked beside the page: in the column at either side, or in the main
+  strip when placed there. A canvas that stored it floating shows it at the
+  right. When an
+  agent moves the page (`navigate`) or shows a visual (a `workspace` frame's
+  `shown`), Chat stands aside: the same tile, never mounted again, floats over
+  the page folded to a filled bar. It opens after the pointer has rested on it
+  120 ms, stays open while the pointer is over it or the keyboard is in its
+  contents, and folds 300 ms after both have left; each later navigation or
+  show folds it at once. A dock button on its bar puts it back at that side,
+  and the toolbar's Chat at the side it came from.
+  Standing aside is the tab's own state (`ChatFeed.aside`), never the canvas's:
+  a reload starts docked, and its fold is not remembered.
+- A floating canvas tile (a visual placed Float, or Chat standing aside) moves
+  by its whole top bar and by the
+  ⠿ handle, which also moves by the arrow keys (16 px, 48 with Shift) and never
+  docks. A press on the bar that stays within 4 px is a click, which focuses;
+  the fold button folds the tile to its bar and unfolds it. Controls on the bar
+  are not part of the bar: a press on one starts nothing. Under 900 px the tile
+  is a plain header in the page's flow and does not move by the bar. A move
+  is a transform on the tile alone, kept inside the stage, and the canvas takes
+  the place once, on release. The place and the fold are kept per visual type in
+  `ui.tiles` (`{collapsed, place: {left, top} | null}`), so they survive a
+  reload; a browser that cannot store keeps them for the session. Opening a
+  saved view forgets the places and shows the view's. A drag and an arrow key
+  start from where the tile is drawn, which the stage's hold may have moved from
+  the saved place. The stage holds each tile from the place it is meant to stand
+  at, not from where an earlier hold left it, so a tile a narrow window pushed in
+  returns when the window grows back; under 900 px it holds nothing. A drag whose
+  bar loses pointer capture (the tile left the page) ends there.
 - "Me" is the account email plus the aliases ticked in Settings. An owner or
   subscriber filter for me matches any of them; a write of me writes the email.
 - Each list keeps its tab, filters, grouping, sort, view (List, or Streams or
@@ -547,6 +719,14 @@ with one response shape, so the fixtures take one per verb.
   each expanded, and Configure's closed.
 - Drafts live in their editor's state, never in a cached row, so a refetch
   leaves them alone.
+- The canvas's state is `["workspace", id]` in the cache, filled by the shell's
+  workspace events stream (`newerWorkspace` keeps the newest revision) and, once,
+  by a read. A conversation's records are `["chat", "records", session]`, its head
+  `["chat", "head", id]` and its history `["chats"]`. What is not records (how
+  often the stream opened, each canvas's open conversation and a Continue in Chat
+  request) is the shell's `ChatFeed`
+  (`src/visuals/chatFeed.ts`), above Chat, which is a lazy chunk that may load
+  after a frame arrived and mount again.
 
 ## The stream
 
@@ -609,6 +789,40 @@ tunnel), which tells which hop holds headers or cuts an idle stream; see its
   After every reconnect, and when a tab hidden for more than 30 s comes back,
   every query does. A hidden tab fetches nothing and only collects ids.
 - After the stream has been down 10 s, a bar says live updates are paused.
+
+### The workspace events stream
+
+With the canvas on, the tab has one stream, and it is not `/api/web/subscribe`:
+`CanvasStream` (`src/app/canvasStream.tsx`), above the routes, creates the user's
+workspace and opens `openWorkspaceEvents` (`src/api/workspaces.ts`), one
+`EventSource` on `/api/workspaces/{id}/events`. It carries the inquiry ids too,
+so the live layer takes them from it, and the early `/api/web/subscribe` stream
+that `main.tsx` opens before the profile is known is closed once the profile
+says the canvas is on. A user who opted out keeps `/api/web/subscribe` as above.
+The stream reconnects as `openStream` does (both share `openEvents` in
+`src/api/stream.ts`): the browser reconnects by itself, and after a refusal the
+wrapper tries again after 1, 3 and 10 s, then every 30 s. It outlives the canvas,
+which unmounts on Settings and Admin. Each open, and each drop and refusal, goes
+to the live layer, which recovers a gap as it does for `/api/web/subscribe`
+(above). Every frame is JSON with `t`, the server's epoch milliseconds:
+
+| Frame | Does |
+|---|---|
+| `{type: "workspace", state, t}` | The canvas as it stands: on every open, after every applied operation, and when the partner changes. Applied through `newerWorkspace`, so a frame never regresses a revision. |
+| `{type: "navigate", route, t}` | An agent moved the page: the browser goes to `route` when `parseHash` accepts it. |
+| `{type: "highlight", ids, t}` | An agent pointed at inquiries: the tab's highlight store (`app/highlights.ts`) takes `ids` as its marks, replacing the last; `[]` clears. The graph rings those nodes, list rows and the rail's peers take `is-highlighted`, and a record page marks its own header. Not state: a closed stream clears them. |
+| `{type: "changed", id, t}` | An inquiry changed, as `/api/web/subscribe` says it. A record appended to a science chat's session changes it, so an open Chat reads what the session gained. |
+
+A frame of another shape is logged and skipped. There is no polling beside the
+stream, and no read of the canvas at boot: the stream's opening frame is the
+canvas, and the canvas reads only after a refused write. A conversation's
+records are read once at mount and then when the live layer reports the session
+changed or a gap.
+While the stream is down the live layer shows the paused bar, as it does for
+`/api/web/subscribe`. The canvas loads every renderer's chunk and the record
+view as soon as it is up (`preloadRenderers`, `src/visuals/registry.tsx`): a
+first render that suspends holds its fallback for React's 300 ms throttle, which
+was the 305 to 335 ms the first show of every visual type took before.
 
 Metrics and transcripts are not on the stream: they refresh when their row's id
 arrives, on open, and from their Refresh button.
@@ -726,6 +940,27 @@ of its own and drives it through `scripts/writer.py`, the Python client as a
 second user. `src/writes/cas.live.test.tsx` runs only with
 `TRACKINIZER_LIVE_URL` naming a disposable local server.
 
+`e2e/live/canvas-push.spec.ts` is the canvas's push bar: it applies 20
+operations per visual type through `POST /api/workspaces/{id}/operations`, and
+20 navigations, waits for each paint (`trackinizer.timings()`), and writes p50,
+p90 and max of `paint wall time - frame t` (and, for the context graph, timeline
+and Artifact, of the data's paint, and for a navigation, of the target page drawn
+with its data) to
+`/opt/scratch/artifacts/trackinizer-web/canvas-chat/timings/canvas-push.json`.
+It fails when any p50 or p90 reaches 100 ms. The canvas is on by default, so the
+specs that watch the stream (`stream.spec.ts`, `session-chat.spec.ts`, `live/`)
+take that path: they wait on whichever stream the
+app uses (`streamOpened`, `abortStream` in `e2e/fixtures.ts`), the canvas's
+events stream here, and `live/` runs on a 1640 x 790 screen that leaves its page
+the size it had without the canvas. Every other spec measures the page's own
+geometry and keys, which a Chat pane beside it changes, so `e2e/fixtures.ts`
+turns the suite's one user's canvas off for it (`test.use({ canvas: true })` asks
+for it on); `e2e/canvas-optout.spec.ts` covers a user who opted out, with
+`/api/web/subscribe` and no canvas. `e2e/canvas-layout.spec.ts` shows
+Chat with a side or a main visual at 1280 x 800, where nothing may scroll
+sideways, and at 390 px, where nothing may either and the message box and Send
+must be on screen.
+
 `e2e/a11y.spec.ts` runs axe's WCAG 2.0 and 2.1 A and AA rules on each main view
 in both themes and fails on any violation.
 
@@ -823,6 +1058,20 @@ fingerprint being the first 24 hex digits of the SHA-256 of the five files'
   clipboard (a page over plain http from another machine), the button says
   "Not copied: see the console", and `trackinizer.details()` gives the text it
   could not copy; the console only says where to find it.
+- `trackinizer.timings()` returns the canvas's timing marks, the last 200 pushed
+  frames, each with its `t` (server epoch milliseconds), when it arrived
+  (`received`, `performance.now()`, and `receivedWall`, epoch milliseconds) and
+  its marks. A `workspace` frame has its `revision` and the marks of the visuals
+  it changed: `paint` is the pane's content committed and painted (a lazy
+  renderer's mark waits for the renderer, not its fallback), and `data`, for the
+  context graph, the timeline and the Artifact, is its data painted. A
+  `navigate` frame has its `route`, and one `page` mark: the target's detail
+  drawn with its data (other views have no mark). Each mark is taken in the first
+  task after the frame that follows the commit, so `wall - t` is the time from
+  the server accepting an operation to the pixels when browser and server share
+  a clock. A change is to a visual's type, version, placement, record or
+  parameters; moving a floating pane is none, and a revision no frame carried
+  (the browser's own write) has no marks.
 - Nothing logged holds a token, a cookie or `Authorization` value, a request
   body, a URL's query, or text a user wrote (titles, descriptions, search text):
   events carry ids, kinds, fields, routes, statuses and timings.

@@ -1,19 +1,35 @@
-"""Recursive JSON aliases for pydantic models and FastAPI routes.
+"""Shared pydantic aliases for wire models: recursive JSON, and UTC instants.
 
-``trackinizer.lib.custom_json`` stops its runtime JSON aliases one level down, because
-msgspec cannot type a self-referencing alias. pydantic can, and needs to: with
-the flat alias it passes a nested frozen mapping or tuple through unvalidated
+pydantic can type a self-referencing alias, and needs to: with a flat alias
+one level deep it passes a nested frozen mapping or tuple through unvalidated
 and then cannot dump it, and the published OpenAPI schema stops describing
-anything below the first level. These carry the same names, so every schema
-component keeps its name.
+anything below the first level. These aliases recurse, and keep the names
+``JSON`` and ``JSONValue`` so every schema component keeps its name.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping, MutableSequence, Sequence
+from datetime import UTC, datetime
+from typing import Annotated
+
+from pydantic import AfterValidator
 
 
-__all__ = ["JSON", "JSONValue", "MutableJSON", "MutableJSONValue"]
+__all__ = ["JSON", "JSONValue", "MutableJSON", "MutableJSONValue", "UtcDatetime"]
+
+
+def _naive_is_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+
+UtcDatetime = Annotated[datetime, AfterValidator(_naive_is_utc)]
+"""A request-body instant; a naive value reads as UTC, an aware one is kept.
+
+asyncpg encodes a naive datetime bound to a ``TIMESTAMPTZ`` column with the
+server process's local zone, so ``2024-12-10`` would be stored as a different
+instant on every host. The schema stays ``date-time``.
+"""
 
 
 type JSONValue = (

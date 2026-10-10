@@ -19,11 +19,21 @@ import decimal
 import types
 import typing
 
+from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
+from starlette.requests import Request
 
 import pytest
 
-from trackinizer.server.api._deps import tag_kind
+from trackinizer.server.api._deps import (
+    get_assistant,
+    get_chat_orgs,
+    get_hub,
+    tag_kind,
+    tag_row,
+)
+from trackinizer.server.chat_hub import ChatHub
+from trackinizer.server.config import Assistant, Config
 from trackinizer.types import inquiries
 from trackinizer.types.cost import Cost
 from trackinizer.types.inquiries import (
@@ -178,6 +188,68 @@ def _issue(
     )
 
 
+def _request(app: FastAPI) -> Request:
+    return Request({"type": "http", "app": app, "headers": []})
+
+
+class TestGetHub:
+    def test_an_app_built_by_hand_gets_one_hub_on_first_use(self) -> None:
+        app = FastAPI()
+        first = get_hub(_request(app))
+        assert get_hub(_request(app)) is first
+        assert get_hub(_request(FastAPI())) is not first
+
+    def test_an_app_keeps_the_hub_it_was_given(self) -> None:
+        app = FastAPI()
+        given = ChatHub()
+        app.state.hub = given
+        assert get_hub(_request(app)) is given
+
+    def test_something_that_is_not_a_hub_is_replaced(self) -> None:
+        app = FastAPI()
+        app.state.hub = "not a hub"
+        replaced = get_hub(_request(app))
+        assert get_hub(_request(app)) is replaced
+
+
+class TestGetAssistant:
+    def test_the_assistant_is_the_configs(self) -> None:
+        app = FastAPI()
+        kb = Assistant(actor="scout", email="kb@example.com")
+        app.state.config = Config(assistant=kb)
+        assert get_assistant(_request(app)) == kb
+
+    def test_none_without_a_config_or_an_assistant(self) -> None:
+        app = FastAPI()
+        assert get_assistant(_request(app)) is None
+        app.state.config = "not a config"
+        assert get_assistant(_request(app)) is None
+        app.state.config = Config()
+        assert get_assistant(_request(app)) is None
+
+
+class TestGetChatOrgs:
+    def test_a_server_groups_users_by_domain_unless_its_config_says_single(
+        self,
+    ) -> None:
+        app = FastAPI()
+        assert get_chat_orgs(_request(app)) == "domain"
+        app.state.config = "not a config"
+        assert get_chat_orgs(_request(app)) == "domain"
+        app.state.config = Config()
+        assert get_chat_orgs(_request(app)) == "domain"
+        app.state.config = Config(chat_orgs="single")
+        assert get_chat_orgs(_request(app)) == "single"
+
+
+class TestTagRow:
+    def test_a_known_row_is_the_encoder_output_plus_its_kind(self) -> None:
+        issue = _issue()
+        expected = cast(dict[str, object], jsonable_encoder(issue))
+        expected["kind"] = "Issue"
+        assert tag_row(issue) == expected
+
+
 class TestTagKind:
     def test_none_passes_through(self) -> None:
         assert tag_kind(None) is None
@@ -256,6 +328,7 @@ class TestTagKind:
         # oracle while exercising nothing.
         instance = _populated(Issue)
         assert instance.produces, "edge tuples must carry an element"
+        assert instance.labels is not None
         assert instance.labels, "list-valued columns must carry an element"
 
     @pytest.mark.parametrize("subclass", _KINDS)

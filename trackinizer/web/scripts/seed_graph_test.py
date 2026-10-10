@@ -11,7 +11,7 @@ import uuid
 
 import pytest
 
-from trackinizer.lib.custom_json import convert, parse
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.types.edges import EDGE_POLICIES
 from trackinizer.types.inquiries import Inquiry
 from trackinizer.web.scripts.graph_structure import (
@@ -24,6 +24,8 @@ from trackinizer.web.scripts.graph_structure import (
 from trackinizer.web.scripts.seed_graph import (
     GRAPH_CONTENTS,
     SeededGraph,
+    Showcase,
+    _titles,
     cascade_order,
     islands,
     seed_graph,
@@ -114,17 +116,17 @@ def test_every_person_is_an_example_address() -> None:
 
 def test_roots_take_written_titles_and_the_showcase_its_own_text() -> None:
     client, _ = _seeded()
-    contents = parse(GRAPH_CONTENTS.read_text(), dict[str, object])
-    written = convert(contents.get("roots"), list[str], default=[])
-    shown = convert(contents.get("showcase"), dict[str, object], default={})
+    contents = from_plain(loads(GRAPH_CONTENTS.read_text()), dict[str, object])
+    written = from_plain(contents.get("roots"), list[str], default=[])
+    shown = from_plain(contents.get("showcase"), dict[str, object], default={})
     titles = [body["title"] for _, body in client.items]
     assert titles[6] == written[0]
     assert (
-        convert(shown.get("root"), dict[str, object], default={}).items()
+        from_plain(shown.get("root"), dict[str, object], default={}).items()
         <= client.items[0][1].items()
     )
     assert (
-        convert(shown.get("belief"), dict[str, object], default={}).items()
+        from_plain(shown.get("belief"), dict[str, object], default={}).items()
         <= client.items[3][1].items()
     )
     assert all(titles)
@@ -136,18 +138,64 @@ def test_a_belief_is_judged_by_its_proves_edges() -> None:
     assert client.items[9][1]["judgement"] == "unproven"
 
 
+def test_a_beliefs_confidence_follows_its_verdict() -> None:
+    structure = Structure(
+        nodes=(*_STRUCTURE.nodes, *[Node(kind="Belief", status="active")] * 2),
+        edges=(
+            *_STRUCTURE.edges,
+            _link(2, 10, "proves", -1),
+            _link(4, 11, "proves", 1),
+        ),
+    )
+    client = _FakeClient()
+    seed_graph(client, structure, actor="ada@example.com")
+    verdicts = {
+        n: (body["judgement"], body["confidence"])
+        for n, (kind, body) in enumerate(client.items)
+        if kind == "Belief" and n != 3
+    }
+    assert verdicts == {
+        9: ("unproven", 0.5),
+        10: ("disproven", 0.2),
+        11: ("proven", 0.9),
+    }
+
+
+def test_only_a_complete_session_is_created_active() -> None:
+    client, _ = _seeded()
+    assert [body["status"] for _, body in client.items] == [
+        *(node.status for node in _STRUCTURE.nodes[:7]),
+        "active",
+        "active",
+        "active",
+    ]
+
+
+def test_a_kind_takes_its_built_titles_in_order() -> None:
+    client, _ = _seeded()
+    kinds = from_plain(
+        from_plain(loads(GRAPH_CONTENTS.read_text()), dict[str, object]).get(
+            "kinds",
+        ),
+        dict[str, object],
+    )
+    titles = _titles(from_plain(kinds.get("Experiment"), dict[str, object]))
+    experiments = [body["title"] for kind, body in client.items if kind == "Experiment"]
+    assert experiments == titles[:2]
+
+
 def test_no_kind_repeats_a_built_title_before_it_has_used_every_one() -> None:
     # Lists show the newest rows of a kind together: a title repeated among them
     # reads as a placeholder.
     client = _FakeClient()
     seed_graph(client, load(GRAPH_STRUCTURE.read_text()), actor="ada@example.com")
-    contents = parse(GRAPH_CONTENTS.read_text(), dict[str, object])
-    shown = convert(contents.get("showcase"), dict[str, object], default={})
+    contents = from_plain(loads(GRAPH_CONTENTS.read_text()), dict[str, object])
+    shown = from_plain(contents.get("showcase"), dict[str, object], default={})
     written = {
-        *convert(contents.get("roots"), list[str], default=[]),
+        *from_plain(contents.get("roots"), list[str], default=[]),
         *(
-            convert(
-                convert(shown.get(part), dict[str, object], default={}).get("title"),
+            from_plain(
+                from_plain(shown.get(part), dict[str, object], default={}).get("title"),
                 str,
                 default="",
             )
@@ -185,13 +233,86 @@ def test_in_cascade_order_the_committed_structure_walks_a_tenth_as_far() -> None
     assert steps < 150_000
 
 
+def test_edges_no_batch_can_carry_are_refused_before_anything_is_written() -> None:
+    """N1-09: 1001 edges into the newest node fit no batch; nothing is half-seeded."""
+    count = BATCH_MAX_ITEMS + 1
+    structure = Structure(
+        nodes=(
+            *_STRUCTURE.nodes,
+            *[Node(kind="Experiment", status="complete")] * count,
+            Node(kind="Belief", status="active"),
+        ),
+        edges=(
+            *_STRUCTURE.edges,
+            *(
+                _link(
+                    len(_STRUCTURE.nodes) + k,
+                    len(_STRUCTURE.nodes) + count,
+                    "proves",
+                )
+                for k in range(count)
+            ),
+        ),
+    )
+    client = _FakeClient()
+    with pytest.raises(ValueError, match="no batch"):
+        seed_graph(client, structure, actor="ada@example.com")
+    assert client.calls == []
+
+
+def test_more_edges_than_nodes_can_carry_are_refused_before_anything_is_written() -> (
+    None
+):
+    """N1-09/S2: carriers never wrap to a negative node index."""
+    structure = Structure(
+        nodes=_STRUCTURE.nodes,
+        edges=(
+            *_STRUCTURE.edges,
+            *(_link(1, 0, "narrows"),) * (BATCH_MAX_ITEMS * len(_STRUCTURE.nodes)),
+        ),
+    )
+    client = _FakeClient()
+    with pytest.raises(ValueError, match="no batch"):
+        seed_graph(client, structure, actor="ada@example.com")
+    assert client.calls == []
+
+
+def test_the_showcase_counts_only_evidence_on_a_belief() -> None:
+    """N1-10: signed edges to an Experiment do not make an island the showcase."""
+    issue = Node(kind="Issue", status="active")
+    structure = Structure(
+        nodes=(
+            issue,
+            *_EXPERIMENTS,
+            Node(kind="Belief", status="active"),
+            issue,
+            *_EXPERIMENTS,
+            Node(kind="Experiment", status="complete"),
+        ),
+        edges=(
+            _link(1, 0, "produced_by"),
+            _link(2, 0, "produced_by"),
+            _link(3, 0, "produced_by"),
+            _link(1, 3, "proves", 1),
+            _link(2, 3, "proves", -1),
+            _link(5, 4, "produced_by"),
+            _link(6, 4, "produced_by"),
+            _link(7, 4, "produced_by"),
+            _link(5, 7, "proves", 1),
+            _link(6, 7, "proves", -1),
+            _link(5, 6, "favors", -1),
+        ),
+    )
+    assert showcase(structure, islands(structure)) == Showcase(root=0, belief=3)
+
+
 def test_the_committed_structure_has_a_showcase_and_a_title_for_every_root() -> None:
     structure = load(GRAPH_STRUCTURE.read_text())
     found = islands(structure)
     picked = showcase(structure, found)
     assert found.home[picked.belief] == picked.root
-    contents = parse(GRAPH_CONTENTS.read_text(), dict[str, object])
-    assert len(convert(contents.get("roots"), list[str], default=[])) >= len(
+    contents = from_plain(loads(GRAPH_CONTENTS.read_text()), dict[str, object])
+    assert len(from_plain(contents.get("roots"), list[str], default=[])) >= len(
         found.roots,
     )
 
@@ -312,7 +433,7 @@ class _FakeClient:
         items: Sequence[tuple[Inquiry.InquiryKind, Mapping[str, object]]],
         *,
         edges: Sequence[Mapping[str, object]] = (),
-        actor: str | None = None,
+        actor: str,
     ) -> list[uuid.UUID]:
         assert actor
         assert 1 <= len(items) <= BATCH_MAX_ITEMS
@@ -324,7 +445,7 @@ class _FakeClient:
         self.edges.extend(
             (
                 self._end(edge, "from", ids),
-                convert(edge["edge_kind"], str),
+                from_plain(edge["edge_kind"], str),
                 self._end(edge, "to", ids),
                 edge.get("valence"),
             )
@@ -352,7 +473,7 @@ class _FakeClient:
         index = edge.get(f"{end}_index")
         if isinstance(index, int):
             return ids[index]
-        made = uuid.UUID(convert(edge[f"{end}_id"], str))
+        made = uuid.UUID(from_plain(edge[f"{end}_id"], str))
         assert made in self._made
         return made
 

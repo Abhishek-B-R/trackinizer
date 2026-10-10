@@ -47,14 +47,11 @@ that answers 404 for `/api/visuals`. A deployed server reads the route.
 
 ## Change a canvas
 
-First enable the canvas in Settings, then `POST /api/workspaces` with the
+The canvas is on by default (Settings turns it off). `POST /api/workspaces` with the
 user's browser session. It returns the default workspace id and revision.
-The browser connects a live `trax run` AgentSession through
-`PUT /api/workspaces/<workspace-id>/connection` with the current revision and
-the session UUID. That session must have been opened by an unrevoked API key
-owned by the user. API keys cannot create or change the connection. Once
-paired, only that session's key can show a visual through the same operation
-the Configure panel uses:
+Besides the browser, only the server's Chat assistant may change a canvas, and
+only one whose owner has talked to it there. Its key shows a visual through the
+same operation the Configure panel uses:
 
 ```http
 POST /api/workspaces/<workspace-id>/operations
@@ -75,38 +72,73 @@ including idempotent replay. `hide`, `focus`, and `place` take an `instance_id` 
 the workspace response. A `show` can also include `record_id` and bounded
 `params`. Showing an existing visual type focuses and updates that instance.
 
-## Chat with a paired session
+## Chat with the assistant
 
-The browser reads `GET /api/workspaces/<workspace-id>/connection` to check
-the stored pairing. Use this direct status for the composer: the session picker
-lists only the 100 most recent sessions and cannot prove that an older pairing
-ended. A disconnected, ended, or unavailable pairing disables the composer.
+Chat talks to the canvas's partner, which `WorkspaceState.partner` names on
+every read and the events stream pushes when it changes. By default it is the
+server's shared assistant; `WorkspaceState.partner_choice` can instead be
+`local`, the owner's own `trax helper` session, which the `partner`
+operation sets. A partner that is not `live` disables the composer. A server with
+no assistant of its own can run `trax helper claude --as ACTOR` as one.
 
-`Chat about this` shows `trax.chat` with the record UUID in `record_id`. To
-send, the browser calls `POST /api/workspaces/<workspace-id>/messages` with
+The canvas's one `Chat` button shows `trax.chat`; on a record's page it puts
+the record UUID in `record_id`, and elsewhere it clears it. To
+send, the browser calls `POST /api/chats` with
 the persisted Chat instance UUID and a fresh `Idempotency-Key`:
 
 ```json
-{"text":"What led to this experiment?","chat_instance_id":"<chat-instance-id>","expected_record_id":"<record-id>"}
+{"kind":"science","workspace_id":"<workspace-id>","text":"What led to this experiment?","chat_instance_id":"<chat-instance-id>","expected_record_id":"<record-id>"}
 ```
 
-The server checks the signed-in workspace owner, live pairing, and Chat
+The server checks the signed-in writer, a live assistant, and the Chat
 instance, and that its record still matches `expected_record_id`. A changed
 record returns 409 before queueing. The server adds the persisted record UUID,
 workspace UUID, and visible visual identities to a typed inbound context.
 When the record exists in this server's graph, the context also includes its
 kind, sequence, and bounded title. A record resolved through a separate read
-profile carries its UUID without invented metadata. The agent receives the
+profile carries its UUID without invented metadata. The browser also sends
+`page`, the `#/...` address it is on, and `trail`, the addresses before it,
+oldest first and at most 8; a malformed address, or a longer trail, returns
+422. The server resolves them: `#/lookup/<id>`, `#/inquiry/<id>`,
+`#/ref/<Kind>/<seq>` and `#/graph?focus=<ref>` name a record, and the context
+carries each as a page with its route and, when it exists, that record.
+Any other address, or a record that does not exist, keeps its route and has
+no record. Each visible visual carries the record it shows the same way, so
+"this" means what the sender sees. The agent receives the
 context beside the message and reads the cited graph rows through trax.
-The `queued` count is a queue receipt; it does not claim the agent answered.
-Retry the same draft with the same key. When the canvas has no persisted
-visuals, send null for both `chat_instance_id` and `expected_record_id`; Chat
-remains the fallback view.
+The receipt names the conversation, and the session once the assistant has it
+open; it does not claim the agent answered. Retry the same draft with the
+same key. When the canvas has no persisted visuals, send null for both
+`chat_instance_id` and `expected_record_id`; Chat remains the fallback view.
 
-Chat previews captured turns from the first browser message in its recent
-window. It hides transport context and collapses long turns. The full
-transcript remains available on the session record page. Subgraph, timeline,
-and Artifact visuals use the same catalog and operation path.
+A conversation is an AgentSession (label `science-chat`). Chat reads its
+records and refreshes when the canvas event stream says the session changed;
+a line by another poster shows its sender. History lists the chats the user
+started or posted in; Clear chat starts a new one and deletes nothing, and the
+composer says chats are public to every user and cannot be deleted. A science
+chat's session in the Console or on its detail page offers Continue in Chat.
+Subgraph, timeline, and Artifact visuals use the same catalog and operation
+path.
+
+## Lineage and timeline
+
+`trax.timeline` is one view, off in a new canvas; Configure shows or hides it
+and `trax workspace W show trax.timeline --record R` or the Chat assistant
+opens it. Time runs across; lineage runs down: up to three lead issues pinned
+at the axis's left edge with their own dates, the record, then its directions
+as rows. Each row's results sit on it by date, and their signed evidence is
+marked for or against by the sign of its valence. A card or square moves the
+page to that record and re-centres the window on it (`show` on the same
+instance with the clicked record).
+
+It makes one read, `GET /api/visuals/timeline/<id>`, for a record of any kind.
+An Issue is the record and its own anchor. An Experiment is shown on the Issue
+that produced it, itself marked among that Issue's results. Any other kind is the
+record row, with leads and directions taken from the nearest Issue it was
+`produced_by` (the oldest if several; `narrows` runs between Issues only), and
+that Issue becomes its nearest lead; with no such Issue it is shown alone.
+Leads are the anchor's `narrows` ancestors, at most three (`_LEAD_LEVELS` in
+`server/visuals/timeline.py`), one indexed lookup per level.
 
 ## Save and reopen a workflow
 
@@ -122,9 +154,8 @@ continue on another device, open the default canvas and call
 `POST /api/workspace-presets/<preset-id>/open` with that canvas UUID, revision,
 and an `Idempotency-Key` UUID. Reuse the key when retrying the same open.
 Opening restores visuals, placement, floating rectangles, and the
-workflow context at a new revision. It clears the old session connection; the
-user pairs a live session before sending another message. The next message
-carries saved guidance and the continuation record in its typed context.
+workflow context at a new revision. The next message carries saved guidance
+and the continuation record in its typed context.
 Presets never store session credentials. Existing browser-only saved inquiry
 queries remain a separate feature.
 
@@ -177,7 +208,7 @@ Any signed-in teammate can read the exact revision at
 `/app/#/lookup/<artifact-id>` or through
 `GET /api/artifacts/<artifact-id>/content`. An agent can show it on a canvas
 with `visual_type: "trax.artifact"` and `record_id` set to the Artifact ID.
-The renderer loads only when shown. `Chat about this` uses the same `record_id`;
+The renderer loads only when shown. `Chat` on its page uses the same `record_id`;
 the agent receives frozen citations and a link to the full content. Custom HTML
 runs in an opaque-origin iframe with a restrictive content security policy;
 it cannot read the app's session.

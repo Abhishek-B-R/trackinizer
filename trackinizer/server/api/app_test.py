@@ -15,11 +15,10 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 import asyncpg
-import fastjsonschema
 import pytest
 
 from trackinizer.conftest import FakeEngine, make_store
-from trackinizer.lib.custom_json import convert, parse
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.server.api import app
 from trackinizer.server.api.app import (
     RequestLoggingMiddleware,
@@ -29,20 +28,24 @@ from trackinizer.server.api.app import (
     fk_violation_handler,
     lifespan,
     not_found_handler,
-    schema_handler,
     unique_violation_handler,
     validation_handler,
 )
-from trackinizer.server.config import Config
-from trackinizer.server.embedders import qwen3_4b
+from trackinizer.server.config import Config, ConfigError
+from trackinizer.server.embedders import qwen3_4b, registry
+from trackinizer.server.embedders.stub import StubEmbedder
+from trackinizer.server.secrets import FileSecrets, SecretRef
 from trackinizer.types.errors import (
     ConflictError,
     NotFoundError,
     ValidationError,
 )
+from trackinizer.wire.wire_machine_host import JOIN_PATH
 
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from starlette.types import Receive, Scope, Send
 
     from trackinizer.server.store.core import Store
@@ -75,8 +78,8 @@ class TestCLIHelpers:
             assert response.status_code == 409
             # ``response.body`` is ``bytes | memoryview``; coerce to
             # ``bytes`` for json.loads's narrower type signature.
-            body = parse(bytes(response.body), dict[str, object])
-            assert prefix in convert(body["detail"], str)
+            body = from_plain(loads(bytes(response.body)), dict[str, object])
+            assert prefix in from_plain(body["detail"], str)
 
     def test_handlers_do_not_leak_constraint_detail(self) -> None:
         # ``asyncpg`` ``detail`` carries internal column / constraint names
@@ -98,9 +101,9 @@ class TestCLIHelpers:
             asyncio.run(unique_violation_handler(req, unique_exc)),
         ]
         for response in responses:
-            body = parse(bytes(response.body), dict[str, object])
+            body = from_plain(loads(bytes(response.body)), dict[str, object])
             assert response.status_code == 409
-            detail = convert(body["detail"], str)
+            detail = from_plain(body["detail"], str)
             assert leak not in detail
             assert "from_id" not in detail
             assert constraint not in detail
@@ -108,43 +111,23 @@ class TestCLIHelpers:
     def test_conflict_handler_emits_error_code(self) -> None:
         req = cast(Request, Mock())
         response = asyncio.run(conflict_handler(req, ConflictError("clash")))
-        body = parse(bytes(response.body), dict[str, object])
+        body = from_plain(loads(bytes(response.body)), dict[str, object])
         assert response.status_code == 409
         assert body == {"detail": "clash", "code": "conflict"}
 
     def test_not_found_handler_emits_404_and_code(self) -> None:
         req = cast(Request, Mock())
         response = asyncio.run(not_found_handler(req, NotFoundError("gone")))
-        body = parse(bytes(response.body), dict[str, object])
+        body = from_plain(loads(bytes(response.body)), dict[str, object])
         assert response.status_code == 404
         assert body == {"detail": "gone", "code": "not_found"}
 
     def test_validation_handler_emits_422_and_code(self) -> None:
         req = cast(Request, Mock())
         response = asyncio.run(validation_handler(req, ValidationError("bad input")))
-        body = parse(bytes(response.body), dict[str, object])
+        body = from_plain(loads(bytes(response.body)), dict[str, object])
         assert response.status_code == 422
         assert body == {"detail": "bad input", "code": "validation"}
-
-    def test_schema_handler_emits_422_and_code(self) -> None:
-        req = cast(Request, Mock())
-        response = asyncio.run(
-            schema_handler(
-                req,
-                fastjsonschema.JsonSchemaValueException("stray key"),
-            ),
-        )
-        body = parse(bytes(response.body), dict[str, object])
-        assert response.status_code == 422
-        assert body == {"detail": "stray key", "code": "schema"}
-
-    def test_schema_error_is_registered_not_merely_defined(self) -> None:
-        # The handler function existing is not what stops the 500 -- FastAPI
-        # only consults REGISTERED handlers for client-side schema failures.
-        assert (
-            app.app.exception_handlers.get(fastjsonschema.JsonSchemaValueException)
-            is schema_handler
-        )
 
 
 class TestRequestLogging:
@@ -169,15 +152,15 @@ class TestRequestLogging:
             for record in caplog.records
             if getattr(record, "event", "") == "trackinizer_request_completed"
         )
-        fields = convert(record.__dict__, dict[str, object])
-        assert convert(fields.get("request_id"), str) == str(request_id)
-        assert convert(fields.get("method"), str) == "GET"
-        assert convert(fields.get("path"), str) == "/api/version"
-        assert convert(fields.get("outcome"), str) == "success"
-        assert convert(fields.get("status_code"), int, default=0) == 200
-        assert convert(fields.get("worker_pid"), int, default=0) > 0
-        assert convert(fields.get("response_start_sec"), float, default=-1) >= 0
-        assert convert(fields.get("duration_sec"), float, default=-1) >= convert(
+        fields = from_plain(record.__dict__, dict[str, object])
+        assert from_plain(fields.get("request_id"), str) == str(request_id)
+        assert from_plain(fields.get("method"), str) == "GET"
+        assert from_plain(fields.get("path"), str) == "/api/version"
+        assert from_plain(fields.get("outcome"), str) == "success"
+        assert from_plain(fields.get("status_code"), int, default=0) == 200
+        assert from_plain(fields.get("worker_pid"), int, default=0) > 0
+        assert from_plain(fields.get("response_start_sec"), float, default=-1) >= 0
+        assert from_plain(fields.get("duration_sec"), float, default=-1) >= from_plain(
             fields.get("response_start_sec"),
             float,
             default=0,
@@ -203,10 +186,10 @@ class TestRequestLogging:
             for record in caplog.records
             if getattr(record, "event", "") == "trackinizer_request_completed"
         )
-        fields = convert(record.__dict__, dict[str, object])
-        assert convert(fields.get("request_id"), str) == request_id
-        assert convert(fields.get("outcome"), str) == "rejected"
-        assert convert(fields.get("status_code"), int, default=0) == 404
+        fields = from_plain(record.__dict__, dict[str, object])
+        assert from_plain(fields.get("request_id"), str) == request_id
+        assert from_plain(fields.get("outcome"), str) == "rejected"
+        assert from_plain(fields.get("status_code"), int, default=0) == 404
 
     # Production runs at WARNING, so only a failure's line is kept there: raised to
     # WARNING, it carries the request id the web app shows beside the error.
@@ -275,10 +258,10 @@ class TestRequestLogging:
             r"request_id=rid-1 worker_pid=\d+ error_type=",
             record.getMessage(),
         )
-        fields = convert(record.__dict__, dict[str, object])
-        assert convert(fields.get("stage"), str) == "http_request"
-        assert convert(fields.get("error_type"), str, default="?") == ""
-        assert 0.0 <= convert(fields.get("duration_sec"), float, default=-1) < 60.0
+        fields = from_plain(record.__dict__, dict[str, object])
+        assert from_plain(fields.get("stage"), str) == "http_request"
+        assert from_plain(fields.get("error_type"), str, default="?") == ""
+        assert 0.0 <= from_plain(fields.get("duration_sec"), float, default=-1) < 60.0
 
 
 class TestAuthDisabledWarning:
@@ -399,6 +382,27 @@ class TestAuthDisabledWarning:
 class TestSessionEmbedderResolution:
     """``_resolve_session_embedder`` decides degrade-vs-warm without downloading."""
 
+    def test_startup_passes_dimension_to_gate_and_builder(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        check = Mock(return_value=True)
+        build = Mock(return_value=StubEmbedder(dim=256))
+
+        def is_weightless(name: str) -> bool:
+            del name
+            return True
+
+        monkeypatch.setattr(registry, "weights_present", check)
+        monkeypatch.setattr(registry, "build_session_embedder", build)
+        monkeypatch.setattr(registry, "is_weightless", is_weightless)
+        app._resolve_session_embedder(
+            FastAPI(),
+            Config(session_embedder="qwen3-embedding-4b", session_embedder_dim=256),
+        )
+        check.assert_called_once_with("qwen3-embedding-4b", dim=256)
+        build.assert_called_once_with("qwen3-embedding-4b", dim=256)
+
     def test_unset_knob_leaves_embedder_none(self) -> None:
         fastapi_app = FastAPI()
         task = app._resolve_session_embedder(
@@ -469,10 +473,186 @@ class TestSessionEmbedderResolution:
         assert warmed == ["warmed"]  # The warm task ran, without downloading.
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("startup_failure", [False, True])
+async def test_lifespan_joins_tasks_after_startup_or_background_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    startup_failure: bool,
+) -> None:
+    store, engine = make_store()
+    monkeypatch.setattr(app, "build_engine", Mock(return_value=engine))
+    monkeypatch.setattr(app, "build_embedder", Mock(return_value=StubEmbedder()))
+    monkeypatch.setattr(app, "Store", Mock(return_value=store))
+    monkeypatch.setattr(store, "bootstrap", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        app,
+        "push_changes_to_live_subscribers",
+        AsyncMock(side_effect=RuntimeError("background failed")),
+    )
+    services = (
+        Mock(side_effect=RuntimeError("startup failed"))
+        if startup_failure
+        else Mock(return_value=[])
+    )
+    monkeypatch.setattr(app, "_start_addon_services", services)
+    fastapi_app = FastAPI()
+    fastapi_app.state.config = Config()
+    before = asyncio.all_tasks()
+    if startup_failure:
+        with pytest.raises(RuntimeError, match="startup failed"):
+            async with lifespan(fastapi_app):
+                pass
+    else:
+        async with lifespan(fastapi_app):
+            await asyncio.sleep(0)
+    assert asyncio.all_tasks() <= before
+    assert engine.exited
+
+
+def test_a_validation_error_outside_variables_keeps_its_input(
+    route_client: tuple[TestClient, Store, FakeEngine],
+) -> None:
+    """Only the variables family drops the rejected input from its 422."""
+    client, _, _ = route_client
+
+    response = client.post("/api/inquiries/lookup", json=["not-a-uuid"])
+
+    assert response.status_code == 422
+    detail = from_plain(response.json(), dict[str, list[dict[str, object]]])["detail"]
+    assert detail[0]["input"] == "not-a-uuid"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"instance": None},
+        {"instance": "not-a-uuid"},
+        {"host_version": 3},
+        {"facts": {"Bad Key": "x"}},
+        {"token": "SECRETMARKER" * 12},
+        {"unexpected": "x"},
+    ],
+    ids=["missing", "uuid", "type", "facts", "long", "extra"],
+)
+def test_join_422_does_not_echo_the_token(
+    route_client: tuple[TestClient, Store, FakeEngine],
+    overrides: dict[str, object],
+) -> None:
+    """A rejected join body names each error's type, location and message only."""
+    client, _, _ = route_client
+    token = "enr_" + "0" * 32 + "_" + "SECRETMARKER" * 3 + "x" * 7
+    body: dict[str, object] = {
+        "name": "dev-1",
+        "token": token,
+        "instance": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "host_version": "0.1",
+        "facts": {},
+        **overrides,
+    }
+    body = {key: value for key, value in body.items() if value is not None}
+
+    response = client.post(JOIN_PATH, json=body)
+
+    assert response.status_code == 422
+    assert "SECRETMARKER" not in response.text
+    detail = from_plain(response.json(), dict[str, list[dict[str, object]]])["detail"]
+    assert detail
+    assert all(set(error) == {"type", "loc", "msg"} for error in detail)
+
+
+def test_lifespan_holds_the_file_secret_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The app keeps the backend ``Config.secrets`` names on ``app.state``."""
+    held = _lifespan_secrets(monkeypatch, f"file:{tmp_path}")
+
+    assert isinstance(held, FileSecrets)
+    held.put(SecretRef(layer="org", owner="", name="TOKEN"), "value")
+    assert (tmp_path / "org" / "_" / "TOKEN").read_text() == "value"
+
+
+def test_lifespan_holds_no_secret_backend_when_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _lifespan_secrets(monkeypatch, "none") is None
+
+
+def test_lifespan_refuses_an_unknown_secret_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, engine = make_store()
+    monkeypatch.setattr(app, "build_engine", Mock(return_value=engine))
+    monkeypatch.setattr(app, "Store", Mock(return_value=store))
+    fastapi_app = FastAPI()
+    fastapi_app.state.config = Config(secrets="vault")
+
+    async def _drive() -> None:
+        async with lifespan(fastapi_app):
+            pass
+
+    with pytest.raises(ConfigError, match="vault"):
+        asyncio.run(_drive())
+
+
+def test_lifespan_resolves_a_scheme_the_deployment_attached(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    backend = FileSecrets(tmp_path)
+
+    def vault(rest: str) -> FileSecrets:
+        del rest
+        return backend
+
+    fastapi_app = FastAPI()
+    fastapi_app.state.secret_schemes = {"vault": vault}
+
+    held = _lifespan_secrets(monkeypatch, "vault:anything", fastapi_app=fastapi_app)
+
+    assert held is backend
+
+
+def test_lifespan_refuses_secret_schemes_that_are_not_a_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fastapi_app = FastAPI()
+    fastapi_app.state.secret_schemes = ["vault"]
+
+    with pytest.raises(ConfigError, match=r"state\.secret_schemes"):
+        _ = _lifespan_secrets(
+            monkeypatch,
+            spec="vault:anything",
+            fastapi_app=fastapi_app,
+        )
+
+
 async def _record_warm(embedder: object, sink: list[str]) -> None:
     """Stand-in warm coroutine: records that it ran, embeds nothing."""
     del embedder
     sink.append("warmed")
+
+
+def _lifespan_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    spec: str,
+    *,
+    fastapi_app: FastAPI | None = None,
+) -> object:
+    """Drive the real ``lifespan`` with a stubbed engine; return ``state.secrets``."""
+    store, engine = make_store()
+    monkeypatch.setattr(app, "build_engine", Mock(return_value=engine))
+    monkeypatch.setattr(app, "build_embedder", Mock(return_value=StubEmbedder()))
+    monkeypatch.setattr(app, "Store", Mock(return_value=store))
+    monkeypatch.setattr(store, "bootstrap", AsyncMock(return_value=None))
+    fastapi_app = fastapi_app or FastAPI()
+    fastapi_app.state.config = Config(secrets=spec)
+
+    async def _drive() -> object:
+        async with lifespan(fastapi_app):
+            return cast(object, fastapi_app.state.secrets)
+
+    return asyncio.run(_drive())
 
 
 if __name__ == "__main__":

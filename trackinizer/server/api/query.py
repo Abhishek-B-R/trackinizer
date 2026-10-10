@@ -9,7 +9,6 @@ web-facing SSE (``/api/web/subscribe``) and the search routes live in
 from __future__ import annotations
 
 from dataclasses import fields
-from datetime import datetime
 from functools import cache
 from typing import TYPE_CHECKING, Annotated, Literal, cast, get_args, get_type_hints
 
@@ -23,7 +22,7 @@ from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Query, Req
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import TypeAdapter
 
-from trackinizer.lib.custom_json import convert, loads
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.lib.postgres import DatabaseEngine
 from trackinizer.server.api._deps import get_store, tag_kind, tag_row
 from trackinizer.server.api._regex_guard import regex_failures_as_400
@@ -32,6 +31,8 @@ from trackinizer.server.api._routes_shared import (
     parse_fields,
     parse_seq_ranges,
 )
+from trackinizer.server.api.locks import require_unlocked
+from trackinizer.server.api.session_access import require_chat_opener_of
 from trackinizer.server.auth import AuthIdentity, require_role
 from trackinizer.server.notify import iter_sse_events
 from trackinizer.server.primitives import lookup_kinds
@@ -54,7 +55,11 @@ from trackinizer.wire.filters import (
     FilterOp,
     canonical_filter_field,
 )
-from trackinizer.wire.json_types import MutableJSON, MutableJSONValue
+from trackinizer.wire.json_types import (
+    MutableJSON,
+    MutableJSONValue,
+    UtcDatetime,
+)
 from trackinizer.wire.routes import (
     DEFAULT_LIST_LIMIT,
     MAX_LIST_LIMIT,
@@ -455,7 +460,9 @@ async def delete_inquiry_route(
 
     Writer-gated like every other mutation; inquiries (including AgentSessions)
     are a shared workspace, so any writer may purge an unowned row. A claimed
-    row must first release its owner through the compare-and-set owner route.
+    row must first release its owner through the compare-and-set owner route. A
+    science chat is the exception: it is public and permanent, so only the key that
+    opened it may purge it.
 
     Args:
       target_id: UUID of the inquiry to delete.
@@ -467,6 +474,8 @@ async def delete_inquiry_route(
       result: Mapping with "id" (inquiry UUID) and "change_id" (purge operation).
 
     """
+    await require_unlocked(request, identity, [target_id], include_peers=True)
+    await require_chat_opener_of(request, identity, target_id)
     store = get_store(request)
     change_id = await store.purge(
         target_id,
@@ -530,7 +539,7 @@ async def list_change_log_route(
     request: Request,
     identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
     *,
-    since: datetime | None = None,
+    since: UtcDatetime | None = None,
     after_id: uuid.UUID | None = None,
     actor: Inquiry.Actor | None = None,
     subject_id: uuid.UUID | None = None,
@@ -632,7 +641,7 @@ def _parse_filter_param(raw: str, kind: Inquiry.InquiryKind) -> Filter:
         ) from err
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="filter must be a JSON object")
-    obj = convert(payload, dict[str, object])
+    obj = from_plain(payload, dict[str, object])
     field = obj.get("field")
     op = obj.get("op")
     # The presence ops carry no operand; default a missing value to "". Gate on
@@ -689,15 +698,14 @@ def _ancestor_json(ancestor: Ancestor) -> MutableJSON:
 
 def _brief_change(change: Change) -> dict[str, object]:
     """Serialize ``change`` with unset snapshot keys dropped and snapshot text cut."""
-    row = convert(
-        cast(object, _change_adapter().dump_python(change, mode="json")),
-        dict[str, object],
-    )
+    # Pydantic's JSON dump is Any; convert narrows the runtime shape below.
+    dumped = cast(object, _change_adapter().dump_python(change, mode="json"))
+    row = from_plain(dumped, dict[str, object])
     text = _snapshot_text_fields()
     for side in ("old", "new"):
         row[side] = {
             key: value[:32] if key in text and isinstance(value, str) else value
-            for key, value in convert(row[side], dict[str, object]).items()
+            for key, value in from_plain(row[side], dict[str, object]).items()
             if value is not None
         }
     return row

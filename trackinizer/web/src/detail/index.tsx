@@ -1,8 +1,11 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { lazy, Suspense, type ReactNode, startTransition, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { lazy, Suspense, type ReactNode, startTransition, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { markPageDrawn } from "../debug/timings";
+import { setInquiryLock } from "../api/admin";
 import { ApiError } from "../api/client";
 import type { Detail, DetailRow } from "../api/detail";
-import { useMeta, useWriteMode } from "../app/boot";
+import { LockedContext, useMeta, useProfile, useWriteMode } from "../app/boot";
+import { useIsHighlighted } from "../app/highlights";
 import { PurgeDialog } from "../bulk/Purge";
 import { useCommands } from "../commands/registry";
 import { CopyDetails } from "../debug/CopyDetails";
@@ -20,6 +23,7 @@ import { capitalize } from "../ui/glyphs";
 import { Icon } from "../ui/icons";
 import { KindIcon, kindLook } from "../ui/kinds";
 import { type PanelSpec, PanelToggle, panelCommand, usePanel } from "../ui/panel";
+import { useToast } from "../ui/toast";
 import { EmptyState, OpenDrawerContext } from "../ui/view";
 import { Activity } from "./Activity";
 import { type Field, kindFields, usd } from "./fields";
@@ -31,6 +35,8 @@ import { Rail } from "./Rail";
 import { Relations } from "./Relations";
 import { dateTime, relativeTime, useMinuteClock } from "./time";
 import { Transcript } from "./transcript";
+import { conversationOf, SCIENCE_CHAT_LABEL } from "../api/chats";
+import { useContinueInChat } from "../visuals/continueChat";
 import "../writes/writes.css";
 import "./detail.css";
 
@@ -88,6 +94,11 @@ function DetailById({ id, kind, name }: { id: string; kind: string | null; name:
   }, [ready, shown]);
   // A row purged while open answers 404 on refetch: say so rather than show it stale.
   const gone = query.error instanceof ApiError && query.error.status === 404;
+  const drawn = !!query.data && !gone && shown;
+  // After an agent's navigation here, the page drawn with its data is what its timing mark waits for.
+  useLayoutEffect(() => {
+    if (drawn) markPageDrawn(window.location.hash);
+  }, [drawn, id]);
   if (query.data && !gone && shown) {
     return (
       <Page
@@ -125,65 +136,85 @@ function Page({ detail, stale, retry }: { detail: Detail; stale: Error | null; r
   const rail = usePanel(RAIL);
   const railId = useId();
   useCommands([panelCommand(rail)]);
+  const admin = useProfile().role === "admin";
   return (
-    <RelationFlows detail={detail}>
-      <Frame
-        kind={row.kind}
-        name={`${row.kind}#${row.seq}`}
-        actions={
-          <>
-            <ShowInGraph row={row} />
-            <MoreMenu detail={detail} />
-            <PanelToggle panel={rail} controls={railId} />
-          </>
-        }
-      >
-        {stale ? (
-          <Bar kind="stale">
-            Could not refresh {detail.self.kind}#{detail.self.seq}: {stale.message}
-            <button type="button" className="btn ghost" onClick={retry}>
-              Retry
-            </button>
-            <CopyDetails message={`Could not refresh ${detail.self.kind}#${detail.self.seq}: ${stale.message}`} error={stale} />
-          </Bar>
-        ) : null}
-        <div className="d-scroll">
-          <div className="d-grid">
-            <div className="d-top">
-              <div className="d-main-inner">
-                <Head detail={detail} now={now} cost={cost} />
-                {at("text").map((field) => (
-                  <TextEditor key={field.name} detail={detail} field={field}>
-                    <TextField field={field} kinds={kinds} />
-                  </TextEditor>
-                ))}
+    <LockedContext value={detail.locked === true && !admin}>
+      <RelationFlows detail={detail}>
+        <Frame
+          kind={row.kind}
+          name={`${row.kind}#${row.seq}`}
+          actions={
+            <>
+              <ContinueInChat row={row} />
+              <ShowInGraph row={row} />
+              <MoreMenu detail={detail} />
+              <PanelToggle panel={rail} controls={railId} />
+            </>
+          }
+        >
+          {stale ? (
+            <Bar kind="stale">
+              Could not refresh {detail.self.kind}#{detail.self.seq}: {stale.message}
+              <button type="button" className="btn ghost" onClick={retry}>
+                Retry
+              </button>
+              <CopyDetails message={`Could not refresh ${detail.self.kind}#${detail.self.seq}: ${stale.message}`} error={stale} />
+            </Bar>
+          ) : null}
+          <div className="d-scroll">
+            <div className="d-grid">
+              <div className="d-top">
+                <div className="d-main-inner">
+                  <Head detail={detail} now={now} cost={cost} />
+                  {at("text").map((field) => (
+                    <TextEditor key={field.name} detail={detail} field={field}>
+                      <TextField field={field} kinds={kinds} />
+                    </TextEditor>
+                  ))}
+                </div>
               </div>
-            </div>
-            <div className="d-rail" id={railId} hidden={rail.collapsed}>
-              <GraphPreview detail={detail} />
-              <Rail detail={detail} />
-              <Properties detail={detail} fields={fields} />
-            </div>
-            <div className="d-main">
-              <div className="d-main-inner">
-                {at("json").map((field) => (
-                  <TextEditor key={field.name} detail={detail} field={field} json>
-                    <JsonField field={field} />
-                  </TextEditor>
-                ))}
-                {row.kind === "Artifact" && <Suspense fallback={<p className="d-loading">Loading Artifact…</p>}>
-                  <ArtifactContent id={row.id} optional />
-                </Suspense>}
-                <Metrics row={row} />
-                <Transcript row={row} />
-                <Relations detail={detail} />
-                <Activity detail={detail} fields={fields} now={now} />
+              <div className="d-rail" id={railId} hidden={rail.collapsed}>
+                <GraphPreview detail={detail} />
+                <Rail detail={detail} />
+                <Properties detail={detail} fields={fields} />
+              </div>
+              <div className="d-main">
+                <div className="d-main-inner">
+                  {at("json").map((field) => (
+                    <TextEditor key={field.name} detail={detail} field={field} json>
+                      <JsonField field={field} />
+                    </TextEditor>
+                  ))}
+                  {row.kind === "Artifact" && <Suspense fallback={<p className="d-loading">Loading Artifact…</p>}>
+                    <ArtifactContent id={row.id} optional />
+                  </Suspense>}
+                  <Metrics row={row} />
+                  <Transcript row={row} />
+                  <Relations detail={detail} />
+                  <Activity detail={detail} fields={fields} now={now} />
+                </div>
               </div>
             </div>
           </div>
-        </div>
-      </Frame>
-    </RelationFlows>
+        </Frame>
+      </RelationFlows>
+    </LockedContext>
+  );
+}
+
+/**
+ * Continue in Chat, on a science chat's session: Chat opens on the conversation, which anyone
+ * signed in as a writer can post in. Offered only where the canvas offers Chat.
+ */
+function ContinueInChat({ row }: { row: DetailRow }) {
+  const continueIn = useContinueInChat();
+  const labels = Array.isArray(row.labels) ? row.labels : [];
+  const conversation = conversationOf(typeof row.cli_session_id === "string" ? row.cli_session_id : null);
+  if (!continueIn || row.kind !== "AgentSession" || !conversation || !labels.includes(SCIENCE_CHAT_LABEL)) return null;
+  return (
+    <button type="button" className="btn ghost" onClick={() => continueIn(row.id)}>
+      Continue in Chat
+    </button>
   );
 }
 
@@ -219,6 +250,8 @@ function MoreMenu({ detail }: { detail: Detail }) {
   const offline = useWriteMode() === "disabled";
   const trigger = useRef<HTMLButtonElement>(null);
   const [purging, setPurging] = useState(false);
+  const admin = useProfile().role === "admin";
+  const lock = useLockToggle(detail);
   if (!actions.length) return null;
   const name = `${detail.self.kind}#${detail.self.seq}`;
   return (
@@ -237,9 +270,16 @@ function MoreMenu({ detail }: { detail: Detail }) {
             icon: <Icon name={icon} size={14} />,
             hint: keys?.[0]?.toUpperCase(),
           })),
+          ...(admin
+            ? [{ value: LOCK, label: detail.locked ? "Unlock" : "Lock", icon: <Icon name="lock" size={14} /> }]
+            : []),
           { value: PURGE, label: "Purge…", icon: <Icon name="trash" size={14} />, danger: true },
         ]}
-        onPick={(id) => (id === PURGE ? setPurging(true) : actions.find((action) => action.id === id)?.run(trigger.current))}
+        onPick={(id) => {
+          if (id === PURGE) setPurging(true);
+          else if (id === LOCK) lock.mutate();
+          else actions.find((action) => action.id === id)?.run(trigger.current);
+        }}
       />
       {purging ? <PurgeDialog detail={detail} returnTo={trigger.current} onClose={() => setPurging(false)} /> : null}
     </>
@@ -248,6 +288,21 @@ function MoreMenu({ detail }: { detail: Detail }) {
 
 /** The ⋯ menu's value for Purge; no relation action has this id. */
 const PURGE = "inquiry.purge";
+
+/** The ⋯ menu's value for an admin's Lock and Unlock. */
+const LOCK = "inquiry.lock";
+
+/** Flip the inquiry's lock, then read it again so the badge follows; a refusal is a toast saying why. */
+function useLockToggle(detail: Detail) {
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const name = `${detail.self.kind}#${detail.self.seq}`;
+  return useMutation({
+    mutationFn: () => setInquiryLock(detail.self.id, !detail.locked),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: detailQueries.detail(detail.self.id).queryKey }),
+    onError: (error) => toast(`Could not ${detail.locked ? "unlock" : "lock"} ${name}: ${error.message}`, { failed: true, error }),
+  });
+}
 
 /** The rail as a panel: on the right, and `]` collapses or expands it. */
 const RAIL: PanelSpec = { id: "detail.rail", name: "parents, children and properties", side: "right", keys: ["]"] };
@@ -263,14 +318,21 @@ const RAIL: PanelSpec = { id: "detail.rail", name: "parents, children and proper
 function Head({ detail, now, cost }: { detail: Detail; now: number; cost: number }) {
   const row = detail.self;
   const one = kindLook(row.kind).one;
+  const highlighted = useIsHighlighted(row.id);
   return (
-    <div className="d-head">
+    <div className={highlighted ? "d-head is-highlighted" : "d-head"}>
       <div className="eyebrow">
         <KindIcon kind={row.kind} size={13} />
         {capitalize(one)}
         <span className="d-cost">
           Cost of this {one} <b>{cost ? usd(cost) : "none recorded"}</b>
         </span>
+        {detail.locked ? (
+          <span className="d-lock" title="Locked: only an admin can change this, its edges or delete it">
+            <Icon name="lock" size={12} />
+            Locked
+          </span>
+        ) : null}
         <span className="d-dates">
           Created <b title={dateTime(row.created)}>{dateTime(row.created)}</b> · Updated{" "}
           <b title={dateTime(row.modified)}>{relativeTime(row.modified, now)}</b>

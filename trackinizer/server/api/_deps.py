@@ -8,13 +8,17 @@ import dataclasses
 import datetime
 import uuid
 
+from trackinizer.server.chat_hub import ChatHub
+from trackinizer.server.config import Config
 from trackinizer.wire.json_types import MutableJSON
 
 
 if TYPE_CHECKING:
-    from fastapi import Request
+    from fastapi import FastAPI, Request
 
+    from trackinizer.server.config import Assistant, ChatOrgs
     from trackinizer.server.inbound import InboundQueue
+    from trackinizer.server.secrets import SecretBackend
     from trackinizer.server.store.core import Store
     from trackinizer.types.inquiries import Inquiry
 
@@ -22,6 +26,7 @@ if TYPE_CHECKING:
 class _State(Protocol):
     store: Store
     inbound: InboundQueue
+    secrets: SecretBackend | None
 
 
 def get_store(request: Request) -> Store:
@@ -50,6 +55,68 @@ def get_inbound(request: Request) -> InboundQueue:
     """
     app = cast(_App, request.app)
     return app.state.inbound
+
+
+def get_hub(request: Request) -> ChatHub:
+    """Return the Chat event hub held on the app state, made on first use.
+
+    An app built by hand, as a test harness does, has no lifespan to make one, so
+    the first request that needs the hub makes it.
+
+    Args:
+      request: Request.
+
+    Returns:
+      result: The ChatHub.
+
+    """
+    app = cast("FastAPI", request.app)
+    hub: object = getattr(app.state, "hub", None)
+    if not isinstance(hub, ChatHub):
+        hub = app.state.hub = ChatHub()
+    return hub
+
+
+def get_assistant(request: Request) -> Assistant | None:
+    """Return the configured assistant; none without a Config.
+
+    Args:
+      request: Request.
+
+    Returns:
+      result: The configured assistant, if any.
+
+    """
+    config: object = getattr(cast("FastAPI", request.app).state, "config", None)
+    return config.assistant if isinstance(config, Config) else None
+
+
+def get_chat_orgs(request: Request) -> ChatOrgs:
+    """Return how science chats group their users; ``domain`` without a Config.
+
+    Args:
+      request: Request.
+
+    Returns:
+      result: ``single`` or ``domain``.
+
+    """
+    config: object = getattr(cast("FastAPI", request.app).state, "config", None)
+    return config.chat_orgs if isinstance(config, Config) else "domain"
+
+
+def get_secrets(request: Request) -> SecretBackend | None:
+    """Return the secret backend held on the app state; ``None`` when disabled.
+
+    Args:
+      request: Request.
+
+    Returns:
+      result: The backend, or ``None`` when secret storage is turned off.
+
+    """
+    app = cast(_App, request.app)
+    return app.state.secrets
 
 
 def tag_row(inquiry: Inquiry) -> MutableJSON:
@@ -109,10 +176,12 @@ def tag_kind(inquiry: Inquiry | None) -> MutableJSON | None:
 def _jsonable(value: object) -> object:
     """Convert one value -- and everything under it -- to JSON-shaped data."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {
-            field.name: _jsonable(cast(object, getattr(value, field.name)))
-            for field in dataclasses.fields(value)
-        }
+        result: dict[str, object] = {}
+        for field in dataclasses.fields(value):
+            # Dataclass reflection returns Any; this cast establishes the recursive boundary.
+            field_value = cast(object, getattr(value, field.name))
+            result[field.name] = _jsonable(field_value)
+        return result
     if isinstance(value, tuple | list):
         # Tuples become lists: the projection fields (edges, ``labels``,
         # ``issue_kind``) are tuples on the model, and a caller comparing

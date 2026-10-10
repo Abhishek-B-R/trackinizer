@@ -1,44 +1,54 @@
--- schema.033.sql -- client-declared ``recorded`` timestamp for backfilled rows.
---
--- Adds one nullable TIMESTAMPTZ to ``inquiries``, plus its ``old_``/``new_``
--- mirror in ``change_log`` so the edit is audited like every other field.
--- ``created`` and ``modified`` stay server-stamped (``clock_timestamp()``) and
--- authoritative for audit; ``recorded`` carries what the CLIENT declares about
--- when the knowledge originated, so a corpus imported in one batch keeps its
--- own chronology instead of collapsing to import time. NULL means "born here",
--- where ``created`` already answers the question.
---
--- Same shape as the declared-provenance datetimes already in the schema
--- (``AgentSession.started``, ``Paper.publish_date``): the server cannot know
--- the truth, so the client supplies it.
---
--- The baseline ``schema.sql`` carries the same columns for a fresh install; a
--- fresh DB records this migration applied WITHOUT executing it, an existing DB
--- records the baseline unrun and executes only this file, so the two must stay
--- in step -- pinned by ``schema_migration_test.py``.
---
--- Numbered 033: the deployed ledger holds through schema.032.sql.
---
--- Safe against the OLD code and not downtime (run it against the live database
--- with the old server still serving; see docs/db_schema_migration.md). The
--- columns are additive and the old build never reads them. The two mirror
--- gates are added NOT VALID and validated separately: every existing row has
--- both mirrors NULL and so already satisfies them, and this way the scan takes
--- SHARE UPDATE EXCLUSIVE rather than holding ACCESS EXCLUSIVE over a
--- change_log that only grows. A fresh install gets the same two rules as
--- unnamed CHECKs inside CREATE TABLE, auto-named by position; named here
--- because ALTER needs a handle to validate. The rule enforced is identical.
-ALTER TABLE inquiries ADD COLUMN IF NOT EXISTS recorded TIMESTAMPTZ;
-
-ALTER TABLE change_log ADD COLUMN IF NOT EXISTS old_recorded TIMESTAMPTZ;
-ALTER TABLE change_log ADD COLUMN IF NOT EXISTS new_recorded TIMESTAMPTZ;
-
-ALTER TABLE change_log
-    ADD CONSTRAINT change_log_old_recorded_gate
-    CHECK (kind = 'recorded' OR old_recorded IS NULL) NOT VALID;
-ALTER TABLE change_log
-    ADD CONSTRAINT change_log_new_recorded_gate
-    CHECK (kind = 'recorded' OR new_recorded IS NULL) NOT VALID;
-
-ALTER TABLE change_log VALIDATE CONSTRAINT change_log_old_recorded_gate;
-ALTER TABLE change_log VALIDATE CONSTRAINT change_log_new_recorded_gate;
+-- Canvas Chat conversations: one signed-in user, one canvas, one partner at a time.
+-- Chat is on for everyone by default; Settings still lets a user opt out.
+ALTER TABLE users ALTER COLUMN visual_workspace_enabled SET DEFAULT TRUE;
+UPDATE users SET visual_workspace_enabled = TRUE;
+-- A canvas made before Chat shipped gets it, floating, once; a full canvas does not.
+UPDATE visual_workspaces
+SET state = jsonb_set(
+        state,
+        '{visuals}',
+        (state -> 'visuals') || jsonb_build_array(jsonb_build_object(
+            'id', gen_random_uuid(),
+            'type', 'trax.chat',
+            'version', 1,
+            'placement', 'floating',
+            'record_id', 'null'::jsonb,
+            'params', '{}'::jsonb,
+            'floating_rect', 'null'::jsonb
+        ))
+    ),
+    revision = revision + 1,
+    modified_at = clock_timestamp()
+WHERE jsonb_array_length(state -> 'visuals') < 12
+  AND NOT EXISTS (
+        SELECT 1 FROM jsonb_array_elements(state -> 'visuals') AS visual
+        WHERE visual ->> 'type' = 'trax.chat'
+  );
+CREATE TABLE IF NOT EXISTS chat_conversations (
+    id                 UUID PRIMARY KEY,
+    user_id            UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    workspace_id       UUID NOT NULL REFERENCES visual_workspaces(id) ON DELETE CASCADE,
+    title              TEXT NOT NULL,
+    partner_session_id UUID REFERENCES inquiries(id) ON DELETE SET NULL,
+    partner_actor      TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    modified_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX IF NOT EXISTS idx_chat_conversations_user_modified
+    ON chat_conversations (user_id, modified_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_conversations_partner_session
+    ON chat_conversations (partner_session_id);
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id              UUID PRIMARY KEY,
+    conversation_id UUID NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+    seq             BIGINT NOT NULL CHECK (seq >= 1),
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    author          TEXT NOT NULL,
+    text            TEXT NOT NULL,
+    -- The browser send that stored a user message: its Idempotency-Key and a hash of
+    -- the request, so a retry finds the message and a different request is refused.
+    request_key     UUID UNIQUE,
+    request_hash    TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (conversation_id, seq)
+);

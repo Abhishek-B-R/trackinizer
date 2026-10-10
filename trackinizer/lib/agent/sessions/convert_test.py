@@ -33,9 +33,10 @@ from trackinizer.lib.agent.sessions.convert import (
     detect_format,
     main,
 )
-from trackinizer.lib.custom_json import (
-    convert as convert_json,
-    parse,
+from trackinizer.lib.codec import (
+    from_plain,
+    from_plain as convert_json,
+    loads,
 )
 
 
@@ -65,7 +66,7 @@ def _first_turn(rollout: str) -> str:
     kept = [rollout.splitlines(keepends=True)[0]]
     started = False
     for line in rollout.splitlines(keepends=True)[1:]:
-        record = parse(line, dict[str, object])
+        record = from_plain(loads(line), dict[str, object])
         started = started or record.get("type") == "turn_context"
         if not started:
             continue
@@ -107,7 +108,7 @@ def test_convert_writes_stdout_and_out_dir(
     assert main(["convert", str(path), "--to", "json"]) == 0
     # A bare ARRAY of tagged records: a session IS its records, so nothing
     # wraps them and no metadata sits beside them.
-    document = parse(capsys.readouterr().out, list[dict[str, object]])
+    document = from_plain(loads(capsys.readouterr().out), list[dict[str, object]])
     assert convert_json(document[0].get("py/object"), str, default="").endswith(
         "TurnContext",
     )
@@ -139,7 +140,7 @@ def test_verify_reports_exactness(
 
 
 def test_verify_does_not_truncate_the_file_named_by_output(tmp_path: Path) -> None:
-    """``verify`` writes no conversion, so ``-o`` must leave its target alone.
+    """``verify`` writes no conversion, so ``-o`` is refused and left alone.
 
     Verifying keeps no text -- it asks whether the bytes agree, not for a copy
     of them -- but the destination was written unconditionally, so the empty
@@ -151,9 +152,75 @@ def test_verify_does_not_truncate_the_file_named_by_output(tmp_path: Path) -> No
     output = tmp_path / "out.txt"
     output.write_text("PREEXISTING")
 
-    assert main(["verify", str(path), "-o", str(output)]) == 0
+    with pytest.raises(SystemExit) as excinfo:
+        main(["verify", str(path), "-o", str(output)])
 
+    assert excinfo.value.code == 2
     assert output.read_text() == "PREEXISTING"
+
+
+def test_verify_refuses_an_output_destination(tmp_path: Path) -> None:
+    # Verify keeps no text, so ``--out-dir`` wrote every part as 0 bytes -- and
+    # pointed at the source's own directory, it truncated the source.
+    path = tmp_path / "s.jsonl"
+    native = _claude_session()
+    path.write_text(native)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main(["verify", str(path), "--out-dir", str(tmp_path)])
+
+    assert excinfo.value.code == 2
+    assert path.read_text() == native
+
+
+def test_a_seam_name_cannot_escape_the_output_directory(tmp_path: Path) -> None:
+    # ``$seam`` comes from a normalized document, which is untrusted input.
+    victim = tmp_path / "victim.jsonl"
+    victim.write_text("KEEP")
+    records = list(claude.normalize(StringIO(_claude_session())))
+    fused = list(fuse.fuse([records, records], ["a.jsonl", "../victim.jsonl"]))
+    source = tmp_path / "in" / "s.json"
+    source.parent.mkdir()
+    out_dir = tmp_path / "out"
+    with source.open("w", encoding="utf-8") as handle:
+        normalized.denormalize(fused, handle)
+
+    assert main(["convert", str(source), "--to", "claude", "--out-dir", str(out_dir)])
+
+    assert victim.read_text() == "KEEP"
+
+
+def test_a_crlf_transcript_does_not_verify_as_byte_exact(tmp_path: Path) -> None:
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(_claude_session().replace("\n", "\r\n").encode("utf-8"))
+
+    assert not convert_file(path, "auto", None, False, destination=False).byte_exact
+    assert not convert_file(path, "auto", None, False).byte_exact
+
+
+def test_a_native_out_dir_does_not_overwrite_a_same_named_part(tmp_path: Path) -> None:
+    # Two sessions whose parts share one file name both land in ``out_dir``.
+    first = _session(tmp_path / "a" / "s.jsonl", _claude_session())
+    second = _session(tmp_path / "b" / "s.jsonl", _claude_session())
+    out_dir = tmp_path / "out"
+
+    assert (
+        main(
+            [
+                "convert",
+                str(first),
+                str(second),
+                "--to",
+                "codex",
+                "--lossy",
+                "--out-dir",
+                str(out_dir),
+            ],
+        )
+        == 0
+    )
+
+    assert len(list(out_dir.iterdir())) == 2
 
 
 @pytest.mark.cli_python_subprocess
@@ -183,7 +250,7 @@ def test_workers_run_in_separate_processes(
         _ = _session(tmp_path / name / "s.jsonl", _claude_session())
 
     assert main(["verify", str(tmp_path), "--workers", "4", "--format", "json"]) == 0
-    report = parse(capsys.readouterr().err, dict[str, object])
+    report = from_plain(loads(capsys.readouterr().err), dict[str, object])
 
     assert report["files"] == 4
     assert report["ok"] == 4
@@ -202,7 +269,7 @@ def test_verify_reports_the_wire_size_against_the_source(
     assert main(["verify", str(path), "--format", "json"]) == 0
     report = convert_json(
         convert_json(
-            parse(capsys.readouterr().err, dict[str, object])["results"],
+            from_plain(loads(capsys.readouterr().err), dict[str, object])["results"],
             list[object],
         )[0],
         dict[str, object],
@@ -227,7 +294,7 @@ def test_verify_reports_a_size_gap_on_a_shortened_rewrite(
     assert main(["verify", str(path), "--format", "json"]) == 1
     report = convert_json(
         convert_json(
-            parse(capsys.readouterr().err, dict[str, object])["results"],
+            from_plain(loads(capsys.readouterr().err), dict[str, object])["results"],
             list[object],
         )[0],
         dict[str, object],
@@ -258,7 +325,8 @@ def test_convert_reports_unreadable_and_unknown_inputs(tmp_path: Path) -> None:
     unknown = tmp_path / "unknown.jsonl"
     unknown.write_text('{"kind":"other"}\n')
 
-    assert convert_file(tmp_path / "absent.jsonl", "auto", "json", False).error
+    absent = convert_file(tmp_path / "absent.jsonl", "auto", "json", False).error or ""
+    assert absent
     assert (
         convert_file(unknown, "auto", "json", False).error
         == "unrecognized session format"
@@ -274,7 +342,8 @@ def test_convert_reports_a_malformed_normalized_payload(tmp_path: Path) -> None:
         '"context_id":"seven"}]',
     )
 
-    assert convert_file(path, "json", "claude", False).error
+    malformed = convert_file(path, "json", "claude", False).error or ""
+    assert malformed
 
 
 def test_json_report_and_usage_errors(
@@ -480,7 +549,7 @@ def test_a_multi_file_session_is_joined_then_split_back_byte_for_byte(
     assert result.output_bytes == result.source_bytes
 
     assert main(["verify", str(project), "--format", "json"]) == 0
-    report = parse(capsys.readouterr().err, dict[str, object])
+    report = from_plain(loads(capsys.readouterr().err), dict[str, object])
     assert report["files"] == 1
     assert report["ok"] == 1
 
@@ -529,14 +598,22 @@ def test_killing_the_run_takes_its_workers_with_it(tmp_path: Path) -> None:
     # the obvious pattern left 11 orphans holding 14 GB. The kernel has to be
     # the one that reaps them.
     for index in range(6):
-        _ = _session(tmp_path / f"s{index}" / "s.jsonl", _claude_session() * 40)
+        _ = _session(tmp_path / "in" / f"s{index}" / "s.jsonl", _claude_session() * 40)
+    # A session no one ever writes: the worker that opens it blocks, so the run
+    # is still alive when it is killed. Without it the run could END before the
+    # loop below saw it: measured, the pool converted all six in 0.36 s and
+    # exited 90 ms after its first output, and a poll whose /proc scan took
+    # 62 ms on a host holding 4,000 pids missed that window 10 times in 10.
+    held = tmp_path / "held.jsonl"
+    os.mkfifo(held)
     started = subprocess.Popen(  # noqa: S603 -- fixed argv, tmp_path input.
         [
             sys.executable,
             "-m",
             "trackinizer.lib.agent.sessions",
             "convert",
-            str(tmp_path),
+            str(tmp_path / "in"),
+            str(held),
             "--to",
             "json",
             "--out-dir",
@@ -549,7 +626,7 @@ def test_killing_the_run_takes_its_workers_with_it(tmp_path: Path) -> None:
     )
     children: list[psutil.Process] = []
     deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline and started.poll() is None:
         children = cast(  # pyright: ignore[reportUnnecessaryCast] -- ty needs it; pyright resolves the stub.
             "list[psutil.Process]",
             psutil.Process(started.pid).children(recursive=True),
@@ -561,6 +638,7 @@ def test_killing_the_run_takes_its_workers_with_it(tmp_path: Path) -> None:
         if len(children) >= 2 and list((tmp_path / "out").glob("*.json")):
             break
         time.sleep(0.1)
+    assert started.poll() is None, "the run ended before it could be killed"
     assert children, "the pool never started"
     assert list((tmp_path / "out").glob("*.json")), "the pool never did any work"
 
@@ -742,6 +820,38 @@ def test_detect_format_recognizes_sagent_records() -> None:
     assert convert.detect_format('{"kind":"meta"}\n') == "sagent"
 
 
+def test_a_known_but_unconvertible_format_is_refused_by_name(tmp_path: Path) -> None:
+    path = tmp_path / "session.jsonl"
+    path.write_text('{"kind":"meta"}\n')
+
+    assert convert_file(path, "auto", "json", False).error == (
+        "unsupported session format: sagent"
+    )
+
+
+def test_an_empty_normalized_document_is_readable(tmp_path: Path) -> None:
+    # ``normalized.denormalize([])`` writes ``[]``, and detection raised on it.
+    path = tmp_path / "empty.json"
+    with path.open("w", encoding="utf-8") as handle:
+        normalized.denormalize([], handle)
+
+    assert detect_format(path.read_text()) == "json"
+    assert convert_file(path, "auto", None, False).ok
+
+
+def test_a_line_that_is_not_an_object_names_no_format() -> None:
+    assert detect_format("[1]\n") == ""
+    assert detect_format("3\n") == ""
+
+
+def test_a_long_pretty_printed_gemini_document_is_sniffed(tmp_path: Path) -> None:
+    path = tmp_path / "g.json"
+    messages = [{"type": "user", "content": f"m{i}"} for i in range(80)]
+    path.write_text(json.dumps({"sessionId": "s", "messages": messages}, indent=2))
+
+    assert convert._sniff(path) == "gemini"
+
+
 def test_convert_file_reports_conversion_type_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -767,15 +877,6 @@ def test_destination_uses_a_hash_when_all_parent_names_collide(tmp_path: Path) -
     assert convert._destination(destination, path, ".json").name.startswith("session-")
 
 
-def test_write_out_dir_writes_a_single_native_target(tmp_path: Path) -> None:
-    out = tmp_path / "out"
-    result = FileResult(path=tmp_path / "source.json", target="claude", text="native")
-
-    convert._write([result], output=None, out_dir=out, stream=StringIO())
-
-    assert (out / "source.jsonl").read_text() == "native"
-
-
 def test_write_out_dir_writes_named_parts(tmp_path: Path) -> None:
     out = tmp_path / "out"
     result = FileResult(
@@ -796,39 +897,25 @@ def test_matches_rejects_same_sized_different_text(tmp_path: Path) -> None:
     assert convert._matches(path, "and") is False
 
 
-def test_streamed_native_conversion_writes_each_part(tmp_path: Path) -> None:
-    project = tmp_path / "project"
-    before = _session(project / "before.jsonl", _claude_session())
-    after = _session(project / "after.jsonl", _claude_session())
-    out = tmp_path / "out"
+@pytest.mark.parametrize("edit", [False, True], ids=["same", "same-size-edit"])
+def test_a_streamed_json_rewrite_is_exact_by_content(
+    tmp_path: Path,
+    *,
+    edit: bool,
+) -> None:
+    # Equal sizes are not equal bytes: a respelling that kept the length -- one
+    # separator moved -- still reported byte-exact.
+    source = tmp_path / "in" / "s.json"
+    source.parent.mkdir()
+    with source.open("w", encoding="utf-8") as handle:
+        normalized.denormalize(claude.normalize(StringIO(_claude_session())), handle)
+    if edit:
+        text = source.read_text()
+        source.write_text("[ " + text[1:].replace(',"', ',"', 1).replace("]\n", "]", 1))
 
-    parts = [
-        list(claude.normalize(StringIO(_claude_session()))),
-        list(claude.normalize(StringIO(_claude_session()))),
-    ]
-    records = list(fuse.fuse(parts, [before.name, after.name]))
-    result = convert._streamed(
-        project,
-        records,
-        (before, after),
-        detected="claude",
-        into="claude",
-        out_dir=out,
-    )
+    result = convert_file(source, "auto", "json", False, destination=tmp_path / "out")
 
-    assert result.output_bytes == before.stat().st_size + after.stat().st_size
-    assert {path.name for path in out.iterdir()} == {before.name, after.name}
-
-    fallback = tmp_path / "fallback"
-    fallback_result = convert._streamed(
-        tmp_path / "single.jsonl",
-        parts[0],
-        (before,),
-        detected="claude",
-        into="claude",
-        out_dir=fallback,
-    )
-    assert fallback_result.parts == ((before.name, ""),)
+    assert result.byte_exact is not edit
 
 
 if __name__ == "__main__":

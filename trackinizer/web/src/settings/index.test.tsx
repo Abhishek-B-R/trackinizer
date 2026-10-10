@@ -34,6 +34,7 @@ test("the page shows the profile, refetched on open, and every section", async (
     "Names that mean you",
     "Appearance",
     "Agent workspace",
+    "Chat partner",
     "API tokens",
     "This browser",
     "Session",
@@ -52,6 +53,20 @@ test("agent workspace opt-in updates the account preference", async () => {
     call: "PUT /api/me/visual-workspace", body: { enabled: true },
   }), FAST);
   await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(true), FAST);
+});
+
+test("the switch for highlighting what the assistant mentions is on, and turns off at once, kept in this browser", () => {
+  serveAccount(ADA);
+  renderScreen(<SettingsView assign={vi.fn()} />, ADA);
+  const workspace = within(screen.getByRole("region", { name: "Agent workspace" }));
+  const toggle = workspace.getByRole("checkbox", { name: "Highlight rows the assistant mentions" }) as HTMLInputElement;
+  expect(toggle.checked).toBe(true);
+  fireEvent.click(toggle);
+  expect(toggle.checked).toBe(false);
+  expect(localStorage.getItem(`trackinizer.v2.highlight-mentions.${ADA.email}`)).toBe("off");
+  fireEvent.click(toggle);
+  expect(toggle.checked).toBe(true);
+  expect(localStorage.getItem(`trackinizer.v2.highlight-mentions.${ADA.email}`)).toBeNull();
 });
 
 test("appearance choice persists and updates the page immediately", () => {

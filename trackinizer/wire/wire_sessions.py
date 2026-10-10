@@ -25,7 +25,8 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from trackinizer.wire.json_types import JSON
+from trackinizer.wire.json_types import JSON, UtcDatetime
+from trackinizer.wire.wire_science_chat import ChatForkAt
 
 
 _MAX_MESSAGE_CHARS: Final = 16_384
@@ -101,7 +102,7 @@ class SessionStart(BaseModel):
     ``end`` if the CLI only reveals it later."""
 
     title: str | None = None
-    started: datetime | None = None
+    started: UtcDatetime | None = None
     actor: str | None = None
     account: str | None = None
     """The active user the session row is attributed to. ``None`` defaults to
@@ -408,6 +409,17 @@ class WorkspaceVisibleVisual(BaseModel):
 
     id: uuid.UUID
     type: str
+    record: WorkspaceRecordContext | None = None
+    """The record the visual shows, when it shows one that exists."""
+
+
+class WorkspacePage(BaseModel):
+    """A page the sender was on, with the record it shows when it names one."""
+
+    route: str
+    """The `#/...` address."""
+
+    record: WorkspaceRecordContext | None = None
 
 
 class WorkspaceMessageContext(BaseModel):
@@ -422,6 +434,18 @@ class WorkspaceMessageContext(BaseModel):
     visible_visuals: list[WorkspaceVisibleVisual]
     agent_instructions: str | None = Field(default=None, max_length=8_192)
     continuation_record_id: uuid.UUID | None = None
+    conversation_id: uuid.UUID | None = None
+    """The Chat conversation the message belongs to; an assistant answers there."""
+
+    fork: ChatForkAt | None = None
+    """Set on the first line of a fork: the line of another conversation's session it
+    starts from. The assistant opens the conversation with the lines up to it."""
+
+    page: WorkspacePage | None = None
+    """The page the sender is on as they send: what "this" means to them."""
+
+    trail: list[WorkspacePage] = Field(default_factory=list)
+    """The pages they came through before it, oldest first."""
 
 
 class InboundDrainItem(BaseModel):
@@ -436,6 +460,11 @@ class InboundDrainItem(BaseModel):
 
     text: str = Field(min_length=1, max_length=_MAX_MESSAGE_CHARS)
     source: str | None = None
+    source_role: str | None = None
+    """The sender's role (``viewer``, ``writer`` or ``admin``) as the server attested
+    it, beside ``source``; ``None`` for a sender the server cannot name, and from a
+    server that predates the field."""
+
     room: str | None = None
     """The room a routed message was scoped to, for the ``[room] sender:``
     injection prefix; ``None`` for a direct (session-id) enqueue."""
@@ -503,7 +532,7 @@ class SendMessageResponse(BaseModel):
 class SessionEnd(BaseModel):
     """Mark a session closed, optionally backfilling late-known fields."""
 
-    ended: datetime | None = None
+    ended: UtcDatetime | None = None
     cli_session_id: str | None = Field(default=None, min_length=1)
     """Set when the CLI only revealed its session id mid-run."""
 
@@ -567,3 +596,19 @@ def session_end_path(session_id: uuid.UUID) -> str:
 def session_inbound_path(session_id: uuid.UUID) -> str:
     """Return the inbound-message path for one session (POST enqueue, GET drain)."""
     return SESSION_INBOUND_PATH.format(session_id=session_id)
+
+
+def inbound_read_timeout(wait_sec: float) -> float | None:
+    """Return the read timeout a drain that holds ``wait_sec`` needs.
+
+    Args:
+      wait_sec: How long the server may hold the drain request open.
+
+    Returns:
+      timeout: Seconds the client may wait to read the response, or ``None``
+        to keep the transport's own timeout when the drain does not wait.
+
+    """
+    # The server returns an empty drain AT ``wait_sec``, so a read deadline equal to
+    # it races that response and turns a normal empty result into a transport error.
+    return wait_sec + 10.0 if wait_sec else None

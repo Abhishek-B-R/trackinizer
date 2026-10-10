@@ -2,7 +2,7 @@
 name: trax
 description: >
   ALWAYS invoke this skill for Trackinizer/trax work tracking, inquiry records, and visual workspaces: issues, beliefs, papers, experiments, codechanges, web results/searches, sessions, costs, board, workspace. Do not hand-write trax records directly -- invoke this skill first.
-argument-hint: "[help|next|blocked|board|graph|search|recent|cost|profile|workspace|<kind>] ..."
+argument-hint: "[help|next|blocked|board|graph|search|recent|cost|profile|env|machine|workspace|<kind>] ..."
 user-invocable: true
 tools: Bash, Read, Write, Edit, Glob, Grep
 ---
@@ -343,20 +343,32 @@ that workspace. Read the state before choosing an instance ID:
 ```bash
 trax workspace WORKSPACE_UUID
 trax workspace WORKSPACE_UUID show trax.chat --record RECORD_UUID --placement side
-trax workspace WORKSPACE_UUID show trax.subgraph --record RECORD_UUID --placement side
+trax workspace WORKSPACE_UUID show trax.subgraph --record RECORD_UUID \
+  --param hops=2 --param highlight=UUID,UUID
 trax workspace WORKSPACE_UUID show trax.timeline --record RECORD_UUID --placement side
 trax workspace WORKSPACE_UUID focus INSTANCE_UUID
 trax workspace WORKSPACE_UUID place INSTANCE_UUID floating
 trax workspace WORKSPACE_UUID hide INSTANCE_UUID
+trax workspace WORKSPACE_UUID highlight RECORD_UUID,RECORD_UUID
+trax workspace WORKSPACE_UUID highlight ""
 ```
 
 The catalog registers `trax.browse`, `trax.chat`, `trax.subgraph`, and
-`trax.timeline`. The timeline accepts Issue and Experiment records and shows
-bounded dated directions, results, and signed evidence. The context graph
-follows the selected record's Issue lineage and highlights it.
-Each write reads
+`trax.timeline`. `trax.timeline` (Lineage and timeline) takes a record of any
+kind and shows its lead issues, bounded dated directions, results, and signed
+evidence; it is off in a new canvas. The context graph
+shows the record in the graph: what lies within `hops` of it (1 to 3, default
+2) lit, the ring past that dimmed, and the record and the inquiries `highlight`
+lists (comma-separated ids) haloed. Showing it again with only a new
+`--record` moves it there and keeps its hops and highlight; any `--param`
+sets them anew, each one it leaves out back to its default. Each write reads
 the current revision and prints the resulting state. If another change wins the
 race and the server returns 409, read the workspace again before retrying.
+`highlight` points at what you are talking about: it marks up to 50 records, by
+UUID, wherever the user's page draws them (graph nodes, list rows, a record's
+relations), and an empty list clears the marks. Like `navigate` it is an event:
+it changes no visual and no revision, a newer highlight replaces the last, and
+it is not replayed to a tab that was not listening.
 Pairing and disconnecting remain browser actions.
 
 ## Decomposing a large task
@@ -395,6 +407,22 @@ trax issue title to "Step 1" \
 When a tree is too large or its node seqs must be referenced later, split across
 commands instead -- capture each new seq from the output, then attach its
 children by ref.
+
+## Environment variables
+
+`trax env` lists the org's variables; `trax env NAME to VALUE` sets one and
+`trax env NAME del` deletes one (admin role). A secret is write-only: pipe it
+with `trax env secret NAME to -` or point at a file with `to @FILE`. A literal
+secret on the command line is refused, and a listing shows `(secret)`, never a
+value. Never echo a secret into a command, a row or your own output.
+
+## Machines
+
+`trax machine` lists the machines campaigns may run on and `trax machine NAME`
+shows one, with its role, labels and `how` line (writer role). `trax machine
+NAME role to ROLE` and `how to TEXT` set a field and create the machine;
+`label add|del LABEL` and `del` change or unregister it (admin role). The
+registry only records machines; read `how` before using one.
 
 ## Recovery
 

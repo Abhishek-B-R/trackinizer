@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import ClassVar, Final, cast, override
 
@@ -27,7 +27,7 @@ class Profile:
 
     url: str
     author: str = ""
-    api_key: str = ""
+    api_key: str = field(default="", repr=False)
     """Sent as ``Authorization: Bearer <api_key>``."""
 
 
@@ -482,7 +482,7 @@ def _validate_profile_name(name: str) -> None:
 
 def _explicit_profile() -> str | None:
     """Profile name pinned by ``$TRACKINIZER_PROFILE`` or the ``current`` file, if any."""
-    if pinned := env("TRACKINIZER_PROFILE"):
+    if pinned := env("TRACKINIZER_PROFILE") or "":
         return pinned
     try:
         text = (config_dir() / "rekursiv-ai" / "trax" / "current").read_text().strip()

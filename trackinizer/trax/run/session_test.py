@@ -35,13 +35,14 @@ import uuid
 import pytest
 
 from trackinizer.client.client import Client
+from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.lib.agent.types.sessions import (
     AssistantMessage,
     IncompleteRecord,
     SessionRecord,
     UserMessage,
 )
-from trackinizer.lib.custom_json import convert, parse
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.lib.posix import follow
 from trackinizer.lib.posix.follow import follow_tree
 from trackinizer.lib.posix.host import HostSpec
@@ -53,8 +54,8 @@ from trackinizer.trax.run.adapters.claude import ClaudeAdapter
 from trackinizer.trax.run.adapters.codex import CodexAdapter
 from trackinizer.trax.run.adapters.gemini import GeminiAdapter
 from trackinizer.trax.run.adapters.iostream import IOStreamAdapter
-from trackinizer.trax.run.adapters.tail import Tail
 from trackinizer.trax.run.custom_types import Event
+from trackinizer.trax.run.inbound import render_inbound
 from trackinizer.trax.run.session import (
     RunConfig,
     _cli_argv,
@@ -62,18 +63,30 @@ from trackinizer.trax.run.session import (
     _emit_slash_commands,
     _existing_session_files,
     _inbound_poll_loop,
+    _open_sink,
     _process_chunk,
-    _render_inbound,
     _routing_env,
     _session_owner,
     _Stats,
     resume_argv,
     run,
 )
-from trackinizer.trax.run.sink import ResilientSink, Sink, TrackinizerSink
+from trackinizer.trax.run.sink import (
+    LockedSink,
+    ResilientSink,
+    Sink,
+    TrackinizerSink,
+)
 from trackinizer.trax.run.slash import SlashCommand
-from trackinizer.wire.wire_session_ir import AppendRecordsResponse
+from trackinizer.wire.wire_session_ir import (
+    AppendRecordsResponse,
+    RecordBody,
+    SlashCommandBody,
+)
 from trackinizer.wire.wire_sessions import (
+    SessionEnd,
+    SessionEndResponse,
+    SessionStart,
     SessionStartResponse,
     WorkspaceMessageContext,
 )
@@ -81,8 +94,7 @@ from trackinizer.wire.wire_sessions import (
 
 if TYPE_CHECKING:
     from trackinizer.trax.run.adapters.custom_types import Adapter
-    from trackinizer.wire.wire_session_ir import RecordBody
-    from trackinizer.wire.wire_sessions import SessionStart
+    from trackinizer.types.streams import TraxRecord
 
 
 @pytest.fixture(autouse=True)
@@ -209,8 +221,8 @@ def _poison_records(stream: TextIO) -> Iterator[SessionRecord]:
 # position it already held rather than the reader having to remember what it emitted.
 def _document_records(stream: TextIO) -> Iterator[SessionRecord]:
     """Every message a whole document holds, re-read from its start."""
-    obj = parse(stream.read(), dict[str, object])
-    for text in convert(obj.get("messages"), list[str], default=[]):
+    obj = from_plain(loads(stream.read()), dict[str, object])
+    for text in from_plain(obj.get("messages"), list[str], default=[]):
         yield UserMessage(content=text)
 
 
@@ -238,7 +250,7 @@ class _FakeAdapter:
         del path
         return None
 
-    def reader(self) -> Tail:
+    def reader(self) -> Tail[TraxRecord]:
         return Tail(_line_records)
 
 
@@ -258,7 +270,7 @@ class _WholeFileAdapter(_FakeAdapter):
         return path.suffix == ".json"
 
     @override
-    def reader(self) -> Tail:
+    def reader(self) -> Tail[TraxRecord]:
         return Tail(_document_records, whole_file=True)
 
 
@@ -269,7 +281,7 @@ class _PoisonAdapter(_FakeAdapter):
     cli_binary: str = "poison"
 
     @override
-    def reader(self) -> Tail:
+    def reader(self) -> Tail[TraxRecord]:
         return Tail(_poison_records)
 
 
@@ -567,7 +579,7 @@ class TestSessionScoping:
         }
         pids = {"A": 101, "B": 102}
 
-        def line_reader(self: CodexAdapter) -> Tail:
+        def line_reader(self: CodexAdapter) -> Tail[TraxRecord]:
             del self
             return Tail(_line_records)
 
@@ -649,7 +661,7 @@ class TestSessionScoping:
         session_id = "00000000-0000-7000-8000-000000000003"
         sink = _RecordingSink()
 
-        def line_reader(self: CodexAdapter) -> Tail:
+        def line_reader(self: CodexAdapter) -> Tail[TraxRecord]:
             del self
             return Tail(_line_records)
 
@@ -1773,8 +1785,8 @@ def _uuid_line(marker: str) -> bytes:
 def _uuid_records(stream: TextIO) -> Iterator[SessionRecord]:
     """Read the claude-shaped fixture lines ``_uuid_line`` writes."""
     for line in stream:
-        obj = parse(line, dict[str, object])
-        message = convert(obj["message"], dict[str, object])
+        obj = from_plain(loads(line), dict[str, object])
+        message = from_plain(obj["message"], dict[str, object])
         yield UserMessage(content=str(message["content"]))
 
 
@@ -1785,7 +1797,7 @@ class _UuidAdapter(_FakeAdapter):
     cli_binary: str = "uuids"
 
     @override
-    def reader(self) -> Tail:
+    def reader(self) -> Tail[TraxRecord]:
         return Tail(_uuid_records)
 
 
@@ -2400,7 +2412,10 @@ class TestSpawnWiring:
         )
         assert status == 0
         assert wiring.argv[0] == "claude"
-        assert "session-log watch not ready" in capsys.readouterr().err
+        assert (
+            "[trax run] session-log watch not ready within 0s; starting the CLI "
+            "anyway (early output may not be captured)\n"
+        ) in capsys.readouterr().err
 
     def test_a_stream_run_without_a_command_starts_no_worker(
         self,
@@ -2738,6 +2753,93 @@ class TestTeardownRunsEvenWhenTheRelayRaises:
         )
 
 
+class TestExitDoesNotWaitOutTheInboundHold:
+    """A run's exit ends the held request its inbound poller is parked in.
+
+    The server holds that request until a message arrives or the session ends,
+    and closing the sink is what ends the session -- so a teardown that joined
+    the poller before closing waited out the whole hold on every exit.
+    """
+
+    def test_the_session_ends_while_the_poller_is_still_parked(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        server = _HoldingServer()
+        client = cast(Client, server)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+        monkeypatch.setattr(session, "ThreadedRelay", partial(_ExitsOnceParked, server))
+        monkeypatch.setattr(session, "_drain_filesystem_loop", _drain_until_stop)
+        monkeypatch.setattr(shutil, "which", _always_found)
+
+        status = session._spawn_and_drain(
+            RunConfig(cli_name="claude", client=client, quiesce_seconds=0.0),
+            ClaudeAdapter(),
+            LockedSink(TrackinizerSink(client, "claude")),
+            _Stats(),
+        )
+
+        assert status == 0
+        assert server.holds == ["ended"], "the hold ran out instead of being ended"
+        assert "inbound poll thread did not stop" not in capsys.readouterr().err
+
+
+class _HoldingServer:
+    """Holds each inbound wait until the session ends, as the server route does."""
+
+    def __init__(self) -> None:
+        self.session = uuid.uuid4()
+        self.parked = threading.Event()
+        self.ended = threading.Event()
+        self.holds: list[str] = []
+
+    def session_start(self, body: SessionStart) -> SessionStartResponse:
+        return SessionStartResponse(id=self.session, seq=0, actor=body.actor)
+
+    def session_end(
+        self,
+        session_id: uuid.UUID,
+        body: SessionEnd | None = None,
+    ) -> SessionEndResponse:
+        del body
+        self.ended.set()
+        return SessionEndResponse(id=session_id)
+
+    def drain_inbound(
+        self,
+        session_id: uuid.UUID,
+        *,
+        wait_sec: float = 0.0,
+    ) -> list[tuple[str, str | None, str | None, WorkspaceMessageContext | None]]:
+        del session_id
+        self.parked.set()
+        self.holds.append("ended" if self.ended.wait(wait_sec) else "timed out")
+        return []
+
+
+class _ExitsOnceParked:
+    """A CLI that exits once inbound delivery is parked in its held request."""
+
+    def __init__(self, server: _HoldingServer, argv: object, **kwargs: object) -> None:
+        del argv, kwargs
+        self._server = server
+
+    def run(self) -> int:
+        assert self._server.parked.wait(5.0), "inbound delivery never parked"
+        return 0
+
+
+def _drain_until_stop(*args: object, armed: threading.Event, **kwargs: object) -> None:
+    """Arm, then capture nothing until the teardown stops the drain."""
+    del kwargs
+    armed.set()
+    stop = args[4]
+    assert isinstance(stop, threading.Event)
+    _ = stop.wait(5.0)
+
+
 class TestInboundIsWaitDriven:
     """Inbound delivery waits on the server, rather than asking repeatedly.
 
@@ -2890,6 +2992,61 @@ class TestInboundBatchSurvivesOneBadMessage:
         assert relay.submitted[:2] == ["first", "third"], (
             f"a bad message took the rest of its batch with it: {relay.submitted}"
         )
+
+
+class TestDeliverOne:
+    """One drained message reaches the CLI with all of its routing, or is logged."""
+
+    def test_a_stream_child_gets_the_whole_routed_envelope(self) -> None:
+        relay = _RecordingRelay()
+        envelope = '{"agent_message": "go"}'
+        session._deliver_one(
+            cast(ThreadedRelay, relay),
+            envelope,
+            "trackinizer",
+            "lab",
+            context=None,
+            stream=True,
+        )
+        assert relay.submitted == [f"[lab] trackinizer: {envelope}"]
+
+    def test_workspace_context_rides_with_the_text(self) -> None:
+        relay = _RecordingRelay()
+        context = WorkspaceMessageContext(workspace_id=uuid.uuid4(), visible_visuals=[])
+        session._deliver_one(
+            cast(ThreadedRelay, relay),
+            "look",
+            "alice@x",
+            None,
+            context=context,
+            stream=False,
+        )
+        assert relay.submitted == [
+            render_inbound("look", "alice@x", None, context=context),
+        ]
+        assert "Trackinizer context" in relay.submitted[0]
+
+    def test_an_undeliverable_message_is_logged_with_its_cause(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The sender believes it was delivered, so the loss must be traceable."""
+        with caplog.at_level("WARNING", logger=session.__name__):
+            session._deliver_one(
+                cast(ThreadedRelay, _PickyRelay(reject="poison")),
+                "poison",
+                None,
+                None,
+                context=None,
+                stream=False,
+            )
+        (record,) = [r for r in caplog.records if r.name == session.__name__]
+        assert record.getMessage() == (
+            "trax run: could not deliver an inbound message; "
+            "continuing with the rest of the batch"
+        )
+        assert record.exc_info is not None
+        assert isinstance(record.exc_info[1], RuntimeError)
 
 
 class TestInboundSurvivesACaptureDegrade:
@@ -3140,135 +3297,6 @@ class _FailingClient:
         raise RuntimeError("back-channel down")
 
 
-class TestRenderInbound:
-    """Routed messages carry their room + sender into the injected text."""
-
-    def test_room_and_sender_prefix(self) -> None:
-        assert _render_inbound("go", "alice@x", "sear") == "[sear] alice@x: go"
-
-    def test_sender_only_when_no_room(self) -> None:
-        # A direct (session-id) enqueue has no room; the sender still shows.
-        assert _render_inbound("go", "alice@x", None) == "alice@x: go"
-
-    def test_bare_text_when_no_context(self) -> None:
-        # Neither room nor attested sender: inject the message verbatim.
-        assert _render_inbound("go", None, None) == "go"
-
-    def test_workspace_chat_context_is_delivered_separately_from_user_text(
-        self,
-    ) -> None:
-        context = WorkspaceMessageContext.model_validate(
-            {
-                "workspace_id": "c5286865-67b6-4bd8-ab51-e06e10c326c5",
-                "record_id": "889ffcb2-cf44-43e7-9806-eb08428c6203",
-                "record": {
-                    "id": "889ffcb2-cf44-43e7-9806-eb08428c6203",
-                    "kind": "Issue",
-                    "seq": 21_706,
-                    "title": "ARC3 effort\nwith a newline",
-                },
-                "visible_visuals": [
-                    {
-                        "id": "2de97e19-2624-4e89-804e-f19e7248eec3",
-                        "type": "trax.chat",
-                    },
-                ],
-            },
-        )
-
-        rendered = _render_inbound(
-            "What led here?",
-            "viewer@example.com",
-            None,
-            context=context,
-        )
-
-        assert rendered == (
-            "viewer@example.com: What led here?\n"
-            f"Trackinizer context (verify with trax): {context.model_dump_json()}"
-            "\nCanvas commands: trax workspace c5286865-67b6-4bd8-ab51-e06e10c326c5; "
-            "to show the context graph for this record, run "
-            "trax workspace c5286865-67b6-4bd8-ab51-e06e10c326c5 "
-            "show trax.subgraph --record 889ffcb2-cf44-43e7-9806-eb08428c6203 "
-            "--placement side"
-        )
-
-    def test_artifact_chat_points_to_full_immutable_content(self) -> None:
-        context = WorkspaceMessageContext.model_validate(
-            {
-                "workspace_id": "c5286865-67b6-4bd8-ab51-e06e10c326c5",
-                "record_id": "251c60b8-1604-4e3a-9eda-1b5b046c3a4d",
-                "artifact_content": {
-                    "revision": 1,
-                    "artifact_id": "251c60b8-1604-4e3a-9eda-1b5b046c3a4d",
-                    "issue_id": "c5286865-67b6-4bd8-ab51-e06e10c326c5",
-                    "title": "Atlas",
-                    "summary": "Frozen summary",
-                    "author": "viewer@example.com",
-                    "created_at": "2026-09-30T00:00:00Z",
-                    "scope": "team",
-                    "format": "html",
-                    "citations": [],
-                    "sections": [],
-                },
-                "visible_visuals": [],
-            },
-        )
-
-        rendered = _render_inbound("Explain the source", None, None, context=context)
-
-        assert "trax artifact 251c60b8-1604-4e3a-9eda-1b5b046c3a4d" in rendered
-        assert (
-            "GET /api/artifacts/251c60b8-1604-4e3a-9eda-1b5b046c3a4d/content"
-            in rendered
-        )
-
-
-_ENVELOPE = json.dumps(
-    {
-        "agent_message": "FYI: trax issue 42 status changed (by bob)",
-        "id": "29b5982f-2e1f-4749-9bb6-fe601444282c",
-        "kind": "status",
-        "subject_ref": "issue 42",
-        "row": "trax issue 42",
-    },
-)
-
-
-class TestRenderInboundEnvelopes:
-    """Change envelopes are shaped per consumer at the CLIENT, not the server.
-
-    The server pushes one uniform JSON envelope to every session. The poller
-    decides what reaches the child's stdin: a model CLI gets only the
-    ``agent_message`` line (the rest of the fields would pollute its
-    context), while an IO-stream child gets the raw JSON to parse itself.
-    """
-
-    def test_model_session_receives_only_the_agent_message(self) -> None:
-        rendered = _render_inbound(_ENVELOPE, "trackinizer", None, stream=False)
-        assert rendered == "FYI: trax issue 42 status changed (by bob)"
-
-    def test_stream_session_receives_the_raw_envelope(self) -> None:
-        rendered = _render_inbound(_ENVELOPE, "trackinizer", None, stream=True)
-        assert rendered == f"trackinizer: {_ENVELOPE}"
-
-    def test_spoofed_source_is_not_treated_as_an_envelope(self) -> None:
-        """Only the route-attested ``trackinizer`` sender unwraps.
-
-        ``source`` is stamped server-side from the principal, so a human
-        cannot claim it -- but a JSON-looking message from any OTHER sender
-        must render as a plain message, not unwrap.
-        """
-        rendered = _render_inbound(_ENVELOPE, "mallory@x", None, stream=False)
-        assert rendered.startswith("mallory@x: ")
-
-    def test_malformed_envelope_falls_back_to_plain_rendering(self) -> None:
-        # A trackinizer-attested message that is not a JSON envelope (or
-        # lacks agent_message) must still be delivered, not dropped.
-        rendered = _render_inbound("not json", "trackinizer", None, stream=False)
-        assert rendered == "trackinizer: not json"
-
-
 class TestResumeArgv:
     """Each CLI spells "continue this session" its own way."""
 
@@ -3291,6 +3319,114 @@ class TestResumeArgv:
         """A fresh run names no session, so it gets no resume tokens."""
         assert resume_argv("claude", None) == ()
         assert resume_argv("codex", None) == ()
+
+
+class _UploadsClient:
+    """A server that takes every upload, keeping each body it was sent as JSON."""
+
+    base_url = "http://uploads.test"
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def session_start(self, body: SessionStart) -> SessionStartResponse:
+        return SessionStartResponse(id=uuid.uuid4(), seq=0, actor=body.actor)
+
+    def append_records(
+        self,
+        session_id: uuid.UUID,
+        **fields: object,
+    ) -> AppendRecordsResponse:
+        del session_id
+        records = cast(list[RecordBody], fields["records"])
+        self.sent.extend(body.model_dump_json() for body in records)
+        slash = cast(list[SlashCommandBody], fields["slash_commands"])
+        self.sent.extend(body.model_dump_json() for body in slash)
+        return AppendRecordsResponse(part=0, written=len(records), skipped=0)
+
+    def session_end(
+        self,
+        session_id: uuid.UUID,
+        body: SessionEnd | None = None,
+    ) -> SessionEndResponse:
+        del body
+        return SessionEndResponse(id=session_id)
+
+
+class _DownClient(_UploadsClient):
+    """A server that refuses the session, so the run captures to its local file."""
+
+    @override
+    def session_start(self, body: SessionStart) -> SessionStartResponse:
+        raise RuntimeError("server down")
+
+
+class TestOpenSinkRedactsDeliveredSecrets:
+    """Every sink ``_open_sink`` builds masks the values ``TRAX_REDACT_NAMES`` names."""
+
+    @pytest.fixture(autouse=True)
+    def _delivered_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TRAX_REDACT_NAMES", "K")
+        monkeypatch.setenv("K", "secretvalue1")
+
+    def test_the_out_file_holds_the_placeholder_only(self, tmp_path: Path) -> None:
+        out = tmp_path / "out.jsonl"
+        config = RunConfig(cli_name="sh", out_path=out)
+        self._capture(_open_sink(config, IOStreamAdapter()), tmp_path / "a.log")
+        stored = out.read_text(encoding="utf-8")
+        assert "[redacted:K]" in stored
+        assert "secretvalue1" not in stored
+
+    def test_the_server_and_its_fallback_file_hold_the_placeholder_only(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fallback = tmp_path / "fallback.jsonl"
+
+        def default_out_path(adapter_name: str) -> Path:
+            del adapter_name
+            return fallback
+
+        monkeypatch.setattr(session, "_default_out_path", default_out_path)
+        up = _UploadsClient()
+        config = RunConfig(cli_name="sh", client=cast(Client, up))
+        self._capture(_open_sink(config, IOStreamAdapter()), tmp_path / "a.log")
+        assert not fallback.exists()
+        assert up.sent
+        assert "secretvalue1" not in "".join(up.sent)
+        assert "[redacted:K]" in "".join(up.sent)
+
+        down = RunConfig(cli_name="sh", client=cast(Client, _DownClient()))
+        self._capture(_open_sink(down, IOStreamAdapter()), tmp_path / "b.log")
+        stored = fallback.read_text(encoding="utf-8")
+        assert "[redacted:K]" in stored
+        assert "secretvalue1" not in stored
+
+    def test_a_named_variable_the_environment_lacks_stops_the_run(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("K")
+        out = tmp_path / "out.jsonl"
+        with pytest.raises(SystemExit, match="K"):
+            _ = _open_sink(RunConfig(cli_name="sh", out_path=out), IOStreamAdapter())
+        assert not out.exists()
+
+    @classmethod
+    def _capture(cls, sink: Sink, path: Path) -> None:
+        # Opening first makes a server that refuses the session degrade before the
+        # first record, so the fallback file records everything itself.
+        _ = sink.open()
+        _ = sink.feed(IOStreamAdapter(), path, b"echo secretvalue1\n")
+        sink.emit_slash_command(
+            SlashCommand(command="secretvalue1", args="x"),
+            datetime(2026, 6, 1, tzinfo=UTC),
+        )
+        for reader in sink.readers.values():
+            reader.close()
+        sink.close()
 
 
 if __name__ == "__main__":

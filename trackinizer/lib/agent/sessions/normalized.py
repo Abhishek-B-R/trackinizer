@@ -1,9 +1,10 @@
 """Normalize and denormalize sessions as the provider-neutral JSON form.
 
-The adapter whose wire format is the IR itself: one tagged JSON array of
-records, encoded by ``trackinizer.lib.custom_json``, so a session converted to this
-format and back carries every semantic record rather than a provider
-projection of one.
+The adapter whose wire format is the IR itself: one JSON array of records,
+each written by :func:`~trackinizer.lib.agent.types.stored.to_stored`, so a session
+converted to this format and back carries every semantic record rather than a
+provider projection of one. A file written before records carried codec tags
+reads too.
 
 Unlike the native formats this one is a DOCUMENT -- a JSON array is not
 readable a line at a time -- so its reader consumes the whole stream before
@@ -18,7 +19,8 @@ from typing import TYPE_CHECKING, TextIO
 import json
 
 from trackinizer.lib.agent.types.sessions import SessionRecord
-from trackinizer.lib.custom_json import convert, loads_untagged, to_builtins
+from trackinizer.lib.agent.types.stored import to_stored
+from trackinizer.lib.codec import from_plain, loads
 
 
 if TYPE_CHECKING:
@@ -40,10 +42,8 @@ def normalize(stream: TextIO) -> Iterator[SessionRecord]:
     """
     # Each record carries its own ``py/object`` tag, which is what selects the
     # union member -- so the whole list decodes as the annotated type rather
-    # than one class named up front. ``loads_untagged`` also reads sessions
-    # archived in the old format, whose ``py/tuple`` tags would otherwise ride
-    # through an untyped ``extra`` into the rebuilt provider file.
-    yield from convert(loads_untagged(stream.read()), list[SessionRecord])
+    # than one class named up front.
+    yield from from_plain(loads(stream.read()), list[SessionRecord])
 
 
 def denormalize(records: Iterable[SessionRecord], stream: TextIO) -> None:
@@ -57,7 +57,7 @@ def denormalize(records: Iterable[SessionRecord], stream: TextIO) -> None:
     # Compact, not indented: this is a storage and transport form, and
     # indenting a 273 MB session spent 33 MB on whitespace alone.
     json.dump(
-        to_builtins(list(records)),
+        [to_stored(record) for record in records],
         stream,
         ensure_ascii=False,
         separators=(",", ":"),

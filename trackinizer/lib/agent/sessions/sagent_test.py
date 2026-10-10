@@ -8,8 +8,11 @@ from typing import cast
 import inspect
 import json
 
+import pytest
+
 from trackinizer.lib.agent.sessions import sagent
 from trackinizer.lib.agent.sessions.convert import detect_format, main
+from trackinizer.lib.agent.sessions.testdata.mistype import mistyped
 from trackinizer.lib.agent.types.sessions import (
     AgentStatusResult,
     AgentToAgentMessage,
@@ -30,6 +33,7 @@ from trackinizer.lib.agent.types.sessions import (
     UserMessage,
     WebFetchResult,
 )
+from trackinizer.lib.codec import immutable
 
 
 def _read(*lines: dict[str, object] | str) -> list[SessionRecord]:
@@ -518,6 +522,30 @@ def test_convert_names_the_format_but_does_not_offer_it() -> None:
     assert "sagent" not in offered
 
 
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"kind": "persistent_agent", "label": "x"},
+        {"kind": "persistent_agent", "label": "x", "session_dir": 7},
+        {"kind": "history", "type": "user", "text": 3},
+        {"kind": "history", "type": "tool_result", "call_id": "c", "content": [1]},
+        {"kind": "history", "type": "assistant", "tool_calls": [{"id": 1}]},
+        {"kind": "meta", "tokens": {"input_tokens": "x"}, "spend": {"a": "b"}},
+        {"kind": "message", "descriptor": "multipart/x-tool-result", "content": [7]},
+    ],
+    ids=["no-dir", "int-dir", "int-text", "list-content", "int-id", "bad-meta", "part"],
+)
+def test_a_malformed_record_degrades_to_an_uncategorized_one(
+    record: dict[str, object],
+) -> None:
+    # Narrowing ran outside the parse's ``try``, so one bad field raised out
+    # of ``normalize`` and aborted the whole read.
+    records = _read(record, _history("user", text="after"))
+
+    assert _only(records, UncategorizedRecord)[0].payload == immutable(record)
+    assert [u.content for u in _only(records, UserMessage)] == ["after"]
+
+
 def test_sagent_is_recognized_by_its_record_kinds() -> None:
     assert sagent.is_sagent(json.dumps(_meta()) + "\n")
     assert sagent.is_sagent(json.dumps(_history("user", text="x")) + "\n")
@@ -529,7 +557,115 @@ def test_sagent_is_recognized_by_its_record_kinds() -> None:
     )
     assert sagent.is_sagent("\n" + json.dumps(_meta()) + "\n")
     assert not sagent.is_sagent("{truncated\n")
+    assert not sagent.is_sagent(json.dumps({"kind": ["meta"]}) + "\n")
     assert not sagent.is_sagent("")
+
+
+def test_a_mistyped_field_aborts_no_read() -> None:
+    """A log field of the wrong type reads as absent, as a missing one does.
+
+    One session states every record family, and each call is answered after it,
+    so a result is typed by the call it answers when its wrong field is read.
+    """
+    calls = [
+        {"id": "c1", "name": "Bash", "args": {"command": "ls"}},
+        {"id": "c2", "name": "Read", "args": {"file_path": "a.py"}},
+        {"id": "c3", "name": "Write", "args": {"path": "b.py", "content": "x"}},
+        {
+            "id": "c4",
+            "name": "Edit",
+            "args": {"file_path": "a.py", "old_string": "a", "new_string": "b"},
+        },
+        {"id": "c5", "name": "WebFetch", "args": {"url": "https://x.org"}},
+        {
+            "id": "c6",
+            "name": "AgentSpawn",
+            "args": {"label": "kid", "prompt": "go", "model_id": "m"},
+        },
+    ]
+    session: list[dict[str, object]] = [
+        _meta(
+            provider="p",
+            tokens={"input_tokens": 3, "output_tokens": 4, "cache_read_tokens": 1},
+            spend={"a": 0.5},
+            total_cost_usd=0.5,
+            num_tool_call_rounds=2,
+        ),
+        {"kind": "persistent_agent", "label": "kid", "session_dir": "/x/kid"},
+        _history("user", text="go", timestamp=1790000000.5),
+        _history(
+            "assistant",
+            text="ok",
+            timestamp=1790000000.5,
+            thinking_blocks=[{"thinking": "t", "signature": "s"}],
+            tool_calls=calls,
+        ),
+        *(
+            _history("tool_result", call_id=f"c{n}", content="a\nb", is_error=False)
+            for n in range(1, 7)
+        ),
+        _history("agent_send", text="hi", source="kid"),
+        _history("compact_complete", text="summary", tokens=12),
+        {
+            "kind": "message",
+            "descriptor": "multipart/x-model-message",
+            "_timestamp": 1_790_000_000_000_000_000,
+            "content": [
+                {
+                    "descriptor": "application/x-thinking",
+                    "content": {"thinking": "t", "signature": "s"},
+                },
+                {"descriptor": "text/plain", "content": "hi"},
+                {
+                    "descriptor": "multipart/x-tool-call",
+                    "content": [
+                        {"descriptor": "text/x-queue-id", "content": "q1"},
+                        {
+                            "descriptor": "application/x-tool-read",
+                            "content": {"path": "a"},
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            "kind": "message",
+            "descriptor": "multipart/x-tool-result",
+            "content": [
+                {"descriptor": "text/x-queue-id", "content": "q1"},
+                {"descriptor": "text/plain", "content": "body"},
+            ],
+        },
+        {"kind": "message", "descriptor": "text/x-user-message", "content": "hello"},
+        {
+            "kind": "message",
+            "role": "assistant",
+            "content": "x",
+            "thinking_blocks": [{"thinking": "t"}],
+            "tool_calls": [{"id": "r1", "name": "Bash", "input": {"command": "ls"}}],
+        },
+        {
+            "kind": "message",
+            "role": "tool",
+            "tool_call_id": "r1",
+            "content": "out",
+            "is_error": True,
+        },
+        {"kind": "context_override", "tokens": 12, "payload": {}},
+    ]
+    failed: list[str] = []
+    for index, record in enumerate(session):
+        for path, changed in mistyped(record):
+            try:
+                _read(
+                    *session[:index],
+                    cast(dict[str, object], changed),
+                    *session[index + 1 :],
+                )
+            except TypeError as error:
+                failed.append(f"{index}.{path}: {error}")
+
+    assert failed == []
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ from typing import (
 )
 from urllib.parse import quote
 from uuid import UUID
+from weakref import WeakSet
 
 import asyncio
 import math
@@ -59,8 +60,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from trackinizer.lib.absent import ABSENT
-from trackinizer.lib.custom_json import convert
-from trackinizer.server.api._deps import tag_row
+from trackinizer.lib.codec import from_plain
+from trackinizer.server.api._deps import get_store, tag_row
 from trackinizer.server.api._regex_guard import regex_failures_as_400
 from trackinizer.server.api._routes_shared import parse_fields
 from trackinizer.server.auth import (
@@ -82,6 +83,7 @@ from trackinizer.server.store.session_search import (
 from trackinizer.server.values import vetted_sql
 from trackinizer.types.change_log import Snapshot
 from trackinizer.types.inquiries import KIND_TO_CLASS, Inquiry
+from trackinizer.wire.json_types import UtcDatetime
 from trackinizer.wire.routes import MAX_LIST_LIMIT, inquiry_relation_fields
 from trackinizer.wire.wire_sessions import (
     FeedCursor,
@@ -92,12 +94,13 @@ from trackinizer.wire.wire_sessions import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 
     import asyncpg
 
     from trackinizer.lib.postgres import Conn, DatabaseEngine
     from trackinizer.server.store.core import Store
+    from trackinizer.types.embedder import QueryEmbedder
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -109,24 +112,8 @@ type WebView = dict[str, object]
 router = APIRouter()
 
 
-def get_store(request: Request) -> Store:
-    """Return the process-wide store."""
-    return _state(request).store
-
-
 _SESSION_SEARCH_MAX_LIMIT: Final = 200
 _SESSION_SEARCH_MAPPER: Final = FootprintMapper().name
-
-
-class _QueryEmbedder(Protocol):
-    """A session embedder that can embed a query with its instruction prefix."""
-
-    name: str
-    dim: int
-
-    async def embed_query(self, text: str) -> list[float]:
-        """Embed a search query on the query-side manifold."""
-        ...
 
 
 # See ``_AppRoute``: shared caches must never store an /app/ response.
@@ -388,6 +375,7 @@ async def web_get(
         )
     return {
         "self": _row_to_dict(row),
+        "locked": row["locked"],
         "edges": edges,
         "backlinks": backlinks,
         "changes": [_change_to_dict(c) for c in changes],
@@ -638,12 +626,12 @@ async def web_feed(
     identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
     *,
     scope: Annotated[FeedScope, Depends(feed_scope)] = WHOLE_FEED,
-    after_created: datetime | None = None,
+    after_created: UtcDatetime | None = None,
     after_session: UUID | None = None,
     after_part: int | None = None,
     after_seq: int | None = None,
-    since: datetime | None = None,
-    until: datetime | None = None,
+    since: UtcDatetime | None = None,
+    until: UtcDatetime | None = None,
     conversation: bool = False,
     limit: int = 200,
     tail: bool = False,
@@ -687,6 +675,7 @@ async def web_feed(
     del identity
     if limit < 1 or limit > 1000:
         raise HTTPException(status_code=400, detail="limit must be in [1, 1000]")
+    _check_window(since, until)
     after = _feed_cursor(after_created, after_session, after_part, after_seq)
     events = await get_store(request).read_feed(
         after=after,
@@ -723,8 +712,8 @@ async def web_feed_facets(
     identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
     *,
     scope: Annotated[FeedScope, Depends(feed_scope)] = WHOLE_FEED,
-    since: datetime | None = None,
-    until: datetime | None = None,
+    since: UtcDatetime | None = None,
+    until: UtcDatetime | None = None,
 ) -> FeedFacetsResponse:
     """Count the feed between ``since`` and ``until`` by session, room and kind.
 
@@ -758,8 +747,8 @@ async def web_feed_histogram(
     identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
     *,
     scope: Annotated[FeedScope, Depends(feed_scope)] = WHOLE_FEED,
-    since: datetime | None = None,
-    until: datetime | None = None,
+    since: UtcDatetime | None = None,
+    until: UtcDatetime | None = None,
     buckets: int = 120,
 ) -> FeedHistogramResponse:
     """Count the feed's records per time bucket, over at most the last 7 days.
@@ -806,9 +795,6 @@ async def web_feed_histogram(
         buckets=buckets,
         scope=scope,
     )
-
-
-# -- Search query parsing ----------------------------------------------------
 
 
 # -- JSON serialization ------------------------------------------------------
@@ -900,9 +886,9 @@ def attach(
       app_dir: Directory of a built web app to serve at /app/; unset mounts none.
 
     """
-    if getattr(app.state, "web_attached", False):
+    if app in _ATTACHED:
         return
-    app.state.web_attached = True
+    _ATTACHED.add(app)
     assets = assets_dir or (_CWD / "assets")
     app.include_router(router, prefix="/api/web")
 
@@ -910,13 +896,7 @@ def attach(
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     if app_dir is not None:
-        # ``check_dir=False`` lets the server start before a build exists.
-        app.add_api_route(
-            "/app/{path:path}",
-            _AppRoute(files=StaticFiles(directory=app_dir, check_dir=False)),
-            methods=["GET"],
-            include_in_schema=False,
-        )
+        _get(app, "/app/{path:path}", _AppRoute(files=_app_files(app_dir)))
         # Stored links name ``/`` with a hash, which the browser keeps across a
         # redirect whose ``Location`` has none, and the app's router reads the old
         # hashes. 302, not 301: a browser keeps a 301 for good, which would pin
@@ -928,12 +908,7 @@ def attach(
             ("/graph", "/app/#/graph"),
             ("/console", "/app/#/console"),
         ):
-            app.add_api_route(
-                path,
-                _RedirectRoute(location=location),
-                methods=["GET"],
-                include_in_schema=False,
-            )
+            _get(app, path, _RedirectRoute(location=location))
     _add_login_route(app, assets / "login.html")
 
 
@@ -1032,12 +1007,7 @@ class _LoginPageRoute:
 def _add_login_route(app: FastAPI, page_path: Path) -> None:
     """Mount the login page when its asset exists."""
     if page_path.is_file():
-        app.add_api_route(
-            "/auth/login_page",
-            _LoginPageRoute(page_path=page_path),
-            methods=["GET"],
-            include_in_schema=False,
-        )
+        _get(app, "/auth/login_page", _LoginPageRoute(page_path=page_path))
 
 
 def _login_redirect(request: Request) -> RedirectResponse:
@@ -1072,11 +1042,11 @@ def _feed_cursor(
             status_code=400,
             detail="after_created, after_session, after_seq must be given together",
         )
-    return (created, session_id, 0 if part is None else convert(part, int), seq)
+    return (created, session_id, 0 if part is None else part, seq)
 
 
 def _check_window(since: datetime | None, until: datetime | None) -> None:
-    """Refuse a window that ends before it starts; a naive time is local."""
+    """Refuse a window that ends before it starts; a naive time is UTC."""
     if (
         since is not None
         and until is not None
@@ -1244,8 +1214,8 @@ def _snapshot_to_dict(row: asyncpg.Record, *, prefix: str) -> WebView:
     for column in _SNAPSHOT_COLUMNS:
         if column == "marginal_cost":
             out["marginal_cost"] = {
-                "agent_usd": convert(row[prefix + "marginal_cost_agent_usd"], float),
-                "resource_usd": convert(
+                "agent_usd": from_plain(row[prefix + "marginal_cost_agent_usd"], float),
+                "resource_usd": from_plain(
                     row[prefix + "marginal_cost_resource_usd"],
                     float,
                 ),
@@ -1258,9 +1228,9 @@ def _snapshot_to_dict(row: asyncpg.Record, *, prefix: str) -> WebView:
         if value is None:
             continue
         if column in ("labels", "subscribers", "issue_kind"):
-            out[column] = convert(value, list[str])
+            out[column] = from_plain(value, list[str])
         elif column == "experiment_codechanges":
-            out[column] = [str(uid) for uid in convert(value, list[UUID])]
+            out[column] = [str(uid) for uid in from_plain(value, list[UUID])]
         elif isinstance(value, UUID):
             out[column] = str(value)
         else:
@@ -1329,7 +1299,7 @@ def _add_edge_annotation(ref: WebView, row: asyncpg.Record) -> None:
     if row["valence"] is not None:
         ref["valence"] = row["valence"]
     if row["labels"]:
-        ref["labels"] = convert(row["labels"], list[str])
+        ref["labels"] = from_plain(row["labels"], list[str])
 
 
 class _AppState(Protocol):
@@ -1338,10 +1308,10 @@ class _AppState(Protocol):
     # Populated lazily by ``_session_embedder``; ``config`` is set by the app
     # lifespan (absent in the duck-typed test apps, hence the getattr reads).
     config: object
-    session_embedder: _QueryEmbedder | None
+    session_embedder: QueryEmbedder | None
     # A/B override embedders, cached per stored name by ``_override_embedder`` so
     # repeated ``?model=`` queries reuse one loaded model.
-    session_embedder_overrides: dict[str, _QueryEmbedder]
+    session_embedder_overrides: dict[str, QueryEmbedder]
 
 
 class _AppLike(Protocol):
@@ -1393,12 +1363,12 @@ def _isoformat(value: object) -> str:
 # ``embed_query``, so caching the instance is cheap and only the first semantic
 # search pays the model load. ``None`` (unset knob or no config) means the
 # semantic arm is unavailable and the route degrades.
-def _session_embedder(request: Request) -> _QueryEmbedder | None:
+def _session_embedder(request: Request) -> QueryEmbedder | None:
     """Return the process's default session-search embedder, or ``None``."""
     state = _state(request)
     cached = getattr(state, "session_embedder", ABSENT)
     if cached is not ABSENT:
-        return cast("_QueryEmbedder | None", cached)
+        return cast("QueryEmbedder | None", cached)
     # ``isinstance`` narrowing, not ``getattr(config, ...)``: the lifespan
     # stores a real ``Config`` (``api/app.py``), so a typed read means a field
     # rename breaks type-checking here instead of silently disabling the
@@ -1406,10 +1376,7 @@ def _session_embedder(request: Request) -> _QueryEmbedder | None:
     config: object = getattr(state, "config", None)
     name = config.session_embedder if isinstance(config, Config) else ""
     dim = config.session_embedder_dim if isinstance(config, Config) else None
-    embedder = cast(
-        "_QueryEmbedder | None",
-        registry.build_session_embedder(name, dim=dim),
-    )
+    embedder = registry.build_cached_session_embedder(name, dim=dim)
     state.session_embedder = embedder
     return embedder
 
@@ -1428,27 +1395,25 @@ def _override_embedder(
     request: Request,
     name: str,
     dim: int | None,
-) -> _QueryEmbedder:
-    """Return the cached A/B override embedder for ``(name, dim)``; 400 if unknown."""
+) -> QueryEmbedder | None:
+    """Return the locally cached A/B model; degrade if uncached, 400 if unknown."""
     state = _state(request)
-    cache = getattr(state, "session_embedder_overrides", ABSENT)
-    if cache is ABSENT:
-        cache = {}
-        state.session_embedder_overrides = cache
-    overrides = cast("dict[tuple[str, int | None], _QueryEmbedder]", cache)
-    key = (name, dim)
-    cached = overrides.get(key)
-    if cached is not None:
-        return cached
+    if not hasattr(state, "session_embedder_overrides"):
+        state.session_embedder_overrides = {}
+    overrides = state.session_embedder_overrides
     try:
-        embedder = registry.build_session_embedder(name, dim=dim)
+        key = (
+            name if registry.is_weightless(name) else registry.resolved_name(name, dim)
+        )
+        cached = overrides.get(key)
+        if cached is not None:
+            return cached
+        embedder = registry.build_cached_session_embedder(name, dim=dim)
     except ConfigError as err:
         raise HTTPException(status_code=400, detail=str(err)) from err
-    if embedder is None:
-        raise HTTPException(status_code=400, detail="model must be non-empty")
-    typed = cast("_QueryEmbedder", embedder)
-    overrides[key] = typed
-    return typed
+    if embedder is not None:
+        overrides[key] = embedder
+    return embedder
 
 
 def _search_embedder(
@@ -1457,8 +1422,10 @@ def _search_embedder(
     semantic: bool,
     model: str,
     dim: int | None,
-) -> _QueryEmbedder | None:
+) -> QueryEmbedder | None:
     """Select the query embedder: the ``model``/``dim`` override, else the default."""
+    if dim is not None and not model:
+        raise HTTPException(status_code=400, detail="dim requires model")
     if not semantic:
         return None
     if model:
@@ -1484,3 +1451,17 @@ async def _probe_frames(
         seq += 1
         due_sec += every_sec
     await asyncio.sleep(for_sec - (time.monotonic() - start))
+
+
+# Apps ``attach`` has already mounted; weak, so a discarded test app is freed.
+_ATTACHED: WeakSet[FastAPI] = WeakSet()
+
+
+def _get(app: FastAPI, path: str, endpoint: Callable[..., Awaitable[object]]) -> None:
+    """Mount a GET-only route that the OpenAPI schema leaves out."""
+    app.get(path, include_in_schema=False)(endpoint)
+
+
+def _app_files(app_dir: Path) -> StaticFiles:
+    """Serve ``app_dir``; ``check_dir=False`` lets the server start before a build."""
+    return StaticFiles(directory=app_dir, check_dir=False)
