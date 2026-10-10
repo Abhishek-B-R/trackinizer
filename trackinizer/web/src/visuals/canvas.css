@@ -1,0 +1,152 @@
+.visual-canvas { position: relative; display: flex; flex: 1; min-height: 0; flex-direction: column; }
+.visual-toolbar { display: flex; align-items: center; height: 38px; min-height: 38px; padding: 0 12px 0 18px; border-bottom: 1px solid var(--line); }
+.visual-toolbar-label { color: var(--muted); font-size: 12px; }
+.visual-toolbar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.visual-toolbar-actions .btn:disabled { opacity: .5; }
+.visual-write-error { padding: 7px 16px; border-bottom: 1px solid var(--line); color: var(--error-text); font-size: 12px; }
+.visual-configure { position: absolute; z-index: 35; top: 42px; right: 12px; width: min(350px, calc(100vw - 24px)); max-height: calc(100vh - 54px); overflow: auto; padding: 14px; background: var(--surface-overlay); border: 1px solid var(--line-strong); border-radius: var(--panel-radius); box-shadow: 0 16px 48px #0009; }
+.visual-configure-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.visual-configure-head h2 { font-size: 13px; font-weight: 600; }
+.visual-option { display: flex; align-items: flex-start; gap: 10px; padding: 10px 6px; border-top: 1px solid var(--line); cursor: pointer; }
+.visual-option input { margin-top: 3px; accent-color: var(--accent); }
+.visual-option span { display: flex; flex-direction: column; gap: 2px; }
+.visual-option strong { font-size: 13px; font-weight: 600; }
+.visual-option small { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.visual-artifact-select { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; }
+.visual-artifact-select input { flex: 1; min-width: 0; padding: 7px 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface-raised); color: var(--text); font: inherit; text-align: center; }
+.visual-artifact-select p { flex-basis: 100%; }
+.visual-presets { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.visual-presets h3 { margin-bottom: 9px; font-size: 13px; font-weight: 600; }
+.visual-presets form, .visual-presets form label { display: flex; flex-direction: column; gap: 6px; }
+.visual-presets form { gap: 9px; }
+.visual-presets form label { color: var(--muted); font-size: 12px; }
+.visual-presets form label span { color: var(--muted); }
+.visual-presets input, .visual-presets textarea { width: 100%; padding: 7px 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface-raised); color: var(--text); font: inherit; }
+.visual-presets textarea { resize: vertical; }
+.visual-presets form .btn { align-self: flex-start; }
+.visual-presets ul { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding: 0; list-style: none; }
+.visual-presets li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.visual-presets li small { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.visual-presets [role="alert"], .visual-preset-status { margin-top: 8px; color: var(--error-text); font-size: 12px; }
+.visual-presets .visual-preset-status { color: var(--accent-hover); }
+.visual-stage { display: flex; flex: 1; min-height: 0; position: relative; overflow: auto; }
+.visual-tile { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
+.visual-tile-browse { overflow: hidden; }
+.visual-tile-floating { position: absolute; right: 16px; width: min(390px, calc(100% - 32px)); height: min(480px, calc(100% - 100px)); min-width: min(280px, calc(100vw - 32px)); min-height: min(220px, calc(100vh - 80px)); max-width: calc(100vw - 32px); max-height: calc(100vh - 80px); border: 1px solid var(--line-strong); border-radius: var(--panel-radius); box-shadow: 0 16px 48px #0008; overflow: hidden; }
+.visual-tile-focused { outline: 1px solid var(--accent); outline-offset: -1px; }
+.visual-tile-toolbar { display: flex; align-items: center; gap: 6px; min-height: 32px; padding: 2px 8px; border-bottom: 1px solid var(--line); font-size: 11px; color: var(--muted); }
+.visual-tile-toolbar span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.visual-tile-toolbar .visual-tile-drag-handle { min-width: 24px; padding: 1px 4px; cursor: grab; touch-action: none; font-size: 15px; line-height: 1; }
+.visual-tile-toolbar .visual-tile-drag-handle:active { cursor: grabbing; }
+.visual-tile-toolbar button, .visual-tile-toolbar select { padding: 2px 5px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--surface-raised); font-size: 11px; color: var(--ink-muted); }
+.visual-tile-toolbar button:disabled, .visual-tile-toolbar select:disabled { opacity: .5; }
+.visual-mobile-tab-toggle { display: none; }
+.visual-loading, .visual-unsupported { padding: 20px; color: var(--muted); }
+.chat-panel .chat-record-context { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 8px 12px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: 12px; }
+.chat-record-context a { color: var(--accent-hover); overflow-wrap: anywhere; }
+.chat-record-context .btn { margin-left: auto; }
+.chat-panel { display: flex; flex: 1; flex-direction: column; min-height: 0; min-width: 0; }
+.chat-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.chat-partner { display: flex; align-items: baseline; gap: 8px; min-width: 0; margin-right: auto; }
+.chat-partner strong { font-size: 14px; font-weight: 600; }
+.chat-partner-note { color: var(--muted); font-size: 12px; }
+.chat-head-actions { display: flex; align-items: center; gap: 4px; }
+.chat-head-actions .btn:disabled { opacity: .5; }
+.chat-menu { display: flex; flex-direction: column; max-height: 260px; overflow: auto; margin: 8px 12px 0; padding: 4px; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface-raised); }
+.chat-menu-option { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; width: 100%; padding: 8px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text); text-align: left; }
+.chat-menu-option:hover, .chat-menu-option:focus-visible { background: var(--surface-overlay); }
+.chat-menu-option[aria-current="true"] { box-shadow: inset 2px 0 0 var(--accent); }
+.chat-menu-option:disabled { opacity: .5; }
+.chat-menu-option span { color: var(--muted); font-size: 12px; }
+.chat-error { margin: 8px 12px 0; color: var(--error-text); font-size: 12px; }
+.chat-note { color: var(--muted); font-size: 12px; }
+.chat-off { display: flex; flex-direction: column; gap: 6px; }
+.chat-off .chat-note { margin: 0; }
+.chat-off .chat-note a { color: var(--accent-hover); }
+.chat-off .helper-commands { margin: 0; }
+.chat-lines { display: flex; flex: 1; flex-direction: column; gap: 10px; min-height: 0; overflow: auto; padding: 12px; }
+.chat-line { max-width: 88%; padding: 8px 11px; border: 1px solid var(--line); border-radius: 10px; font-size: 13px; overflow-wrap: anywhere; }
+.chat-line-user { align-self: flex-end; background: var(--surface-overlay); }
+.chat-line-assistant { align-self: flex-start; background: var(--surface-raised); }
+.chat-line-pending { opacity: .7; }
+.chat-line-other { align-self: flex-start; }
+.chat-line-author { display: block; margin-bottom: 3px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.chat-notice { margin: 0; padding: 6px 12px 0; color: var(--muted); font-size: 11px; }
+.chat-line-body { margin: 0; }
+/* Seen on hover or focus, and always where there is no hover to find it by. */
+.chat-line-fork { display: block; margin-top: 4px; padding: 0; font-size: 11px; opacity: 0; }
+.chat-line:hover .chat-line-fork, .chat-line:focus-within .chat-line-fork { opacity: 1; }
+@media (hover: none) { .chat-line-fork { opacity: 1; } }
+.chat-fork-banner { margin: 0; padding: 6px 12px 0; color: var(--muted); font-size: 12px; }
+.chat-line p.chat-line-body { white-space: pre-wrap; }
+.chat-status { align-self: flex-start; color: var(--muted); font-size: 12px; font-style: italic; }
+.chat-panel .composer { padding: 8px 12px 12px; border-top: 1px solid var(--line); }
+/* The page and the other main visuals share a strip: each has 240 px at least, and a strip with more than fit scrolls inside itself. Visuals docked at a side stand in one column there, left or right of it, up to 360 px or 30% wide, so Chat's header and box stay on the screen however many visuals there are. */
+.visual-main-strip { display: flex; flex: 1 1 0; min-width: 0; min-height: 0; overflow-x: auto; }
+.visual-main-strip > .visual-tile { flex: var(--tile-share, 1) 0 var(--tile-basis, 240px); min-width: 240px; }
+/* The page's lists need 300 px for their own toolbar. */
+.visual-main-strip > .visual-tile-browse { flex-basis: var(--tile-basis, 300px); min-width: 300px; }
+.visual-main-strip > .visual-tile + .visual-tile, .visual-main-strip > .visual-divider + .visual-tile { border-left: 1px solid var(--line); }
+.visual-side-column { display: flex; flex: 0 1 var(--column-width, min(360px, 30%)); flex-direction: column; min-width: 260px; max-width: 70%; min-height: 0; border-left: 1px solid var(--line); overflow-y: auto; }
+.visual-side-column > .visual-tile { flex: var(--tile-share, 1) 1 0; min-height: 280px; }
+.visual-side-column > .visual-tile + .visual-tile, .visual-side-column > .visual-divider + .visual-tile { border-top: 1px solid var(--line); }
+.visual-side-column-left { border-left: 0; border-right: 1px solid var(--line); }
+@media (max-width: 900px) {
+  .visual-stage { flex-direction: column; }
+  /* A phone has no left: both columns come under the page. */
+  .visual-side-column-left { order: 1; border-right: 0; }
+  .visual-main-strip { flex: 0 0 auto; flex-direction: column; overflow-x: visible; }
+  .visual-main-strip > .visual-tile { flex: 0 0 min(400px, 48vh); min-width: 0; width: 100%; }
+  .visual-side-column { flex: 0 0 auto; min-width: 0; width: 100%; border-left: 0; border-top: 1px solid var(--line); overflow-y: visible; }
+  .visual-side-column > .visual-tile { flex: 0 0 min(400px, 48vh); min-height: 0; }
+  .visual-main-strip > .visual-tile + .visual-tile, .visual-main-strip > .visual-divider + .visual-tile { border-left: 0; border-top: 1px solid var(--line); }
+}
+@media (max-width: 900px) { .visual-tile-floating { position: relative; top: auto !important; right: auto; width: 100%; height: 34px; border-radius: 0; box-shadow: none; flex: 0 0 auto; } .visual-tile-floating.visual-tile-mobile-expanded { height: min(400px, 48vh); } .visual-mobile-tab-toggle { display: inline-block; } }
+/* A tile's whole top bar drags it (a press without movement focuses it); the controls on the bar keep their own cursors. */
+.visual-tile-toolbar-draggable { cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
+.visual-tile-toolbar-draggable:active { cursor: grabbing; }
+.visual-tile-toolbar-draggable button, .visual-tile-toolbar-draggable select { cursor: pointer; }
+.visual-tile-toolbar .visual-tile-fold { min-width: 22px; line-height: 1; }
+/* A folded tile is its top bar alone; its contents stay mounted, so Chat keeps its conversation and its stream. */
+@media (min-width: 901px) {
+  .visual-tile-floating.visual-tile-collapsed { height: auto !important; min-height: 0; }
+  .visual-tile-collapsed > :not(.visual-tile-toolbar) { display: none; }
+  .visual-tile-collapsed > .visual-tile-toolbar { border-bottom: 0; }
+}
+@media (max-width: 900px) {
+  .visual-tile-toolbar .visual-tile-fold { display: none; }
+  .visual-tile-toolbar-draggable { cursor: auto; touch-action: auto; user-select: auto; -webkit-user-select: auto; }
+  .visual-column-edge, .visual-divider, .visual-window-edge { display: none; }
+  /* Chat standing aside is a header in its strip's flow, as tall as a floating tile there and not as its strip's tiles. */
+  .visual-main-strip > .visual-tile-floating, .visual-side-column > .visual-tile-floating { flex: 0 0 auto; }
+}
+/* Chat standing aside floats from inside its strip, over the stage. Folded, its bar is filled, so it is found at a glance (a phone's header is folded until Expand opens it); a column that holds nothing else in the flow takes no room. */
+.visual-tile-aside.visual-tile-collapsed:not(.visual-tile-mobile-expanded) > .visual-tile-toolbar { background: var(--accent); color: #fff; }
+@media (min-width: 901px) {
+  .visual-side-column-vacant { flex: 0 0 0; min-width: 0; border: 0; overflow: visible; }
+}
+/* What a drag draws over the stage. The snap preview marks where the tile would dock: the column at a side, or the whole stage at the top edge, where it joins the page's strip. A docked tile stays in its strip while it is dragged, which would clip it, so it dims and a card follows the pointer in its place. */
+.visual-snap { position: absolute; z-index: 40; display: none; border: 2px solid var(--accent); border-radius: var(--panel-radius); background: var(--accent-soft); pointer-events: none; }
+.visual-snap[data-zone="left"] { display: block; top: 6px; bottom: 6px; left: 6px; width: min(360px, 30%); }
+.visual-snap[data-zone="side"] { display: block; top: 6px; bottom: 6px; right: 6px; width: min(360px, 30%); }
+.visual-snap[data-zone="main"] { display: block; inset: 6px; }
+.visual-drag-ghost { position: absolute; z-index: 45; top: 0; left: 0; display: none; width: 220px; padding: 7px 12px; overflow: hidden; border: 1px solid var(--accent); border-radius: var(--panel-radius); background: var(--surface-overlay); box-shadow: 0 16px 48px #0008; color: var(--text); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
+.visual-tile-lifted { opacity: .45; }
+/* The edge between a column and the page: 6 px to grab, 3 px over each of them, so it takes no room of its own. */
+.visual-column-edge { position: relative; z-index: 5; flex: 0 0 6px; margin: 0 -3px; cursor: col-resize; touch-action: none; }
+.visual-column-edge:hover, .visual-column-edge:focus-visible, .visual-column-edge:active, .visual-divider:hover, .visual-divider:active { background: var(--accent); outline: 0; }
+/* The divider between two docked tiles, across the main strip or down a column: 6 px to grab, 3 px over each neighbour. The two trade room; a tile's share of its strip is its flex weight, an even share being 1. */
+.visual-divider { position: relative; z-index: 5; flex: 0 0 6px; touch-action: none; }
+.visual-divider-x { margin: 0 -3px; cursor: col-resize; }
+.visual-divider-y { margin: -3px 0; cursor: row-resize; }
+/* A floating window resizes by any edge or corner, as a desktop's does: strips 6 px thick along its sides and 12 px squares at its corners, over its content. */
+.visual-window-edge { position: absolute; z-index: 3; touch-action: none; }
+.visual-window-edge-n, .visual-window-edge-s { right: 12px; left: 12px; height: 6px; cursor: ns-resize; }
+.visual-window-edge-e, .visual-window-edge-w { top: 12px; bottom: 12px; width: 6px; cursor: ew-resize; }
+.visual-window-edge-ne, .visual-window-edge-se, .visual-window-edge-sw, .visual-window-edge-nw { width: 12px; height: 12px; }
+.visual-window-edge-n, .visual-window-edge-ne, .visual-window-edge-nw { top: 0; }
+.visual-window-edge-s, .visual-window-edge-se, .visual-window-edge-sw { bottom: 0; }
+.visual-window-edge-e, .visual-window-edge-ne, .visual-window-edge-se { right: 0; }
+.visual-window-edge-w, .visual-window-edge-nw, .visual-window-edge-sw { left: 0; }
+.visual-window-edge-ne, .visual-window-edge-sw { cursor: nesw-resize; }
+.visual-window-edge-nw, .visual-window-edge-se { cursor: nwse-resize; }

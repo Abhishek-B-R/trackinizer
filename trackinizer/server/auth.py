@@ -42,6 +42,10 @@ from fastapi import Depends, HTTPException, Request
 from trackinizer.lib.userdirs import data_dir
 from trackinizer.server.notify import tx
 from trackinizer.server.session import read_session_cookie
+from trackinizer.wire.wire_machine_host import (
+    CREDENTIAL_PREFIX,
+    ENROLLMENT_PREFIX,
+)
 
 
 if TYPE_CHECKING:
@@ -67,6 +71,7 @@ __all__ = [
     "create_api_key",
     "current_user",
     "effective_role",
+    "extract_bearer",
     "generate_token",
     "hash_secret",
     "list_api_keys",
@@ -269,6 +274,10 @@ def generate_token() -> tuple[str, str]:
 
     """
     secret = "trax_" + secrets.token_urlsafe(_TOKEN_BYTES)
+    # A machine credential starts ``trax_machine_``; an API key that did would be
+    # mistaken for one by ``current_user``'s early 401. Odds 2^-48 per mint.
+    while secret.startswith(CREDENTIAL_PREFIX):
+        secret = "trax_" + secrets.token_urlsafe(_TOKEN_BYTES)
     return secret, secret[:TOKEN_PREFIX_LEN]
 
 
@@ -307,7 +316,11 @@ async def current_user(request: Request) -> AuthIdentity:
         )
     # The Store carries the per-process ``last_used_at`` throttle.
     store = state.store
-    bearer = _try_extract_bearer(request)
+    bearer = extract_bearer(request)
+    # A machine credential or enrollment token is not a user credential: refuse it
+    # before any lookup, with the answer an unknown bearer gets.
+    if bearer is not None and bearer.startswith((CREDENTIAL_PREFIX, ENROLLMENT_PREFIX)):
+        raise HTTPException(status_code=401, detail="invalid bearer token")
     if bearer is not None:
         identity = await _resolve_identity(
             store,
@@ -323,6 +336,30 @@ async def current_user(request: Request) -> AuthIdentity:
         if identity is not None:
             return identity
     raise HTTPException(status_code=401, detail="not authenticated")
+
+
+def extract_bearer(request: Request) -> str | None:
+    """Return the bearer secret from the Authorization header, or ``None``.
+
+    A non-Bearer scheme yields ``None`` so :func:`current_user` can try the session
+    path. An offered blank Bearer credential returns ``""`` and 401s downstream;
+    only "no bearer offered" is silent. Authentication schemes are case-insensitive
+    under HTTP semantics.
+
+    Args:
+      request: FastAPI request.
+
+    Returns:
+      secret: The credential after ``Bearer``, or ``None`` when none was offered.
+
+    """
+    header = request.headers.get("Authorization", "")
+    scheme, separator, credentials = header.partition(" ")
+    if scheme.casefold() != "bearer":
+        return None
+    if not separator:
+        return ""
+    return credentials.strip()
 
 
 def require_role(min_role: Role) -> Callable[..., Awaitable[AuthIdentity]]:
@@ -528,8 +565,8 @@ async def revoke_api_key(conn: Conn, *, key_id: uuid.UUID, user_id: uuid.UUID) -
 async def allowlist_match(conn: Conn, *, email: str) -> Role | None:
     """Return the role the allowlist grants ``email``, or ``None`` to deny.
 
-    The allowlist holds literal emails (``user@rekursiv.ai``) and domain
-    wildcards (``*@rekursiv.ai``). A literal row wins when both would match,
+    The allowlist holds literal emails (``user@example.com``) and domain
+    wildcards (``*@example.com``). A literal row wins when both would match,
     so an individual override beats the domain default. The wildcard lookup
     runs only on a literal miss, keeping the common case one indexed probe.
     Matching is case-insensitive.
@@ -786,20 +823,6 @@ def _publish_bootstrap_token(token_path: Path) -> None:
     )
 
 
-# A non-Bearer scheme yields ``None`` so :func:`current_user` can try the session path.
-# An offered blank Bearer credential returns ``""`` and 401s downstream; only "no bearer
-# offered" is silent. Authentication schemes are case-insensitive under HTTP semantics.
-def _try_extract_bearer(request: Request) -> str | None:
-    """Return the bearer secret from the Authorization header, or ``None``."""
-    header = request.headers.get("Authorization", "")
-    scheme, separator, credentials = header.partition(" ")
-    if scheme.casefold() != "bearer":
-        return None
-    if not separator:
-        return ""
-    return credentials.strip()
-
-
 # The session path is off when ``app.state.config`` is absent (tests that skip the
 # lifespan) or ``Config.session_secret`` is unset (OAuth not configured); bearer auth is
 # unaffected either way.
@@ -1017,7 +1040,7 @@ def _b64decode(encoded: str) -> bytes:
 
 class _ConfigLike(Protocol):
     auth_disabled: bool
-    session_secret: str | None
+    session_secret: str
     session_max_age_seconds: int
 
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Final, cast
 
 from trackinizer.lib.absent import ABSENT, Absent
-from trackinizer.lib.custom_json import ListCodec
+from trackinizer.lib.codec import from_plain
 from trackinizer.server.notify import notify_after_commit, tx
 from trackinizer.server.primitives import (
     infer_produced_endpoints,
@@ -601,7 +601,7 @@ class _EdgeMixin(_CascadeAuditMixin):
             )
         raw_labels = row["labels"]
         old_labels = (
-            None if raw_labels is None else tuple(ListCodec.coerce(raw_labels, str))
+            None if raw_labels is None else tuple(from_plain(raw_labels, list[str]))
         )
         new_note: str | None
         if isinstance(note, Absent):
@@ -911,7 +911,7 @@ class _EdgeMixin(_CascadeAuditMixin):
                 )
             labels = row["labels"]
             edge_labels = (
-                None if labels is None else tuple(ListCodec.coerce(labels, str))
+                None if labels is None else tuple(from_plain(labels, list[str]))
             )
             # Capture every edge touching ``from_id`` before the DELETE.
             # The cascade re-walks ``edges`` live, so deleting first would

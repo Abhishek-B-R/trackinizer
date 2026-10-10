@@ -9,7 +9,7 @@ from uuid import UUID
 
 import pytest
 
-from trackinizer.lib.custom_json import DictCodec, loads
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.server.api.conftest import (
     clear_identity_override,
     install_identity,
@@ -97,7 +97,9 @@ def test_the_header_comes_first_then_one_line_per_row(
 
     assert r.status_code == 200
     assert r.headers["content-type"].startswith(EXPORT_MEDIA_TYPE)
-    header, *rows = [DictCodec.coerce(loads(line)) for line in r.text.splitlines()]
+    header, *rows = [
+        from_plain(loads(line), dict[str, object]) for line in r.text.splitlines()
+    ]
     assert header == {
         "format": EXPORT_FORMAT,
         "version": EXPORT_VERSION,
@@ -109,7 +111,10 @@ def test_the_header_comes_first_then_one_line_per_row(
 def test_uuids_and_timestamps_become_strings(export_client: TestClient) -> None:
     r = export_client.get(EXPORT_API_PATH)
 
-    inquiry = DictCodec.coerce(DictCodec.coerce(loads(r.text.splitlines()[1]))["row"])
+    inquiry = from_plain(
+        from_plain(loads(r.text.splitlines()[1]), dict[str, object])["row"],
+        dict[str, object],
+    )
     assert inquiry == {
         "id": str(_ISSUE),
         "title": "Broad question",

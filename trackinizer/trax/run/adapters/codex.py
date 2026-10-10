@@ -21,12 +21,14 @@ import os
 import re
 
 from trackinizer.lib.agent.sessions import codex
-from trackinizer.lib.custom_json import StrCodec
-from trackinizer.trax.run.adapters.tail import Tail
+from trackinizer.lib.agent.sessions.tail import Tail
+from trackinizer.lib.codec import from_plain
 
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    from trackinizer.types.streams import TraxRecord
 
 
 _ROLLOUT_NAME: Final = re.compile(
@@ -47,14 +49,17 @@ class CodexAdapter:
     name: str = "codex"
     cli_binary: str = "codex"
     whole_file: bool = False
+    parent_session_env: frozenset[str] = frozenset[str]()
 
     @property
     def _sessions_dir(self) -> Path:
         # Resolve per call, not at import (see ClaudeAdapter). ``$CODEX_HOME``
         # is where codex itself keeps its config root -- hermetic launchers
         # point it at a throwaway dir -- so honor it, else ``~/.codex``.
-        home = os.environ.get("CODEX_HOME")
-        return (Path(home) if home else Path.home() / ".codex") / "sessions"  # noqa: TID251 -- vendor fixed path, not ours (AGENTS.md rule 3)  # house-ignore[xdg-literal] -- Vendor CLI's fixed home path, not ours (AGENTS.md rule 3).
+        home = os.environ.get("CODEX_HOME", "")
+        if home:
+            return Path(home) / "sessions"
+        return Path.home() / ".codex" / "sessions"  # noqa: TID251 -- vendor fixed path, not ours (AGENTS.md rule 3)  # house-ignore[xdg-literal] -- Vendor CLI's fixed home path, not ours (AGENTS.md rule 3).
 
     def session_dirs(self) -> Iterable[Path]:
         """Return the directories this CLI writes sessions under."""
@@ -103,8 +108,8 @@ class CodexAdapter:
         # Typeshed types a match group ``str | Any`` -- a group may be optional
         # in general. This one is not: it is unconditional in the pattern, so
         # the match cannot succeed without it.
-        return StrCodec.coerce(found["session_id"])
+        return from_plain(found["session_id"], str)
 
-    def reader(self) -> Tail:
+    def reader(self) -> Tail[TraxRecord]:
         """Return a fresh IR reader for one codex rollout file."""
         return Tail(codex.normalize)

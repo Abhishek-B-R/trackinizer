@@ -31,6 +31,7 @@ import logging
 import threading
 import time
 
+from trackinizer.server.auth import Role
 from trackinizer.wire.wire_sessions import WorkspaceMessageContext
 
 
@@ -45,6 +46,10 @@ class Inbound:
 
     source: str | None = None
 
+    source_role: Role | None = None
+    """The sender's role as the server saw it, beside the attested ``source``; ``None``
+    for a message the server itself generates."""
+
     room: str | None = None
     """The room a routed send was scoped to; threads into the ``[room]
     sender:`` injection prefix. ``None`` for a direct (session-id) enqueue."""
@@ -52,8 +57,8 @@ class Inbound:
     context: WorkspaceMessageContext | None = None
 
 
-class InboundReplayConflictError(Exception):
-    """An idempotency key was reused for a different scoped message."""
+class IdempotencyReuseError(Exception):
+    """An idempotency key that sent one message was used to send another."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -61,8 +66,8 @@ class _SendReceipt:
     """Original send result retained for retry-safe responses."""
 
     delivered: tuple[UUID, ...]
-    fingerprint: str | None = None
-    queued: int | None = None
+    fingerprint: str = ""
+    source: str | None = None
 
 
 @dataclass(slots=True, kw_only=True)
@@ -72,6 +77,9 @@ class _Waiter:
     loop: asyncio.AbstractEventLoop
 
     event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    released: bool = False
+    """Set when its session's lease is revoked: the hold ends taking nothing."""
 
 
 @dataclass(slots=True, kw_only=True)
@@ -159,15 +167,23 @@ class InboundQueue:
             }
             return list(self._poller_expires)
 
+    # A lease is revoked as its session ends, and that session's poller is then parked
+    # in a held request. Left parked, the hold keeps the exiting run -- which ends its
+    # session before it stops its poller -- waiting out the whole hold.
     def forget_poller(self, session_id: UUID) -> None:
-        """Revoke a lease when a session ends cleanly."""
+        """Revoke a session's lease and end every hold parked on it."""
         with self._lock:
             self._poller_expires.pop(session_id, None)
+            for waiter in self._waiters.get(session_id, ()):
+                waiter.released = True
+            self._wake(session_id)
 
     def send_once(
         self,
         key: UUID | None,
         targets: list[tuple[UUID, Inbound]],
+        *,
+        fingerprint: str = "",
     ) -> list[UUID]:
         """Atomically dedup, enqueue, and record one idempotent send.
 
@@ -188,19 +204,26 @@ class InboundQueue:
         Args:
           key: Idempotency key (UUID or None).
           targets: (session_id, message) pairs to enqueue.
+          fingerprint: Names what the send says. A key that is replayed with
+            another fingerprint is a different send under a used key, which is
+            refused; callers that name none replay whatever the body.
 
         Returns:
           delivered: the session ids enqueued to (or the original receipt on
             a key replay).
+
+        Raises:
+          IdempotencyReuseError: ``key`` already sent a message with another
+            fingerprint.
 
         """
         with self._lock:
             if key is not None:
                 seen = self._seen_sends.get(key)
                 if seen is not None:
-                    if seen.fingerprint is not None:
-                        raise InboundReplayConflictError(
-                            "Idempotency-Key already used for a workspace message",
+                    if seen.fingerprint != fingerprint:
+                        raise IdempotencyReuseError(
+                            "Idempotency-Key already used for another message",
                         )
                     return list(seen.delivered)
             delivered: list[UUID] = []
@@ -210,56 +233,30 @@ class InboundQueue:
             if key is not None and delivered:
                 self._remember(
                     key,
-                    _SendReceipt(delivered=tuple(delivered)),
+                    receipt=_SendReceipt(
+                        delivered=tuple(delivered),
+                        fingerprint=fingerprint,
+                        source=targets[0][1].source,
+                    ),
                 )
             return delivered
 
-    def send_scoped_once(
-        self,
-        key: UUID,
-        session_id: UUID,
-        message: Inbound,
-        *,
-        fingerprint: str,
-    ) -> int:
-        """Queue once and replay the original depth for one scoped message.
+    def sender_of(self, key: UUID) -> str | None:
+        """Return who sent the message that first used ``key``, while it is remembered.
 
         Args:
-          key: Idempotency key.
-          session_id: Paired live session.
-          message: Text and server-derived canvas context.
-          fingerprint: Hash of the attested request and target.
+          key: An idempotency key.
 
         Returns:
-          queued: Pending depth when the original send completed.
-
-        Raises:
-          InboundReplayConflictError: Key already names another send.
+          source: The attested sender of the send ``key`` delivered; ``None`` for a
+            key never used, forgotten, or used by a message without a sender.
 
         """
         with self._lock:
             seen = self._seen_sends.get(key)
-            if seen is not None:
-                if seen.fingerprint != fingerprint:
-                    raise InboundReplayConflictError(
-                        "Idempotency-Key already used for another message",
-                    )
-                if seen.queued is None:
-                    raise RuntimeError("Scoped send receipt has no queue depth")
-                return seen.queued
-            self._append_capped(session_id, message)
-            queued = len(self._queues[session_id])
-            self._remember(
-                key,
-                _SendReceipt(
-                    delivered=(session_id,),
-                    fingerprint=fingerprint,
-                    queued=queued,
-                ),
-            )
-            return queued
+            return None if seen is None else seen.source
 
-    def _remember(self, key: UUID, receipt: _SendReceipt) -> None:
+    def _remember(self, key: UUID, *, receipt: _SendReceipt) -> None:
         """Retain a bounded receipt under the caller's queue lock."""
         self._seen_sends[key] = receipt
         while len(self._seen_sends) > self.max_seen_keys:
@@ -310,8 +307,7 @@ class InboundQueue:
 
         """
         with self._lock:
-            queue = self._queues.pop(session_id, None)
-            return list(queue) if queue else []
+            return list(self._queues.pop(session_id, ()))
 
     async def await_messages(
         self,
@@ -328,14 +324,15 @@ class InboundQueue:
 
         Returns empty at the timeout rather than holding forever -- a proxy
         will cut an idle connection anyway, and the caller needs a turn to
-        notice it should stop.
+        notice it should stop. Returns empty at once when the session's lease
+        is revoked (:meth:`forget_poller`).
 
         Args:
           session_id: Session to drain.
           timeout_sec: How long to wait when nothing is pending.
 
         Returns:
-          messages: Everything queued, oldest first; empty on timeout.
+          messages: Everything queued, oldest first; empty on timeout or release.
 
         """
         waiter = _Waiter(loop=asyncio.get_running_loop())
@@ -352,6 +349,10 @@ class InboundQueue:
                 return []
         finally:
             self._release(session_id, waiter)
+        # A released poller is leaving: a message drained for it now would be typed
+        # into a CLI that has exited, so it stays queued instead.
+        if waiter.released:
+            return []
         return self.drain(session_id)
 
     def _release(self, session_id: UUID, waiter: _Waiter) -> None:
@@ -387,5 +388,16 @@ class InboundQueue:
 
         """
         with self._lock:
-            queue = self._queues.get(session_id)
-            return len(queue) if queue else 0
+            return len(self._queues.get(session_id, ()))
+
+    def is_full(self, session_id: UUID) -> bool:
+        """Say whether one more message would evict the oldest waiting one.
+
+        Args:
+          session_id: Session id.
+
+        Returns:
+          full: Whether the session's queue is at its cap.
+
+        """
+        return self.pending(session_id) >= self.max_per_session

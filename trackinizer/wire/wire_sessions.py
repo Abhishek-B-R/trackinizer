@@ -8,8 +8,9 @@ path templates; the server registers handlers against them and the client
 builds requests from them, so neither can drift.
 
 It also carries the cross-session console feed (:class:`FeedEvent`,
-:class:`FeedCursor`) and the inbound/routed messaging bodies -- everything
-about a session that is not one of its records.
+:class:`FeedCursor`), its counts (:class:`FeedFacetsResponse`,
+:class:`FeedHistogramResponse`) and the inbound/routed messaging bodies --
+everything about a session that is not one of its records.
 
 This package is part of the publishable client distribution, so it must
 not import ``server`` / ``trax`` / fastapi (see ``import_purity_test``).
@@ -24,7 +25,8 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from trackinizer.lib.custom_json import JSON
+from trackinizer.wire.json_types import JSON, UtcDatetime
+from trackinizer.wire.wire_science_chat import ChatForkAt
 
 
 _MAX_MESSAGE_CHARS: Final = 16_384
@@ -47,6 +49,8 @@ def _reject_blank(value: str | None) -> str | None:
 
 
 __all__ = [
+    "FEED_FACETS_PATH",
+    "FEED_HISTOGRAM_PATH",
     "FEED_PATH",
     "SEND_MESSAGE_PATH",
     "SESSION_API_PATHS",
@@ -57,9 +61,15 @@ __all__ = [
     "SESSION_START_PATH",
     "VERSION_PATH",
     "DrainInboundResponse",
+    "FeedActorFacet",
+    "FeedBucket",
     "FeedCursor",
     "FeedEvent",
+    "FeedFacetsResponse",
+    "FeedHistogramResponse",
+    "FeedKindFacet",
     "FeedResponse",
+    "FeedRoomFacet",
     "InboundDrainItem",
     "InboundEnqueueRequest",
     "InboundEnqueueResponse",
@@ -92,7 +102,7 @@ class SessionStart(BaseModel):
     ``end`` if the CLI only reveals it later."""
 
     title: str | None = None
-    started: datetime | None = None
+    started: UtcDatetime | None = None
     actor: str | None = None
     account: str | None = None
     """The active user the session row is attributed to. ``None`` defaults to
@@ -234,6 +244,80 @@ class FeedResponse(BaseModel):
     next_after: FeedCursor | None = None
 
 
+class FeedActorFacet(BaseModel):
+    """One session's share of a feed window, as the console's agent list shows it."""
+
+    actor: str
+    """The session's routing name (``owner``), as :class:`FeedEvent` carries it."""
+
+    session_id: uuid.UUID
+    cli: str | None
+    rooms: list[str]
+    count: int = Field(ge=0)
+    """Records in the window."""
+
+    conversation: int = Field(ge=0)
+    """Of ``count``, the records that are conversation: what a person or agent
+    said, not tool calls, thinking or bookkeeping."""
+
+    last: datetime
+    """``created`` of the session's newest record in the window."""
+
+    ended: datetime | None
+    """When the session ended; ``None`` while it is live."""
+
+
+class FeedRoomFacet(BaseModel):
+    """One room's share of a feed window."""
+
+    room: str
+    count: int = Field(ge=0)
+    """Records in the window from sessions in the room."""
+
+    actors: list[str]
+    """The routing names of those sessions."""
+
+
+class FeedKindFacet(BaseModel):
+    """One record kind's share of a feed window."""
+
+    kind: str
+    count: int = Field(ge=0)
+
+
+class FeedFacetsResponse(BaseModel):
+    """What a feed window holds, by session, room and record kind.
+
+    ``actors`` is newest ``last`` first; ``rooms`` and ``kinds`` are largest
+    ``count`` first.
+    """
+
+    actors: list[FeedActorFacet]
+    rooms: list[FeedRoomFacet]
+    kinds: list[FeedKindFacet]
+
+
+class FeedBucket(BaseModel):
+    """Records written in ``[start, start + bucket_seconds)``."""
+
+    start: datetime
+    count: int = Field(ge=0)
+
+
+class FeedHistogramResponse(BaseModel):
+    """Feed records per time bucket, every bucket from ``start`` to ``end``.
+
+    Buckets are ``bucket_seconds`` wide and aligned to the Unix epoch, so the
+    first starts at or before the window's start and the last ends after its
+    end; buckets with no records are listed with a ``count`` of 0.
+    """
+
+    start: datetime
+    end: datetime
+    bucket_seconds: int = Field(ge=1)
+    counts: list[FeedBucket]
+
+
 class InboundEnqueueRequest(BaseModel):
     """A message a client asks trackinizer to inject into a live session.
 
@@ -325,6 +409,17 @@ class WorkspaceVisibleVisual(BaseModel):
 
     id: uuid.UUID
     type: str
+    record: WorkspaceRecordContext | None = None
+    """The record the visual shows, when it shows one that exists."""
+
+
+class WorkspacePage(BaseModel):
+    """A page the sender was on, with the record it shows when it names one."""
+
+    route: str
+    """The `#/...` address."""
+
+    record: WorkspaceRecordContext | None = None
 
 
 class WorkspaceMessageContext(BaseModel):
@@ -339,6 +434,18 @@ class WorkspaceMessageContext(BaseModel):
     visible_visuals: list[WorkspaceVisibleVisual]
     agent_instructions: str | None = Field(default=None, max_length=8_192)
     continuation_record_id: uuid.UUID | None = None
+    conversation_id: uuid.UUID | None = None
+    """The Chat conversation the message belongs to; an assistant answers there."""
+
+    fork: ChatForkAt | None = None
+    """Set on the first line of a fork: the line of another conversation's session it
+    starts from. The assistant opens the conversation with the lines up to it."""
+
+    page: WorkspacePage | None = None
+    """The page the sender is on as they send: what "this" means to them."""
+
+    trail: list[WorkspacePage] = Field(default_factory=list)
+    """The pages they came through before it, oldest first."""
 
 
 class InboundDrainItem(BaseModel):
@@ -353,6 +460,11 @@ class InboundDrainItem(BaseModel):
 
     text: str = Field(min_length=1, max_length=_MAX_MESSAGE_CHARS)
     source: str | None = None
+    source_role: str | None = None
+    """The sender's role (``viewer``, ``writer`` or ``admin``) as the server attested
+    it, beside ``source``; ``None`` for a sender the server cannot name, and from a
+    server that predates the field."""
+
     room: str | None = None
     """The room a routed message was scoped to, for the ``[room] sender:``
     injection prefix; ``None`` for a direct (session-id) enqueue."""
@@ -420,7 +532,7 @@ class SendMessageResponse(BaseModel):
 class SessionEnd(BaseModel):
     """Mark a session closed, optionally backfilling late-known fields."""
 
-    ended: datetime | None = None
+    ended: UtcDatetime | None = None
     cli_session_id: str | None = Field(default=None, min_length=1)
     """Set when the CLI only revealed its session id mid-run."""
 
@@ -447,6 +559,8 @@ SESSION_INBOUND_PATH: Final = "/api/sessions/{session_id}/inbound"
 SEND_MESSAGE_PATH: Final = "/api/messages"
 VERSION_PATH: Final = "/api/version"
 FEED_PATH: Final = "/api/web/feed"
+FEED_FACETS_PATH: Final = "/api/web/feed/facets"
+FEED_HISTOGRAM_PATH: Final = "/api/web/feed/histogram"
 
 
 # Every non-field API path the client, SPA, or deploy probe depends on, as a
@@ -464,6 +578,8 @@ SESSION_API_PATHS: tuple[str, ...] = (
     SEND_MESSAGE_PATH,
     VERSION_PATH,
     FEED_PATH,
+    FEED_FACETS_PATH,
+    FEED_HISTOGRAM_PATH,
 )
 
 
@@ -480,3 +596,19 @@ def session_end_path(session_id: uuid.UUID) -> str:
 def session_inbound_path(session_id: uuid.UUID) -> str:
     """Return the inbound-message path for one session (POST enqueue, GET drain)."""
     return SESSION_INBOUND_PATH.format(session_id=session_id)
+
+
+def inbound_read_timeout(wait_sec: float) -> float | None:
+    """Return the read timeout a drain that holds ``wait_sec`` needs.
+
+    Args:
+      wait_sec: How long the server may hold the drain request open.
+
+    Returns:
+      timeout: Seconds the client may wait to read the response, or ``None``
+        to keep the transport's own timeout when the drain does not wait.
+
+    """
+    # The server returns an empty drain AT ``wait_sec``, so a read deadline equal to
+    # it races that response and turns a normal empty result into a transport error.
+    return wait_sec + 10.0 if wait_sec else None

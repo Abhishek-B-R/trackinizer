@@ -5,19 +5,20 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, override
 
 import logging
+import sys
 import uuid
+
+import pytest
 
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    import pytest
-
     from trackinizer.types.inquiries import Inquiry
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.custom_json import DictCodec, StrCodec
+from trackinizer.lib.codec import from_plain
 from trackinizer.tools import replay_live_graph
 
 
@@ -180,13 +181,34 @@ def test_detail_order_key_uses_source_created_then_id() -> None:
     )
 
     ids = [
-        StrCodec.coerce(DictCodec.coerce(detail["self"])["id"]) for detail in ordered
+        from_plain(from_plain(detail["self"], dict[str, object])["id"], str)
+        for detail in ordered
     ]
     assert ids == [
         "00000000-0000-0000-0000-000000000000",
         "ffffffff-ffff-ffff-ffff-ffffffffffff",
         "11111111-1111-1111-1111-111111111111",
     ]
+
+
+@pytest.mark.parametrize("other", [["--traverse"], ["--limit", "2"]])
+def test_seed_rejects_ignored_options(
+    other: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["replay", "--target", "https://target.test", "--seed", "Issue#1", *other],
+    )
+
+    def connect(source: str) -> Client:
+        del source
+        pytest.fail("argument validation must precede connections")
+
+    monkeypatch.setattr(replay_live_graph, "_source_client", connect)
+    with pytest.raises(SystemExit, match="2"):
+        replay_live_graph.main()
 
 
 if __name__ == "__main__":

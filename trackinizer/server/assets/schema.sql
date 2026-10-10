@@ -68,6 +68,10 @@ CREATE TABLE IF NOT EXISTS inquiries (
     favors_authority    DOUBLE PRECISION,
     cited_by_authority  DOUBLE PRECISION,
     issue_authority     DOUBLE PRECISION,
+    -- An admin-set flag, not a ColumnSpec field: while TRUE only an admin may edit the
+    -- row, change its edges or delete it (``api/locks.py``). Setting it records no
+    -- change, so it leaves ``modified`` alone.
+    locked         BOOLEAN NOT NULL DEFAULT FALSE,
     created        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     modified       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
 
@@ -582,9 +586,24 @@ CREATE TABLE IF NOT EXISTS users (
     name        TEXT NOT NULL,
     role        TEXT NOT NULL CHECK (role IN ('viewer', 'writer', 'admin')),
     status      TEXT NOT NULL CHECK (status IN ('active', 'disabled')),
-    visual_workspace_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    visual_workspace_enabled BOOLEAN NOT NULL DEFAULT TRUE,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    last_login  TIMESTAMPTZ
+    last_login  TIMESTAMPTZ,
+    -- The welcome flow's agreement: when, and to which rules version (see
+    -- ``api/auth_routes.py``).
+    acknowledged_at            TIMESTAMPTZ,
+    acknowledged_rules_version TEXT
+);
+
+-- Who set or cleared an inquiry's ``locked`` flag, and when (``api/locks.py``).
+-- ``inquiry_id`` is FK-free like ``change_log.subject_id``, so a purged row keeps its
+-- history.
+CREATE TABLE IF NOT EXISTS inquiry_lock_log (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    inquiry_id UUID NOT NULL,
+    locked     BOOLEAN NOT NULL,
+    actor      TEXT NOT NULL,
+    created    TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -706,8 +725,7 @@ END$$;
 -- row. The owning experiment is the ``Experiment`` artifact in ``inquiries``;
 -- these rows hang off it by ``experiment_id`` and carry no edges, cost,
 -- supersession, or ``change_log`` audit (the same exemption
--- ``session_records`` takes). Tenant scope is derived by joining to
--- inquiries.
+-- ``session_records`` takes).
 --
 -- ``PRIMARY KEY (experiment_id, key, step)`` is the per-point dedup mechanism
 -- (a retried batch ``ON CONFLICT DO NOTHING``s) and the index serving both the
@@ -725,10 +743,14 @@ CREATE TABLE IF NOT EXISTS experiment_metrics (
     -- ``read_metrics`` reconstructs it, so a stored empty, whitespace-only, or
     -- over-long key would 500 the read. This CHECK backstops the wire like the
     -- step/value/kind CHECKs below -- the 512 bound matches
-    -- ``wire_metrics._MAX_KEY_CHARS`` and ``btrim(key) <> ''`` matches the
-    -- wire's blank rejection.
+    -- ``wire_metrics._MAX_KEY_CHARS``, and the trimmed set is every code point
+    -- Python's ``str.isspace`` admits, so it matches the wire's ``strip``. A
+    -- bare ``btrim(key)`` trims only spaces and stored a tab key (schema.031).
     key           TEXT NOT NULL CHECK (
-        char_length(key) BETWEEN 1 AND 512 AND btrim(key) <> ''),
+        char_length(key) BETWEEN 1 AND 512
+        AND btrim(key, E'\t\n\x0b\f\r\x1c\x1d\x1e\x1f \u0085  '
+            '          '
+            '     　') <> ''),
     step          BIGINT NOT NULL CHECK (step >= 0),
     -- Finite only: the wire ``MetricPoint.value`` is ``Field(allow_inf_nan=
     -- False)`` and ``read_metrics`` reconstructs it, so a stored NaN/±Inf would
@@ -823,7 +845,7 @@ CREATE INDEX IF NOT EXISTS idx_session_records_recent_turns
 -- The cross-session console feed is a keyset scan over exactly this tuple
 -- (``store/session.py::read_feed``), polled every 1.5s by every open console.
 -- Without the index that ORDER BY is a sequential scan plus a sort over the
--- whole capture corpus -- 3,081,202 rows on the deployed instance -- and it
+-- whole capture corpus -- millions of rows on a busy server -- and it
 -- still returns the right answer, so nothing fails: the cost shows up only as
 -- latency. The retired ``agent_session_events`` carried the same index for the
 -- same query; it must not be lost in the move.
@@ -892,6 +914,77 @@ CREATE TABLE IF NOT EXISTS session_slash_commands (
     args        TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (session_id, seq)
 );
+
+-- When each session that polls its inbound queue was last heard from, so the
+-- reaper can close one whose run died. A table, not process memory: a run that
+-- dies while the server restarts must still be closed, and one closed for
+-- silence (``reaped``) must still be reopened if it comes back. A session that
+-- never polls has no row: with no poller, its silence means nothing. Added in 032.
+CREATE TABLE IF NOT EXISTS session_liveness (
+    session_id  UUID PRIMARY KEY REFERENCES inquiries(id) ON DELETE CASCADE,
+    last_seen   TIMESTAMPTZ NOT NULL,
+    reaped      BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- The environment variables an agent launch exports, by layer (org, machine,
+-- user). A secret's value is never stored here: ``value`` is NULL and the
+-- server's secret backend holds it. Added in 034.
+CREATE TABLE IF NOT EXISTS variables (
+    layer       TEXT NOT NULL CHECK (layer IN ('org', 'machine', 'user')),
+    owner       TEXT NOT NULL DEFAULT '',
+    name        TEXT NOT NULL CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_]{0,127}$'),
+    secret      BOOLEAN NOT NULL,
+    value       TEXT,
+    updated_by  TEXT NOT NULL,
+    updated     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (layer, owner, name),
+    CHECK (secret = (value IS NULL))
+);
+
+-- The machines a campaign may run on: a name, a role, one line telling an agent
+-- how to use the machine, and labels. Added in 035.
+CREATE TABLE IF NOT EXISTS machines (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        TEXT NOT NULL UNIQUE CHECK (name ~ '^[a-z0-9][a-z0-9-]{0,62}$'),
+    role        TEXT NOT NULL DEFAULT ''
+                CHECK (role = '' OR role ~ '^[a-z][a-z0-9-]{0,31}$'),
+    how         TEXT NOT NULL DEFAULT '' CHECK (char_length(how) <= 2000),
+    labels      TEXT[] NOT NULL DEFAULT '{}',
+    created     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by  TEXT NOT NULL,
+    updated     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_heartbeat TIMESTAMPTZ,
+    host_instance  UUID,
+    host_version   TEXT NOT NULL DEFAULT '' CHECK (char_length(host_version) <= 64),
+    facts          JSONB NOT NULL DEFAULT '{}'
+                   CHECK (jsonb_typeof(facts) = 'object' AND octet_length(facts::text) <= 8192)
+);
+
+-- One-use tokens that let a host join as a machine, and the credentials it joins
+-- with. A revoked credential row is kept so the server answers it 410, not 401.
+-- Added in 036.
+CREATE TABLE IF NOT EXISTS machine_enrollments (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    machine_id    UUID NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+    secret_sha256 BYTEA NOT NULL CHECK (octet_length(secret_sha256) = 32),
+    created_by    TEXT NOT NULL,
+    created       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at    TIMESTAMPTZ NOT NULL,
+    used_at       TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_machine_enrollments_open
+    ON machine_enrollments (machine_id) WHERE used_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS machine_credentials (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    machine_id    UUID NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+    secret_sha256 BYTEA NOT NULL CHECK (octet_length(secret_sha256) = 32),
+    created       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used     TIMESTAMPTZ,
+    revoked_at    TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_machine_credentials_live
+    ON machine_credentials (machine_id) WHERE revoked_at IS NULL;
 
 -- Per-user canvas state. The companion receipt table makes retried operations
 -- return the original result without applying them twice. Added in 026.

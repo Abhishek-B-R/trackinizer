@@ -14,7 +14,7 @@ Usage::
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast, override
+from typing import TYPE_CHECKING, Final, Protocol, cast, override
 
 import argparse
 import logging
@@ -28,17 +28,22 @@ else:
 
     uvicorn = lazy_import("uvicorn")  # ~90 ms; main() launches the server.
 
+from trackinizer.addons.deployment import DeploymentError, deployment_config
 from trackinizer.lib.userdirs import data_dir
 from trackinizer.server import web
+from trackinizer.server.api.addons_routes import attach_deployment
 from trackinizer.server.api.app import app
 from trackinizer.server.config import (
     Config,
     ConfigError,
     ConfigFlags,
+    auth_disabled_from_env,
     session_max_age_from_env,
 )
 from trackinizer.server.embedders.registry import EMBEDDERS
 
+
+_CWD: Final = Path(__file__).resolve().parent
 
 logger = logging.getLogger(__name__)
 
@@ -105,18 +110,43 @@ class _Flags(ConfigFlags, Protocol):
     static_dir: Path | None
     app_dir: Path | None
     log_level: str | None
+    addons: str
+    addon_override: list[str]
 
 
 def _configure_app(flags: _Flags) -> None:
-    """Attach config (and the web UI) to the module-level app."""
+    """Attach config, the deployment (and the web UI) to the module-level app."""
     try:
         app.state.config = Config.from_args(flags)
-    except ConfigError as err:
+        # Routers must be mounted before uvicorn starts the app, so the
+        # deployment is built here rather than in the lifespan, which only
+        # starts its services.
+        attach_deployment(
+            app,
+            deployment=deployment_config(
+                flags.addons,
+                overrides=flags.addon_override,
+            ).make(),
+        )
+    except (ConfigError, DeploymentError) as err:
         # Library code raises ConfigError (a plain Exception); the CLI is
         # the one place that turns a bad config into a clean process exit.
         raise SystemExit(str(err)) from err
     if flags.web:
-        web.attach(app, static_dir=flags.static_dir, app_dir=flags.app_dir)
+        web.attach(
+            app,
+            static_dir=flags.static_dir,
+            app_dir=flags.app_dir or _packaged_app(_CWD.parent),
+        )
+
+
+# The wheel carries the web app's build here (an `artifacts` entry in
+# ``.export/pyproject.toml``); a checkout has one once `npm run build` has run in
+# web/.
+def _packaged_app(package: Path) -> Path | None:
+    """Return the web app build beside ``package``, or ``None`` without one."""
+    built = package / "web" / "dist"
+    return built if (built / "index.html").is_file() else None
 
 
 def _parse_args(
@@ -229,10 +259,10 @@ def _parse_args(
         type=Path,
         default=None,
         help=(
-            "Serve /static from this runtime directory instead of the SPA's "
-            "bundled assets/static. Lets an operator publish files written "
-            "after deploy (e.g. a generated report) without writing into the "
-            "source tree. Unset keeps the bundled assets."
+            "Serve /static from this runtime directory, to anyone. Lets an "
+            "operator publish files written after deploy (e.g. a generated "
+            "report) without writing into the source tree. Unset serves "
+            "nothing at /static."
         ),
     )
     parser.add_argument(
@@ -241,11 +271,14 @@ def _parse_args(
         default=None,
         metavar="DIR",
         help=(
-            "Serve a separately built web app from DIR at /app/, only to "
-            "signed-in users; /app/ serves DIR/index.html. DIR is resolved on "
-            "every request, so it may be missing at startup (404 until a build "
-            "lands) or a symlink swapped to a new build without a restart. "
-            "Unset serves nothing at /app/."
+            "Serve a separately built web app from DIR at /app/ to the callers "
+            "the API answers: signed-in users, or everyone under --no-auth; "
+            "/app/ serves DIR/index.html. DIR is resolved on every request, so "
+            "it may be missing at startup (404 until a build lands) or a "
+            "symlink swapped to a new build without a restart. "
+            "Unset, it is the build packaged with trackinizer, if any. With an "
+            "app, /, /me, /admin, /graph and /console redirect into it; with "
+            "none, nothing is served at them or at /app/."
         ),
     )
     parser.add_argument(
@@ -262,19 +295,54 @@ def _parse_args(
         ),
     )
     parser.add_argument(
-        "--no-auth",
-        action="store_true",
+        "--auth",
+        action=argparse.BooleanOptionalAction,
+        default=not auth_disabled_from_env(),
         help=(
-            "Disable bearer/session auth; every request resolves to a "
-            "synthetic admin identity. For ephemeral / local-only demos "
-            "(example.sh). NEVER enable in production: anyone who can "
-            "reach the port can edit everything."
+            "Require bearer/session auth (default, unless $TRACKINIZER_NO_AUTH=1). "
+            "--no-auth disables it: every request resolves to a synthetic admin "
+            "identity. For ephemeral / local-only demos (example.sh). NEVER "
+            "disable in production: anyone who can reach the port can edit "
+            "everything."
+        ),
+    )
+    parser.add_argument(
+        "--assistant",
+        default=os.environ.get("TRACKINIZER_ASSISTANT", ""),
+        metavar="ACTOR=EMAIL",
+        help=(
+            "The shared Chat partner: a live session whose granted actor is "
+            "ACTOR (or ACTOR#N) and whose API key belongs to the account EMAIL "
+            "is the Chat partner of every canvas "
+            "(default: $TRACKINIZER_ASSISTANT; empty means none)."
         ),
     )
     parser.add_argument(
         "--log-level",
         default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+    )
+    parser.add_argument(
+        "--addons",
+        default=os.environ.get("TRACKINIZER_ADDONS", ""),
+        metavar="FACTORY",
+        help=(
+            "Dotted path to a function returning the Deployment config this "
+            "server runs: its visuals, and its addons, whose server services "
+            "start in this process and whose routes mount under "
+            "/api/addons/<name>. Empty runs the default visuals and no addons "
+            "(default: $TRACKINIZER_ADDONS)."
+        ),
+    )
+    parser.add_argument(
+        "--addon-override",
+        action="append",
+        default=[],
+        metavar="PATH=VALUE",
+        help=(
+            "configgle override on the --addons Deployment config, e.g. "
+            "ADDON.FIELD=VALUE, or ADDON=null to switch an addon off. Repeatable."
+        ),
     )
     flags, remaining = parser.parse_known_args(argv)
     return cast(_Flags, flags), remaining
@@ -296,7 +364,7 @@ def _session_ttl_default() -> int:
 # the registered default dim, or pairs with ``--session-embedder-dim``).
 def _session_embedder_choices() -> list[str]:
     """Return the ``--session-embedder`` choices: empty, stubs, models, bare slugs."""
-    slugs = {key.split("@", 1)[0] for key in EMBEDDERS}
+    slugs = {key.partition("@")[0] for key in EMBEDDERS}
     return ["", "stub", "stub-1024", *sorted(EMBEDDERS), *sorted(slugs)]
 
 
@@ -312,7 +380,7 @@ def _positive_session_ttl(value: str) -> int:
 
 def _configure_logging(level: str | None) -> int | None:
     """Set the package log level from the flag or ``TRACKINIZER_LOG_LEVEL``."""
-    raw = level or os.environ.get("TRACKINIZER_LOG_LEVEL")
+    raw = level or os.environ.get("TRACKINIZER_LOG_LEVEL", "")
     if not raw:
         return None
     value = getattr(logging, raw.upper(), None)

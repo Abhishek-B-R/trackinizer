@@ -1,26 +1,38 @@
-"""Named canvas presets survive a new browser and exclude live session pairing."""
+"""Named canvas presets survive a new browser and carry their guidance to Chat."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import json
 import uuid
 
 import httpx2
 import pytest
 
-from trackinizer.lib.custom_json import DictCodec, IntCodec, ListCodec, StrCodec, loads
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.server.api.app import app
+from trackinizer.server.api.canvas_test_support import (
+    ASSISTANT_CONFIG,
+    KB_ACTOR,
+    act_as_assistant,
+    drain,
+    open_workspace,
+    revision_of,
+    seed_accounts,
+    start_session,
+)
 from trackinizer.server.api.conftest import (
-    TEST_API_KEY_ID,
     TEST_USER_ID,
     install_identity,
     make_test_identity,
 )
+from trackinizer.server.chat_hub import ChatHub, WorkspaceFrame
 from trackinizer.server.inbound import InboundQueue
 
 
 if TYPE_CHECKING:
+    from trackinizer.server.chat_hub import Frame
     from trackinizer.server.store.core import Store
 
 
@@ -30,24 +42,19 @@ async def test_save_on_one_client_and_open_on_another(
     pglite_route_client: tuple[httpx2.AsyncClient, Store],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A saved workflow restores its visual state and guidance, not its session."""
+    """A saved workflow restores its visual state, and Chat hands on its guidance."""
     client, store = pglite_route_client
+    monkeypatch.setattr(app.state, "config", ASSISTANT_CONFIG, raising=False)
     monkeypatch.setattr(app.state, "inbound", InboundQueue(), raising=False)
-    async with store.engine.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO users (id, email, name, role, status, visual_workspace_enabled) "
-            "VALUES ($1, 'test-user@example.com', 'Test', 'writer', 'active', TRUE)",
-            TEST_USER_ID,
-        )
-        await conn.execute(
-            "INSERT INTO api_keys (id, user_id, name, secret_hash, prefix, role) "
-            "VALUES ($1, $2, 'agent', 'test-hash', 'trax_test', 'writer')",
-            TEST_API_KEY_ID,
-            TEST_USER_ID,
-        )
+    await seed_accounts(store)
+    act_as_assistant()
+    session_id = await start_session(client, actor=KB_ACTOR)
     install_identity(make_test_identity(api_key_id=None))
-    first = DictCodec.coerce(loads((await client.post("/api/workspaces")).content))
-    workspace_id = StrCodec.coerce(first["id"])
+    first = from_plain(
+        loads((await client.post("/api/workspaces")).content),
+        dict[str, object],
+    )
+    workspace_id = from_plain(first["id"], str)
     shown = await client.post(
         f"/api/workspaces/{workspace_id}/operations",
         json={
@@ -61,25 +68,12 @@ async def test_save_on_one_client_and_open_on_another(
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert shown.status_code == 200
-    current = DictCodec.coerce(loads(shown.content))
+    current = from_plain(loads(shown.content), dict[str, object])
     chat = next(
-        DictCodec.coerce(item)
-        for item in ListCodec.coerce(current["visuals"])
-        if DictCodec.coerce(item)["type"] == "trax.chat"
+        from_plain(item, dict[str, object])
+        for item in from_plain(current["visuals"], list[object])
+        if from_plain(item, dict[str, object])["type"] == "trax.chat"
     )
-    install_identity(make_test_identity())
-    started = await client.post("/api/sessions/start", json={"cli": "codex"})
-    assert started.status_code == 201
-    session_id = StrCodec.coerce(DictCodec.coerce(loads(started.content))["id"])
-    assert (await client.get(f"/api/sessions/{session_id}/inbound")).status_code == 200
-    install_identity(make_test_identity(api_key_id=None))
-    paired = await client.put(
-        f"/api/workspaces/{workspace_id}/connection",
-        json={"revision": current["revision"], "session_id": session_id},
-    )
-    assert paired.status_code == 200
-    current = DictCodec.coerce(loads(paired.content))
-    assert current["connected_session_id"] == session_id
     save = await client.post(
         "/api/workspace-presets",
         json={
@@ -89,7 +83,7 @@ async def test_save_on_one_client_and_open_on_another(
             "agent_instructions": "Trace evidence before proposing a change.",
             "continuation_record_id": str(uuid.uuid4()),
             "floating_rects": {
-                StrCodec.coerce(chat["id"]): {
+                from_plain(chat["id"], str): {
                     "left": 80,
                     "top": 100,
                     "width": 420,
@@ -100,12 +94,15 @@ async def test_save_on_one_client_and_open_on_another(
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert save.status_code == 200
-    preset = DictCodec.coerce(loads(save.content))
+    preset = from_plain(loads(save.content), dict[str, object])
     assert preset["name"] == "ARC3 investigation"
     assert preset["agent_instructions"] == "Trace evidence before proposing a change."
-    assert "connected_session_id" not in DictCodec.coerce(preset["state"])
-    assert DictCodec.coerce(
-        ListCodec.coerce(DictCodec.coerce(preset["state"])["visuals"])[-1],
+    assert from_plain(
+        from_plain(
+            from_plain(preset["state"], dict[str, object])["visuals"],
+            list[object],
+        )[-1],
+        dict[str, object],
     )["floating_rect"] == {
         "left": 80,
         "top": 100,
@@ -120,12 +117,14 @@ async def test_save_on_one_client_and_open_on_another(
         listed = await second_browser.get("/api/workspace-presets")
         assert listed.status_code == 200
         assert [
-            DictCodec.coerce(row)["id"]
-            for row in ListCodec.coerce(loads(listed.content))
+            from_plain(row, dict[str, object])["id"]
+            for row in from_plain(loads(listed.content), list[object])
         ] == [preset["id"]]
-        read = await second_browser.get(f"/api/workspace-presets/{preset['id']}")
-        assert read.status_code == 200
-        assert loads(read.content) == loads(save.content)
+        read_response = await second_browser.get(
+            f"/api/workspace-presets/{preset['id']}",
+        )
+        assert read_response.status_code == 200
+        assert json.loads(read_response.content) == json.loads(save.content)
 
     changed = await client.post(
         f"/api/workspaces/{workspace_id}/operations",
@@ -136,7 +135,7 @@ async def test_save_on_one_client_and_open_on_another(
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert changed.status_code == 200
-    second = DictCodec.coerce(loads(changed.content))
+    second = from_plain(loads(changed.content), dict[str, object])
     async with httpx2.AsyncClient(
         transport=httpx2.ASGITransport(app=app, raise_app_exceptions=False),
         base_url="http://second-browser",
@@ -147,12 +146,11 @@ async def test_save_on_one_client_and_open_on_another(
             headers={"Idempotency-Key": str(uuid.uuid4())},
         )
     assert opened.status_code == 200
-    restored = DictCodec.coerce(loads(opened.content))
-    assert restored["revision"] == IntCodec.coerce(second["revision"]) + 1
-    assert restored["connected_session_id"] is None
+    restored = from_plain(loads(opened.content), dict[str, object])
+    assert restored["revision"] == from_plain(second["revision"], int) + 1
     assert restored["agent_instructions"] == preset["agent_instructions"]
     assert restored["continuation_record_id"] == preset["continuation_record_id"]
-    assert len(ListCodec.coerce(restored["visuals"])) == 2
+    assert len(from_plain(restored["visuals"], list[object])) == 2
     resaved = await client.post(
         "/api/workspace-presets",
         json={
@@ -163,7 +161,7 @@ async def test_save_on_one_client_and_open_on_another(
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert resaved.status_code == 200
-    second_preset = DictCodec.coerce(loads(resaved.content))
+    second_preset = from_plain(loads(resaved.content), dict[str, object])
     assert second_preset["agent_instructions"] == preset["agent_instructions"]
     assert second_preset["continuation_record_id"] == preset["continuation_record_id"]
     focused = await client.post(
@@ -175,18 +173,13 @@ async def test_save_on_one_client_and_open_on_another(
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert focused.status_code == 200
-    continued = DictCodec.coerce(loads(focused.content))
+    continued = from_plain(loads(focused.content), dict[str, object])
     assert continued["agent_instructions"] == preset["agent_instructions"]
     assert continued["continuation_record_id"] == preset["continuation_record_id"]
-    assert continued["connected_session_id"] is None
-    paired_again = await client.put(
-        f"/api/workspaces/{workspace_id}/connection",
-        json={"revision": continued["revision"], "session_id": session_id},
-    )
-    assert paired_again.status_code == 200
     sent = await client.post(
-        f"/api/workspaces/{workspace_id}/messages",
+        "/api/chats",
         json={
+            "workspace_id": workspace_id,
             "text": "Continue this investigation",
             "chat_instance_id": chat["id"],
             "expected_record_id": None,
@@ -194,10 +187,16 @@ async def test_save_on_one_client_and_open_on_another(
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert sent.status_code == 200
-    install_identity(make_test_identity())
-    drained = await client.get(f"/api/sessions/{session_id}/inbound")
-    messages = ListCodec.coerce(DictCodec.coerce(loads(drained.content))["messages"])
-    context = DictCodec.coerce(DictCodec.coerce(messages[0])["context"])
+    act_as_assistant()
+    drained = await drain(client, session_id=session_id)
+    messages = from_plain(
+        from_plain(loads(drained.content), dict[str, object])["messages"],
+        list[object],
+    )
+    context = from_plain(
+        from_plain(messages[0], dict[str, object])["context"],
+        dict[str, object],
+    )
     assert context["agent_instructions"] == preset["agent_instructions"]
     assert context["continuation_record_id"] == preset["continuation_record_id"]
 
@@ -219,8 +218,11 @@ async def test_presets_enforce_revision_owner_and_floating_target(
             foreign_id,
         )
     install_identity(make_test_identity(api_key_id=None))
-    workspace = DictCodec.coerce(loads((await client.post("/api/workspaces")).content))
-    workspace_id = StrCodec.coerce(workspace["id"])
+    workspace = from_plain(
+        loads((await client.post("/api/workspaces")).content),
+        dict[str, object],
+    )
+    workspace_id = from_plain(workspace["id"], str)
     base = {"workspace_id": workspace_id, "revision": 0, "name": "Research"}
     assert (
         await client.post(
@@ -253,8 +255,12 @@ async def test_presets_enforce_revision_owner_and_floating_target(
             headers={"Idempotency-Key": str(uuid.uuid4())},
         )
     ).status_code == 422
-    browse_id = StrCodec.coerce(
-        DictCodec.coerce(ListCodec.coerce(workspace["visuals"])[0])["id"],
+    browse_id = from_plain(
+        from_plain(
+            from_plain(workspace["visuals"], list[object])[0],
+            dict[str, object],
+        )["id"],
+        str,
     )
     assert (
         await client.post(
@@ -274,7 +280,10 @@ async def test_presets_enforce_revision_owner_and_floating_target(
         headers={"Idempotency-Key": str(uuid.uuid4())},
     )
     assert saved.status_code == 200
-    preset_id = StrCodec.coerce(DictCodec.coerce(loads(saved.content))["id"])
+    preset_id = from_plain(
+        from_plain(loads(saved.content), dict[str, object])["id"],
+        str,
+    )
     assert (
         await client.put(f"/api/workspace-presets/{preset_id}", json={"name": "   "})
     ).status_code == 422
@@ -302,7 +311,10 @@ async def test_presets_enforce_revision_owner_and_floating_target(
         },
     )
     assert revised.status_code == 200
-    assert DictCodec.coerce(loads(revised.content))["name"] == "Research revisited"
+    assert (
+        from_plain(loads(revised.content), dict[str, object])["name"]
+        == "Research revisited"
+    )
     assert (
         await client.post(
             f"/api/workspace-presets/{preset_id}/open",
@@ -344,8 +356,11 @@ async def test_preset_save_and_open_replay_once(
             TEST_USER_ID,
         )
     install_identity(make_test_identity(api_key_id=None))
-    workspace = DictCodec.coerce(loads((await client.post("/api/workspaces")).content))
-    workspace_id = StrCodec.coerce(workspace["id"])
+    workspace = from_plain(
+        loads((await client.post("/api/workspaces")).content),
+        dict[str, object],
+    )
+    workspace_id = from_plain(workspace["id"], str)
     save_body = {"workspace_id": workspace_id, "revision": 0, "name": "ARC3"}
     save_headers = {"Idempotency-Key": str(uuid.uuid4())}
     saved = await client.post(
@@ -359,15 +374,16 @@ async def test_preset_save_and_open_replay_once(
         headers=save_headers,
     )
     assert saved.status_code == replayed_save.status_code == 200
-    assert loads(saved.content) == loads(replayed_save.content)
+    assert json.loads(saved.content) == json.loads(replayed_save.content)
     mismatched_save = await client.post(
         "/api/workspace-presets",
         json={**save_body, "name": "Other"},
         headers=save_headers,
     )
     assert mismatched_save.status_code == 409
-    assert "Idempotency-Key" in StrCodec.coerce(
-        DictCodec.coerce(loads(mismatched_save.content))["detail"],
+    assert "Idempotency-Key" in from_plain(
+        from_plain(loads(mismatched_save.content), dict[str, object])["detail"],
+        str,
     )
     async with store.engine.acquire() as conn:
         assert (
@@ -377,7 +393,10 @@ async def test_preset_save_and_open_replay_once(
             )
             == 1
         )
-    preset_id = StrCodec.coerce(DictCodec.coerce(loads(saved.content))["id"])
+    preset_id = from_plain(
+        from_plain(loads(saved.content), dict[str, object])["id"],
+        str,
+    )
     open_body = {"workspace_id": workspace_id, "revision": 0}
     open_headers = {"Idempotency-Key": str(uuid.uuid4())}
     opened = await client.post(
@@ -391,9 +410,10 @@ async def test_preset_save_and_open_replay_once(
         headers=open_headers,
     )
     assert opened.status_code == replayed_open.status_code == 200
-    assert loads(opened.content) == loads(replayed_open.content)
-    current = DictCodec.coerce(
+    assert json.loads(opened.content) == json.loads(replayed_open.content)
+    current = from_plain(
         loads((await client.get(f"/api/workspaces/{workspace_id}")).content),
+        dict[str, object],
     )
     assert current["revision"] == 1
     mismatched_open = await client.post(
@@ -402,8 +422,9 @@ async def test_preset_save_and_open_replay_once(
         headers=open_headers,
     )
     assert mismatched_open.status_code == 409
-    assert "Idempotency-Key" in StrCodec.coerce(
-        DictCodec.coerce(loads(mismatched_open.content))["detail"],
+    assert "Idempotency-Key" in from_plain(
+        from_plain(loads(mismatched_open.content), dict[str, object])["detail"],
+        str,
     )
     revision = 1
     latest_open_body = open_body
@@ -421,11 +442,12 @@ async def test_preset_save_and_open_replay_once(
         revision += 1
     async with store.engine.acquire() as conn:
         assert (
-            IntCodec.coerce(
+            from_plain(
                 await conn.fetchval(
                     "SELECT count(*) FROM visual_workspace_operations WHERE workspace_id = $1",
                     uuid.UUID(workspace_id),
                 ),
+                int,
             )
             <= 64
         )
@@ -434,7 +456,7 @@ async def test_preset_save_and_open_replay_once(
         json=latest_open_body,
         headers=latest_open_headers,
     )
-    assert loads(replayed_latest.content) == loads(latest_open.content)
+    assert json.loads(replayed_latest.content) == json.loads(latest_open.content)
     for _ in range(66):
         transient = await client.post(
             "/api/workspace-presets",
@@ -446,34 +468,79 @@ async def test_preset_save_and_open_replay_once(
             headers={"Idempotency-Key": str(uuid.uuid4())},
         )
         assert transient.status_code == 200
-        transient_id = StrCodec.coerce(DictCodec.coerce(loads(transient.content))["id"])
+        transient_id = from_plain(
+            from_plain(loads(transient.content), dict[str, object])["id"],
+            str,
+        )
         assert (
             await client.delete(f"/api/workspace-presets/{transient_id}")
         ).status_code == 204
     async with store.engine.acquire() as conn:
         assert (
-            IntCodec.coerce(
+            from_plain(
                 await conn.fetchval(
                     "SELECT count(*) FROM visual_workspace_operations WHERE workspace_id = $1",
                     uuid.UUID(workspace_id),
                 ),
+                int,
             )
             <= 64
         )
 
 
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+async def test_opening_a_preset_pushes_the_canvas_once_and_its_replay_pushes_nothing(
+    pglite_route_client: tuple[httpx2.AsyncClient, Store],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every tab sees the restored canvas; a retried open is silent."""
+    client, store = pglite_route_client
+    hub = ChatHub()
+    monkeypatch.setattr(app.state, "inbound", InboundQueue(), raising=False)
+    monkeypatch.setattr(app.state, "hub", hub, raising=False)
+    await seed_accounts(store)
+    workspace_id = await open_workspace(client)
+    revision = await revision_of(client, workspace_id=workspace_id)
+    saved = await client.post(
+        "/api/workspace-presets",
+        json={"workspace_id": str(workspace_id), "revision": revision, "name": "view"},
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert saved.status_code == 200
+    preset_id = from_plain(
+        from_plain(loads(saved.content), dict[str, object])["id"],
+        str,
+    )
+    key = str(uuid.uuid4())
+    body = {"workspace_id": str(workspace_id), "revision": revision}
+    path = f"/api/workspace-presets/{preset_id}/open"
+    with hub.subscribe(workspace_id) as stream:
+        opened = await client.post(path, json=body, headers={"Idempotency-Key": key})
+        replay = await client.post(path, json=body, headers={"Idempotency-Key": key})
+        frames: list[Frame | None] = []
+        while not stream.queue.empty():
+            frames.append(stream.queue.get_nowait())
+    assert (opened.status_code, replay.status_code) == (200, 200)
+    assert loads(opened.content) == loads(replay.content)
+    assert [f.type for f in frames if f is not None] == ["workspace"]
+    frame = frames[0]
+    assert isinstance(frame, WorkspaceFrame)
+    assert frame.state.revision == revision + 1
+
+
 def test_preset_create_conflict_is_in_openapi() -> None:
     """Generated clients can decode the documented stale-revision response."""
-    spec = DictCodec.coerce(app.openapi())
-    paths = DictCodec.coerce(spec["paths"])
-    endpoint = DictCodec.coerce(paths["/api/workspace-presets"])
-    operation = DictCodec.coerce(endpoint["post"])
-    responses = DictCodec.coerce(operation["responses"])
-    conflict = DictCodec.coerce(responses["409"])
-    content = DictCodec.coerce(conflict["content"])
-    media = DictCodec.coerce(content["application/json"])
-    schema = DictCodec.coerce(media["schema"])
-    assert StrCodec.coerce(schema["$ref"]).endswith(
+    spec = from_plain(app.openapi(), dict[str, object])
+    paths = from_plain(spec["paths"], dict[str, object])
+    endpoint = from_plain(paths["/api/workspace-presets"], dict[str, object])
+    operation = from_plain(endpoint["post"], dict[str, object])
+    responses = from_plain(operation["responses"], dict[str, object])
+    conflict = from_plain(responses["409"], dict[str, object])
+    content = from_plain(conflict["content"], dict[str, object])
+    media = from_plain(content["application/json"], dict[str, object])
+    schema = from_plain(media["schema"], dict[str, object])
+    assert from_plain(schema["$ref"], str).endswith(
         "/WorkspaceConflict",
     )
 

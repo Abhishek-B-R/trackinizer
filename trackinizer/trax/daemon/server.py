@@ -30,14 +30,13 @@ from trackinizer.trax.context import (
 from trackinizer.trax.daemon.client import STALE_EXIT_CODE
 from trackinizer.trax.daemon.protocol import (
     FORWARDED_ENV,
+    KEY_ENV,
     ProtocolVersionError,
     Request,
     Response,
-    package_root,
     read_frame,
     socket_address,
     socket_path,
-    source_version,
     write_frame,
 )
 from trackinizer.trax.render import TERMINAL_WIDTH
@@ -108,7 +107,7 @@ def handle(
     return Response(stdout=out.getvalue(), stderr=err.getvalue(), exit_code=exit_code)
 
 
-def serve(path: Path | None = None) -> None:
+def serve(path: Path | None = None, *, version: str) -> None:
     """Run the daemon until it is idle for :data:`_IDLE_TIMEOUT_SEC`.
 
     Binding is the arbiter for the spawn race: several clients missing a
@@ -117,11 +116,13 @@ def serve(path: Path | None = None) -> None:
 
     Args:
       path: Socket path for the daemon; uses socket_path() if None.
+      version: Source fingerprint the spawning caller took before this
+        process imported anything; a request carrying another is answered
+        stale.
 
     """
     sock = socket_address(path) if path is not None else socket_path()
     sock.parent.mkdir(parents=True, exist_ok=True, mode=_SOCKET_DIR_MODE)
-    version = source_version(package_root())
     server = _bind(sock, version)
     if server is None:
         return
@@ -252,8 +253,15 @@ def _run_isolated(
     """Run one verb bound to the caller's streams, environment, and directory."""
     OUT_STREAM.set(out)
     ERR_STREAM.set(err)
-    ENV.set(dict(request.env))
-    OVERLAID_NAMES.set(frozenset(FORWARDED_ENV))
+    # A request names only the variables the protocol forwards, so a client that
+    # sends ``TRACKINIZER_TOKEN`` anyway still reads it as absent.
+    ENV.set(
+        {name: value for name, value in request.env.items() if name in FORWARDED_ENV},
+    )
+    # ``TRACKINIZER_TOKEN`` is claimed but never forwarded: without the claim, a
+    # name the caller did not send falls through to the daemon's own environment
+    # and its key would authenticate this caller against the caller's server.
+    OVERLAID_NAMES.set(frozenset((*FORWARDED_ENV, KEY_ENV)))
     CWD.set(request.cwd)
     # The daemon's stdout is a socket, so ``isatty()`` there is always False
     # and autodetection would size every table as if piped.

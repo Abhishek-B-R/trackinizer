@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import pytest
 
+from trackinizer.lib.agent.sessions import shell_results
 from trackinizer.lib.agent.sessions.shell_results import (
     lift_shell_result,
     shell_result_for_replay,
@@ -17,6 +19,37 @@ from trackinizer.lib.agent.types.sessions import (
     FileWriteResult,
     ShellCommandResult,
 )
+
+
+if TYPE_CHECKING:
+    from trackinizer.lib.agent.sessions.shell_results import _BashNode
+
+
+class _Node:
+    def __init__(
+        self,
+        *,
+        kind: str = "word",
+        word: str = "",
+        parts: list[_BashNode] | None = None,
+        type: str = "",
+        input: int | None = None,
+        output: _BashNode | None = None,
+        heredoc: _BashNode | None = None,
+        value: str = "",
+        pos: tuple[int, int] = (0, 0),
+        op: str = "",
+    ) -> None:
+        self.kind = kind
+        self.word = word
+        self.parts = parts or []
+        self.type = type
+        self.input = input
+        self.output = output or self
+        self.heredoc = heredoc
+        self.value = value
+        self.pos = pos
+        self.op = op
 
 
 @pytest.mark.parametrize(
@@ -251,6 +284,9 @@ def test_an_append_lifts_to_the_lines_it_added(script: str, udiff: str) -> None:
         ("sed -n '/^def /,/^class /p' a.txt", ((None, None),)),
         ("head -20 a.txt", ((1, 20),)),
         ("head -n 20 a.txt", ((1, 20),)),
+        # An unstated count is coreutils' default of 10, not the whole file.
+        ("head a.txt", ((1, 10),)),
+        ("tail a.txt", ((None, 10),)),
         # ``tail`` counts backwards from the end, so it states a count only.
         ("tail -5 a.txt", ((None, 5),)),
         ("tail -n 5 a.txt", ((None, 5),)),
@@ -267,6 +303,8 @@ def test_an_append_lifts_to_the_lines_it_added(script: str, udiff: str) -> None:
         "sed-regex",
         "head-bare",
         "head-n",
+        "head-default",
+        "tail-default",
         "tail-bare",
         "tail-n",
         "cat",
@@ -567,6 +605,301 @@ def test_replay_uses_the_operand_position_when_argv_values_repeat() -> None:
 
     assert replay is not None
     assert replay.command == ("/bin/cat", "new")
+
+
+def test_replay_renames_the_operand_not_an_earlier_word_with_its_text() -> None:
+    # The script and the file carry the same text, so a lookup by value
+    # rewrote the script and left the file named as before.
+    shell = ShellCommandResult(
+        call_id="c1",
+        command=("sed", "-i", "s/a/b/", "s/a/b/"),
+        exit_code=0,
+    )
+    lifted = lift_shell_result(shell)
+    assert isinstance(lifted, FileEditResult)
+
+    replay = shell_result_for_replay(replace(lifted, path="x"))
+
+    assert replay is not None
+    assert replay.command == ("sed", "-i", "s/a/b/", "x")
+
+
+def test_an_edited_quoted_heredoc_write_rewrites_its_content() -> None:
+    script = "cat > f << 'EOF'\nold\nEOF\n"
+    result = FileWriteResult(call_id="c1", path="f", content="new\n")
+
+    assert shell_results.rewrite_shell_source(script, result) == (
+        "/usr/bin/printf %s 'new\n' > f\n"
+    )
+
+
+def test_replay_preserves_stderr_from_the_shell_result() -> None:
+    shell = ShellCommandResult(
+        call_id="c1",
+        command=("cat", "a.txt"),
+        stderr="warning",
+        exit_code=0,
+    )
+    lifted = lift_shell_result(shell)
+    assert isinstance(lifted, FileReadResult)
+
+    replay = shell_result_for_replay(lifted)
+
+    assert replay is not None
+    assert replay.stderr == "warning"
+
+
+def test_rewrite_of_an_unrecognized_command_is_unchanged() -> None:
+    result = FileReadResult(call_id="c1", path="a.txt", content="body")
+
+    assert (
+        shell_results.rewrite_shell_source("unknown a.txt", result) == "unknown a.txt"
+    )
+
+
+def _other_utility(executable: str) -> str:
+    del executable
+    return "other"
+
+
+@pytest.mark.parametrize(
+    ("script", "expected"),
+    [
+        ("cd sub && echo old >| a.txt", "cd sub && /usr/bin/printf %s new >| a.txt"),
+        (
+            "cd sub && cat > a.txt <<- 'EOF'\n\told\n\tEOF\n",
+            "cd sub && /usr/bin/printf %s new > a.txt\n",
+        ),
+    ],
+    ids=["chdir", "tab-heredoc"],
+)
+def test_a_rewrite_splices_into_the_original_spans(script: str, expected: str) -> None:
+    # Both halves of the old reparse: a heredoc's body and terminator are
+    # replaced with the command, and the chdir prefix and trailer survive.
+    result = FileWriteResult(call_id="c1", path="sub/a.txt", content="new")
+
+    assert shell_results.rewrite_shell_source(script, result) == expected
+
+
+def test_rewrite_shell_source_changes_only_a_write_content() -> None:
+    result = FileWriteResult(call_id="c1", path="a.txt", content="new")
+
+    assert shell_results.rewrite_shell_source("echo old > a.txt", result) == (
+        "/usr/bin/printf %s new > a.txt"
+    )
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "cat < a.txt",
+        "cat a.txt | head -n 1",
+        "cd /w; cat a.txt",
+        "cd /w /x && cat a.txt",
+        "cat a.txt && cat b.txt",
+        "cat",
+        "cat -n a.txt",
+        "head -n nope a.txt",
+        "head -n 2 -a.txt",
+        "sed -n '0p' a.txt",
+        "sed -n '' a.txt",
+        "sed -n '1w out.txt' a.txt",
+        "nl -ba -a.txt",
+        "patch a.diff b.txt",
+        "sed -i s/a/b/",
+        "sed -i s/a/b/ a.txt b.txt",
+        "cat > a.txt 2> errors.txt",
+        "printf body > a.txt 2> errors.txt",
+        "tee a.txt b.txt",
+        "tee -p a.txt",
+    ],
+)
+def test_unsupported_shell_shapes_are_not_lifted(script: str) -> None:
+    shell = ShellCommandResult(
+        call_id="c1",
+        command=("bash", "-lc", script),
+        exit_code=0,
+    )
+
+    assert lift_shell_result(shell) is None
+
+
+def test_patch_heredoc_carries_the_inline_diff() -> None:
+    shell = ShellCommandResult(
+        call_id="c1",
+        command=(
+            "bash",
+            "-lc",
+            "/usr/bin/patch a.txt << 'EOF'\n@@ -1 +1 @@\n-a\n+b\nEOF\n",
+        ),
+        exit_code=0,
+    )
+
+    lifted = lift_shell_result(shell)
+
+    assert isinstance(lifted, FileEditResult)
+    assert render_udiff(lifted.edits) == "@@ -1 +1 @@\n-a\n+b\n"
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "bash -x echo",
+        "echo hi > a.txt 2> e.txt",
+        "echo hi < a.txt",
+        "sed --in-place s/a/b/ a.txt",
+        "sed -i.bak s/a/b/ a.txt",
+        "sed -i -e s/a/b/",
+        "patch a.txt b.txt",
+        "head -n nope a.txt",
+        "head -n 2 -a.txt",
+        "sed -n '$p' a.txt",
+        "sed -n '1,0p' a.txt",
+    ],
+)
+def test_rewriting_unsupported_shapes_preserves_the_source(script: str) -> None:
+    result = FileReadResult(call_id="c1", path="a.txt", content="body")
+
+    assert shell_results.rewrite_shell_source(script, result) == script
+
+
+def test_rewrite_stencils_a_shell_command_with_an_edited_path() -> None:
+    result = FileReadResult(call_id="c1", path="new.txt", content="body")
+
+    assert shell_results.rewrite_shell_source("cat old.txt", result) == "cat new.txt"
+    assert shell_results._stencil_command(
+        ("bash", "-lc", "unknown"),
+        result,
+    ) == ("bash", "-lc", "unknown")
+
+
+def test_shell_source_rejects_a_shell_without_a_c_flag() -> None:
+    assert shell_results._shell_source(("bash", "-x", "echo")) is None
+    assert shell_results._shell_source(None) is None
+
+
+def test_unknown_utility_is_not_a_file_operation() -> None:
+    node = _Node(kind="word", word="unknown", parts=[], pos=(0, 7))
+    assert shell_results._matched_row([node], quoted=None) is None
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(shell_results, "_standard_utility", _other_utility)
+        assert shell_results._matched_row([node], quoted=None) is None
+
+
+def test_matched_row_rejects_non_command_nodes() -> None:
+    node = _Node(kind="operator", word="", parts=[], pos=(0, 1))
+    assert shell_results._matched_row([node], quoted=None) is None
+
+
+def test_simple_command_rejects_compounds_and_invalid_cd_prefixes() -> None:
+    assert shell_results._simple_command("cd /w && cat a && cat b") is None
+    assert shell_results._simple_command("cd >log && cat a") is None
+    assert shell_results._simple_command("a;b") is None
+
+
+def test_quoted_heredoc_requires_a_terminator() -> None:
+    assert shell_results._quoted_heredoc("cat > a.txt << 'EOF'\nbody\n") is None
+
+
+def test_heredoc_write_rejects_non_cat_and_invalid_body() -> None:
+    redirect = _Node(
+        kind="redirect",
+        type=">",
+        input=None,
+        output=_Node(pos=(0, 1)),
+    )
+    word = _Node(kind="word", word="echo", parts=[], pos=(0, 4))
+
+    assert shell_results._heredoc_write([word, redirect], literal=True) is None
+    assert shell_results._heredoc_write([word], literal=True) is None
+
+
+def test_heredoc_write_rejects_missing_delimiter_and_body() -> None:
+    output = _Node(kind="word", word="a", parts=[], pos=(0, 1))
+    document = _Node(
+        kind="redirect",
+        type="<<",
+        input=None,
+        output=output,
+        heredoc=None,
+    )
+    cat = _Node(kind="word", word="cat", parts=[], pos=(0, 3))
+    assert shell_results._heredoc_write([cat, document], literal=True) is None
+    document.heredoc = _Node(value="body")
+    document.output.word = "EOF"
+    assert shell_results._heredoc_write([cat, document], literal=True) is None
+
+    echo = _Node(kind="word", word="echo", parts=[], pos=(0, 4))
+    assert shell_results._heredoc_write([echo, document], literal=True) is None
+    document.output.word = "-"
+    target = _Node(
+        kind="redirect",
+        type=">",
+        input=None,
+        output=_Node(kind="word", word="a", parts=[], pos=(0, 1)),
+    )
+    assert shell_results._heredoc_write([cat, target, document], literal=True) is None
+    document.output.word = "EOF"
+    assert shell_results._heredoc_write([cat, target, document], literal=True) is None
+
+
+def test_single_output_rejects_other_descriptors_and_redirects() -> None:
+    output = _Node(kind="word", word="a", parts=[], pos=(0, 1))
+    descriptor = _Node(input=2, type=">", output=output)
+    unknown = _Node(input=None, type="<", output=output)
+
+    assert shell_results._single_output([descriptor]) is None
+    assert shell_results._single_output([unknown]) is None
+
+
+def test_patch_helpers_reject_invalid_operands() -> None:
+    word = _Node(kind="word", word="patch", parts=[], pos=(0, 5))
+    path = _Node(kind="word", word="-x", parts=[], pos=(6, 8))
+    target = _Node(kind="word", word="a", parts=[], pos=(6, 7))
+
+    assert shell_results._patch_heredoc([word], body="diff") is None
+    assert shell_results._patch_heredoc([word, path], body="diff") is None
+    assert shell_results._patch_operation(["patch", "a", "b"], [word], []) is None
+    assert shell_results._patch_operation(["patch", "a"], [word, target], []) == (
+        "rewrite",
+        "a",
+        (6, 7),
+        "",
+        (),
+    )
+
+
+def test_line_reader_supports_lines_equals_and_rejects_dash_paths() -> None:
+    path = _Node(pos=(0, 1))
+    count = _Node(pos=(0, 1))
+    nodes = [_Node(pos=(0, 1)) for _ in range(3)]
+    assert shell_results._line_reader_operation(
+        "head",
+        ["head", "--lines=2", "a"],
+        nodes,
+    ) == ("read", "a", nodes[2].pos, None, ((1, 2),))
+    assert (
+        shell_results._line_reader_operation(
+            "head",
+            ["head", "-x"],
+            [path, count],
+        )
+        is None
+    )
+    assert shell_results._line_reader_operation(
+        "head",
+        ["head", "a"],
+        [path, count],
+    ) == ("read", "a", count.pos, None, ((1, 10),))
+    assert shell_results._simple_command("") is None
+
+    class Parser:
+        def parse(self, _: str) -> list[object]:
+            return []
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(shell_results, "bashlex", Parser())
+        assert shell_results._simple_command("anything") is None
 
 
 if __name__ == "__main__":

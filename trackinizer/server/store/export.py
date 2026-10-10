@@ -39,7 +39,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, cast
 
-from trackinizer.lib.custom_json import loads
+import json
+
 from trackinizer.server.notify import tx
 from trackinizer.server.store.read import _lower_filter
 from trackinizer.server.store.shared import _StoreShared
@@ -236,6 +237,6 @@ async def _read_table(
         row = {name: record[name] for name, _ in columns}
         for name in json_columns:
             if (text := row[name]) is not None:
-                row[name] = loads(cast(str, text))
+                row[name] = json.loads(cast(str, text))
         rows.append(row)
     return tuple(rows)

@@ -1,0 +1,25 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/api/me/profile"
+  },
+  "response": {
+    "body": {
+      "acknowledged_at": null,
+      "acknowledged_rules_version": null,
+      "api_key_id": null,
+      "email": "no-auth@localhost",
+      "last_login": null,
+      "name": "no-auth",
+      "role": "admin",
+      "rules_issue_id": null,
+      "rules_version": null,
+      "user_id": "00000000-0000-4000-9000-000000000001",
+      "visual_workspace_enabled": true
+    },
+    "headers": {
+      "content-type": "application/json"
+    },
+    "status": 200
+  }
+}

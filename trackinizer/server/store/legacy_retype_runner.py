@@ -26,10 +26,8 @@ rewrite preserves, so retyped history must not re-surface as fresh activity.
 Idempotent by content: a part with no ``legacy/*`` payload kinds is a no-op,
 so a cancelled run resumes by re-running.
 
-Sharding: ``retype_all`` splits sessions by ``hashtext(session_id::text)`` --
-the split ``session_ir_storage_cost.md`` measured at 171 s where the serial
-form burned 19 minutes. Shards are disjoint; each session rewrites under its
-own transaction.
+Sharding: ``retype_all`` splits sessions by ``hashtext(session_id::text)``.
+Shards are disjoint; each session rewrites under its own transaction.
 
 Maintenance run-hook (``docs/db_schema_migration.md``: a backfill runs
 against the live database BEFORE any restart, old server still serving)::
@@ -53,13 +51,7 @@ from uuid import UUID
 import json
 
 from trackinizer.lib.agent.types.sessions import UncategorizedRecord
-from trackinizer.lib.custom_json import (
-    DataclassCodec,
-    DictCodec,
-    StrCodec,
-    json_unfreeze,
-    loads,
-)
+from trackinizer.lib.codec import from_plain, loads, mutable
 from trackinizer.server.notify import tx
 from trackinizer.server.store.legacy_retype import (
     LEGACY_KINDS,
@@ -215,6 +207,8 @@ class _Output:
 
 async def _read_sources(conn: Conn, session_id: UUID) -> list[_Source]:
     """Read the part's rows in ``idx`` order, ciphertext joined, rows locked."""
+    # pragma: no mutate start -- the db_pglite tests exercise this SQL, and the
+    # mutation run deselects them.
     rows = await conn.fetch(
         "SELECT r.kind, r.context_id, r.timestamp, r.model, r.created, "
         "r.payload, r.text, "
@@ -228,6 +222,7 @@ async def _read_sources(conn: Conn, session_id: UUID) -> list[_Source]:
         session_id,
         _LEGACY_PART,
     )
+    # pragma: no mutate end
     sources: list[_Source] = []
     for row in rows:
         kind = row["kind"]
@@ -265,8 +260,13 @@ async def _read_sources(conn: Conn, session_id: UUID) -> list[_Source]:
                 created=created,
                 payload_text=payload_text,
                 text=text,
-                legacy_kind=StrCodec.coerce(
-                    DictCodec.coerce(loads(payload_text)).get("kind"),
+                # A row already retyped has no legacy ``kind``.
+                legacy_kind=from_plain(
+                    from_plain(loads(payload_text), dict[str, object]).get(
+                        "kind",
+                    ),
+                    str,
+                    default="",
                 ),
                 ciphertext="" if raw_bytes is None else raw_bytes.decode(),
             ),
@@ -300,14 +300,18 @@ def _outputs_for(
                 ciphertext=source.ciphertext,
             ),
         ]
-    record = DataclassCodec.from_json(
+    record = from_plain(
+        from_plain(loads(source.payload_text), dict[str, object]),
         UncategorizedRecord,
-        DictCodec.coerce(loads(source.payload_text)),
     )
     out = retype(
         record,
         timestamp=(
-            source.timestamp.isoformat() if source.timestamp is not None else None
+            source.timestamp.isoformat()
+            if source.timestamp is not None
+            else source.created.isoformat()
+            if source.legacy_kind == "legacy/SlashCommand"
+            else None
         ),
         ciphertext=source.ciphertext,
     )
@@ -330,7 +334,7 @@ def _outputs_for(
                 model=source.model,
                 created=source.created,
                 payload_text=json.dumps(
-                    json_unfreeze(row.payload),
+                    mutable(row.payload),
                     separators=(",", ":"),
                 ),
                 text=row.text,

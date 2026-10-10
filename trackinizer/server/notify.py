@@ -14,7 +14,7 @@ import logging
 
 import asyncpg
 
-from trackinizer.lib.custom_json import DictCodec, StrCodec, loads
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.lib.postgres import DatabaseEngine
 
 
@@ -42,6 +42,8 @@ __all__ = [
     "NOTIFICATION_BUFFER",
     "NOTIFY_CHANNEL",
     "Notification",
+    "changed_id",
+    "iter_changed_ids",
     "iter_sse_events",
     "notify_after_commit",
     "tx",
@@ -152,6 +154,10 @@ async def iter_sse_events(
     body byte, and the Cloudflare edge answers 524 after 125 s without one and
     cuts a stream idle for 125 s, so a quiet stream never opened in the browser.
 
+    The opening comment follows the subscription, so every change notified after
+    it reaches the stream: a client may treat a read it starts after ``open`` as
+    covered from then on.
+
     Args:
       engine: Database connection to listen on.
       keepalive_sec: Longest silence before a keep-alive comment; must stay
@@ -161,13 +167,18 @@ async def iter_sse_events(
       item: SSE-formatted frames (bytes with id and newline) and comments.
 
     """
-    yield b": open\n\n"
     payloads = engine.listen(NOTIFY_CHANNEL)
     # One ``anext`` stays pending across keep-alives: ``asyncio.wait_for``
     # would cancel it, which throws into the listen generator and ends the
     # subscription.
     pending = asyncio.ensure_future(anext(payloads))
     try:
+        # The bus registers a listener when its generator first runs, which is this
+        # ``anext``'s first step; one pass of the loop takes it there. Saying
+        # ``open`` before it lost the changes in between, so every client read
+        # everything again on every open.
+        await asyncio.sleep(0)
+        yield b": open\n\n"
         while True:
             done, _ = await asyncio.wait({pending}, timeout=keepalive_sec)
             if not done:
@@ -187,11 +198,38 @@ async def iter_sse_events(
         await payloads.aclose()
 
 
-def _sse_frame(payload: str) -> bytes:
-    """One SSE ``data:`` frame for a NOTIFY payload; empty for a malformed one."""
+async def iter_changed_ids(engine: DatabaseEngine) -> AsyncGenerator[str]:
+    """Yield the inquiry id of each ``NOTIFY_CHANNEL`` payload, as the web stream relays it.
+
+    Args:
+      engine: Database connection to listen on.
+
+    Yields:
+      id: An inquiry id; a malformed payload is logged and skipped.
+
+    """
+    payloads = engine.listen(NOTIFY_CHANNEL)
     try:
-        payload_data = DictCodec.coerce(loads(payload))
-        subject_id = StrCodec.coerce(payload_data["id"])
+        async for payload in payloads:
+            if (subject_id := changed_id(payload)) is not None:
+                yield subject_id
+    finally:
+        await payloads.aclose()
+
+
+def changed_id(payload: str) -> str | None:
+    """Read the inquiry id out of a NOTIFY payload; None for a malformed one.
+
+    Args:
+      payload: The payload ``_publish_notifications`` sent.
+
+    Returns:
+      id: The inquiry id.
+
+    """
+    try:
+        payload_data = from_plain(loads(payload), dict[str, object])
+        return from_plain(payload_data["id"], str)
     except (json.JSONDecodeError, KeyError, TypeError):
         # Drop one bad payload rather than kill the stream, but LOG it: a
         # silent drop would hide a payload-shape regression (the producer
@@ -201,6 +239,13 @@ def _sse_frame(payload: str) -> bytes:
             NOTIFY_CHANNEL,
             payload,
         )
+        return None
+
+
+def _sse_frame(payload: str) -> bytes:
+    """One SSE ``data:`` frame for a NOTIFY payload; empty for a malformed one."""
+    subject_id = changed_id(payload)
+    if subject_id is None:
         return b""
     return f"data: {json.dumps({'id': subject_id})}\n\n".encode()
 

@@ -1,7 +1,8 @@
 """The inquiry-kind verbs (``issue``, ``belief``, ...) and the helper commands.
 
-The 8 kind names share one ``Kind`` command; ``recent``, ``next``,
-``blocked``, ``graph``, ``board``, and ``cost`` each get their own class.
+The nine kind names share one ``Kind`` command. Helpers cover recent activity,
+search, identity, scheduling, graphs, costs, confidence, authority, messaging,
+version, export, and visual workspaces.
 """
 
 from __future__ import annotations
@@ -15,13 +16,7 @@ import sys
 import uuid
 
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.custom_json import (
-    DictCodec,
-    FloatCodec,
-    IntCodec,
-    ListCodec,
-    StrCodec,
-)
+from trackinizer.lib.codec import from_plain
 from trackinizer.trax import render
 from trackinizer.trax.commands import Command, HelpPage
 from trackinizer.trax.context import cwd, env
@@ -162,7 +157,7 @@ _NEGATIVE_CITATION_LABELS: Final[Mapping[Edge.Kind, tuple[str, str]]] = {
 
 
 class Kind(Command):
-    """The 8 inquiry-kind names, each acting as a verb.
+    """The nine inquiry-kind names, each acting as a verb.
 
     One parser handles every shape; :meth:`run` routes by looking at the
     trailing positionals:
@@ -237,6 +232,28 @@ class Kind(Command):
 
     @classmethod
     @override
+    def dispatch(
+        cls,
+        verb: str,
+        rest: list[str],
+        client_factory: Callable[[], Client],
+    ) -> None:
+        """Parse inquiry arguments without consuming a native runner's tail.
+
+        Args:
+          verb: Inquiry kind spelling.
+          rest: Unparsed command arguments.
+          client_factory: Authenticated client factory.
+
+        """
+        if verb == "agentsession" and (split := _split_run_tail(rest)) is not None:
+            args = cls.make_parser().parse_args(split[0])
+            cls.run_resume(split[0], split[1], args, client_factory)
+            return
+        super().dispatch(verb, rest, client_factory)
+
+    @classmethod
+    @override
     def run(
         cls,
         verb: str,
@@ -267,7 +284,7 @@ class Kind(Command):
             return run_bulk_apply(bulk, args, client_factory)
         if query := parse_list_query(kind, rest):
             return run_list_query(query, args, client_factory)
-        if subjects := parse_subject_list(rest, default_kind=kind):
+        if (subjects := parse_subject_list(rest, default_kind=kind)) is not None:
             for subject in subjects:
                 run_show(subject, args, client_factory)
             return None
@@ -306,7 +323,7 @@ class Kind(Command):
           tokens: Row-specific suffix (edge index if any).
           args: CLI namespace (sort, format, width).
           client_factory: Callable that creates a client.
-          against: Flip the edge direction for display.
+          against: Select citations with negative valence.
 
         """
         if len(tokens) > 1:
@@ -392,15 +409,10 @@ class Kind(Command):
         if not starts_with_ref(before):
             raise ClientError("run needs one session: trax agentsession 42 run claude")
         target, *runner_args = tail
-        # ``--lossy`` gates the CONVERSION, which happens before any runner
-        # exists, so it is the tail's own rather than something to forward.
-        #
-        # Read off the parsed namespace, not the raw tail: this parser
-        # declares the flag (it must, or it rejects the command outright) and
-        # therefore has already consumed it -- scanning ``runner_args`` for it
-        # found nothing and every ``--lossy`` resume was refused anyway.
-        lossy = bool(_arg_bool(args, "lossy"))
-        forwarded = [arg for arg in runner_args if arg != "--lossy"]
+        boundary = runner_args.index("--") if "--" in runner_args else len(runner_args)
+        options, native = runner_args[:boundary], runner_args[boundary:]
+        lossy = _arg_bool(args, "lossy") or "--lossy" in options
+        forwarded = [arg for arg in options if arg != "--lossy"] + native
         ref, consumed = consume_ref(before, 0, kind_hint="AgentSession")
         if before[consumed:]:
             raise ClientError(
@@ -615,7 +627,13 @@ class Kind(Command):
     ) -> list[dict[str, object]]:
         edge_kind, inbound = relation
         bucket = "backlinks" if inbound else "edges"
-        rows = ListCodec.mappings(DictCodec.coerce(payload.get(bucket)).get(edge_kind))
+        rows = from_plain(
+            from_plain(payload.get(bucket), dict[str, object], default={}).get(
+                edge_kind,
+            ),
+            list[dict[str, object]],
+            default=[],
+        )
         if against:
             # A ``dis*`` spelling selects the negative-valence (against) subset of
             # the shared citation kind: for-vs-against is the valence sign.
@@ -660,8 +678,8 @@ class Kind(Command):
         relation: tuple[str, bool],
     ) -> dict[str, object]:
         edge_kind, inbound = relation
-        subject = DictCodec.coerce(subject_payload["self"])
-        peer = DictCodec.coerce(peer_payload["self"])
+        subject = from_plain(subject_payload["self"], dict[str, object])
+        peer = from_plain(peer_payload["self"], dict[str, object])
         source, target = (peer, subject) if inbound else (subject, peer)
         # For-vs-against is the sign of valence: a negative-valence citation reads
         # with the dis* spelling, not the plain kind name.
@@ -681,11 +699,18 @@ class Kind(Command):
         target_id = str(target.get("id") or "")
         changes = [
             change
-            for change in ListCodec.mappings(source_payload.get("changes"))
+            for change in from_plain(
+                source_payload.get("changes"),
+                list[dict[str, object]],
+                default=[],
+            )
             if any(
-                DictCodec.coerce(snapshot).get("peer_edge_kind") == edge_kind
-                and DictCodec.coerce(snapshot).get("peer_id") == target_id
-                for snapshot in (change.get("old"), change.get("new"))
+                from_plain(snapshot.get("peer_edge_kind"), str, default="") == edge_kind
+                and from_plain(snapshot.get("peer_id"), str, default="") == target_id
+                for snapshot in (
+                    from_plain(change.get("old"), dict[str, object], default={}),
+                    from_plain(change.get("new"), dict[str, object], default={}),
+                )
             )
         ]
         return {
@@ -705,7 +730,10 @@ class Kind(Command):
         sort: str,
     ) -> list[dict[str, object]]:
         if sort == "seq":
-            return sorted(rows, key=lambda row: IntCodec.coerce(row.get("seq")))
+            return sorted(
+                rows,
+                key=lambda row: from_plain(row.get("seq"), int, default=0),
+            )
         if sort == "recent":
             return sorted(
                 rows,
@@ -717,7 +745,7 @@ class Kind(Command):
         if sort == "valence":
             return sorted(
                 rows,
-                key=lambda row: FloatCodec.coerce(row.get("valence")),
+                key=lambda row: from_plain(row.get("valence"), float, default=0.0),
                 reverse=True,
             )
         return sorted(
@@ -729,8 +757,8 @@ class Kind(Command):
                 # defaults to 20; an explicit 0 is preserved.
                 20
                 if row.get("priority") is None
-                else IntCodec.coerce(row.get("priority"), 0),
-                IntCodec.coerce(row.get("seq")),
+                else from_plain(row.get("priority"), int, default=20),
+                from_plain(row.get("seq"), int, default=0),
             ),
         )
 
@@ -766,7 +794,7 @@ class Kind(Command):
             _kind, _target_id, payload = client.get_inquiry(
                 UuidRef(uuid=uuid.UUID(str(row["id"]))),
             )
-            self_row = DictCodec.coerce(payload["self"])
+            self_row = from_plain(payload["self"], dict[str, object])
             hydrated.append(dict(self_row, **cls._relation_edge_metadata(row)))
         return hydrated
 
@@ -872,12 +900,10 @@ class Kind(Command):
         # arg". ``None`` threads the clear through ``add_edge`` to the labels
         # route that writes NULL; ``()`` leaves stored labels untouched
         # (TRAX-CLI-004).
-        labels = cast(Sequence[str] | None, metadata.get("labels"))
-        edge_labels: Sequence[str] | None
+        labels = from_plain(metadata.get("labels"), list[str], default=[])
+        edge_labels: Sequence[str] | None = labels
         if "labels" in metadata and not labels:
             edge_labels = None
-        else:
-            edge_labels = labels or ()
         result = client.add_edge(
             src_id,
             tgt_id,
@@ -892,6 +918,8 @@ class Kind(Command):
             echo(f"added: {source} {edge_kind} {target}")
         elif result.changed:
             echo(f"annotated: {source} {edge_kind} {target}")
+        else:
+            echo(f"exists: {source} {edge_kind} {target}")
 
     @classmethod
     def run_create(
@@ -956,7 +984,6 @@ class Kind(Command):
         cls._flatten_inline_tree(
             edge_actions,
             from_index=0,
-            actor=actor,
             client=client,
             items=items,
             edges=edges,
@@ -1108,7 +1135,6 @@ class Kind(Command):
         actions: Sequence[EdgeAction],
         *,
         from_index: int,
-        actor: Inquiry.Actor,
         client: Client,
         items: list[tuple[Inquiry.InquiryKind, Mapping[str, object]]],
         edges: list[dict[str, object]],
@@ -1134,7 +1160,6 @@ class Kind(Command):
                 cls._flatten_inline_tree(
                     target.edges,
                     from_index=new_index,
-                    actor=actor,
                     client=client,
                     items=items,
                     edges=edges,
@@ -1330,7 +1355,6 @@ class Kind(Command):
         cls._flatten_inline_tree(
             target.edges,
             from_index=0,
-            actor=actor,
             client=client,
             items=items,
             edges=edges,
@@ -1621,7 +1645,7 @@ def run_bulk_apply(
     actions = _resolve_stdin_actions(bulk.actions)
     for row in rows:
         row_kind = cast(Inquiry.InquiryKind, row["kind"])
-        ref = SeqRef(kind=row_kind, seq=IntCodec.coerce(row["seq"], 0))
+        ref = SeqRef(kind=row_kind, seq=from_plain(row["seq"], int))
         run_actions(ref, actions, args, client_factory, kind=row_kind)
 
 
@@ -1671,7 +1695,7 @@ def run_field(
     del args
     client = client_factory()
     _kind, _target_id, payload = client.get_inquiry(ref)
-    row = DictCodec.coerce(payload["self"])
+    row = from_plain(payload["self"], dict[str, object])
     if field not in row:
         raise ClientError(f"field {field!r} not present on {ref}")
     echo(format_field_value(row[field]))
@@ -2165,7 +2189,11 @@ Examples:
             # off-window (status unknown) prerequisite still blocks the row.
             prerequisites = [
                 pid
-                for ref in ListCodec.mappings(row.get("requires"))
+                for ref in from_plain(
+                    row.get("requires"),
+                    list[dict[str, object]],
+                    default=[],
+                )
                 if (pid := str(ref.get("id")))
                 and status_by_id.get(pid, "active") == "active"
             ]
@@ -2249,7 +2277,10 @@ Options:
             for pid in _ref_ids(row.get("requires"))
             if pid in rows_by_id
         }
-        ordered = sorted(rows, key=lambda row: IntCodec.coerce(row.get("seq")))
+        ordered = sorted(
+            rows,
+            key=lambda row: from_plain(row.get("seq"), int, default=0),
+        )
         roots = [row for row in ordered if str(row.get("id")) not in depended_on]
         # ``rendered`` spans the whole forest so a node reachable from many
         # roots is expanded once. Without it a layered graph re-renders every
@@ -2622,7 +2653,7 @@ Notes:
             room=room,
         )
         if not delivered:
-            scope = f"@{actor}:{room}" if room else f"@{actor}"
+            scope = f"@{actor}:{room}" if room is not None else f"@{actor}"
             echo(f"undelivered: no live session matches {scope}")
             return
         echo(f"sent to {len(delivered)} session(s)")
@@ -2718,12 +2749,24 @@ class Workspace(Command):
 
     names = ("workspace",)
     help = HelpPage(
-        usage="trax workspace WORKSPACE_UUID [show TYPE | hide UUID | focus UUID | place UUID PLACEMENT]",
-        summary="Read a workspace or change its visible modules.",
-        options=(("--record UUID", "Record target for a shown visual."),),
+        usage="trax workspace WORKSPACE_UUID [show TYPE | navigate ROUTE | highlight UUID[,UUID...] | hide UUID | focus UUID | place UUID PLACEMENT]",
+        summary="Read a workspace, change its visible modules, move its page, or mark records.",
+        options=(
+            ("--record UUID", "Record target for a shown visual."),
+            (
+                "--param KEY=VALUE",
+                (
+                    "Parameter of a shown visual, repeatable; its value is read as "
+                    "the type the visual catalog gives that parameter."
+                ),
+            ),
+        ),
         examples=(
             "trax workspace 11111111-1111-1111-1111-111111111111",
-            "trax workspace UUID show trax.chat --record RECORD_UUID --placement side",
+            "trax workspace UUID show trax.subgraph --record RECORD_UUID --placement side",
+            "trax workspace UUID show trax.timeline --record RECORD_UUID --param direction_limit=5",
+            "trax workspace UUID navigate '#/list/Issue'",
+            "trax workspace UUID highlight RECORD_UUID,RECORD_UUID",
             "trax workspace UUID hide INSTANCE_UUID",
         ),
         notes=("Mutations fetch the current revision before applying one operation.",),
@@ -2737,11 +2780,15 @@ class Workspace(Command):
         parser.add_argument(
             "action",
             nargs="?",
-            choices=("show", "hide", "focus", "place"),
+            choices=("show", "navigate", "highlight", "hide", "focus", "place"),
         )
         parser.add_argument("subject", nargs="*")
         parser.add_argument("--record")
-        parser.add_argument("--placement", choices=("main", "side", "floating"))
+        parser.add_argument(
+            "--placement",
+            choices=("main", "left", "side", "floating"),
+        )
+        parser.add_argument("--param", action="append", default=[], metavar="KEY=VALUE")
         return parser
 
     @classmethod
@@ -2755,35 +2802,57 @@ class Workspace(Command):
         del verb
         flags = cast(_WorkspaceArgs, args)
         workspace_id = _workspace_uuid(flags.workspace_id, "workspace")
-        path = f"/api/workspaces/{workspace_id}"
         client = client_factory()
-        current = client.get(path)
         if flags.action is None:
-            if flags.subject or flags.record or flags.placement:
+            record = flags.record or ""
+            if flags.subject or record or flags.placement is not None or flags.param:
                 raise ClientError("workspace read does not accept operation arguments")
-            _print_workspace(current)
+            _print_workspace(client.read_workspace(workspace_id))
             return
-        operation = _workspace_operation(flags)
-        revision = IntCodec.coerce(DictCodec.coerce(current).get("revision"))
-        updated = client.post(
-            f"{path}/operations",
-            body={"revision": revision, "operation": operation},
+        if flags.action == "highlight":
+            updated = client.highlight(workspace_id, ids=_highlight_ids(flags))
+            _print_workspace(updated)
+            return
+        parameters = (
+            _visual_parameters(client, visual_type=flags.subject[0])
+            if flags.action == "show" and flags.param and len(flags.subject) == 1
+            else {}
         )
+        operation = _workspace_operation(flags, parameters=parameters)
+        if operation["kind"] == "navigate":
+            updated = client.navigate(workspace_id, route=str(operation["route"]))
+        else:
+            updated = client.apply_workspace_operation(
+                workspace_id,
+                operation=operation,
+            )
         _print_workspace(updated)
 
 
-def _workspace_operation(args: _WorkspaceArgs) -> dict[str, object]:
+def _workspace_operation(
+    args: _WorkspaceArgs,
+    *,
+    parameters: Mapping[str, str],
+) -> dict[str, object]:
     """Build one validated workspace operation from CLI arguments."""
     subject = list(args.subject)
     operation: dict[str, object]
+    if args.param and args.action != "show":
+        raise ClientError("--param is accepted only with show")
     if args.action == "show":
         if len(subject) != 1:
             raise ClientError("show requires one visual type")
-        operation = {"kind": "show", "visual_type": subject[0], "params": {}}
+        operation = {"kind": "show", "visual_type": subject[0]}
         if args.placement is not None:
             operation["placement"] = args.placement
         if args.record is not None:
             operation["record_id"] = str(_workspace_uuid(args.record, "record"))
+        if args.param:
+            operation["params"] = _workspace_params(args.param, parameters=parameters)
+    elif args.action == "navigate":
+        if len(subject) != 1 or args.record is not None or args.placement is not None:
+            raise ClientError("navigate requires one route")
+        operation = {"kind": "navigate", "route": subject[0]}
     elif args.action in {"hide", "focus"}:
         if len(subject) != 1 or args.record is not None or args.placement is not None:
             raise ClientError(f"{args.action} requires one instance UUID")
@@ -2796,7 +2865,7 @@ def _workspace_operation(args: _WorkspaceArgs) -> dict[str, object]:
             len(subject) != 2
             or args.record is not None
             or args.placement is not None
-            or subject[1] not in {"main", "side", "floating"}
+            or subject[1] not in {"main", "left", "side", "floating"}
         ):
             raise ClientError("place requires an instance UUID and placement")
         operation = {
@@ -2807,22 +2876,86 @@ def _workspace_operation(args: _WorkspaceArgs) -> dict[str, object]:
     return operation
 
 
+def _highlight_ids(args: _WorkspaceArgs) -> list[uuid.UUID]:
+    """Read ``highlight``'s one comma-separated UUID list; an empty one clears."""
+    if len(args.subject) != 1 or args.record is not None or args.placement is not None:
+        raise ClientError("highlight requires UUID[,UUID...] ('' clears)")
+    return [
+        _workspace_uuid(item, "record") for item in args.subject[0].split(",") if item
+    ]
+
+
+def _workspace_params(
+    pairs: list[str],
+    *,
+    parameters: Mapping[str, str],
+) -> dict[str, str | int | bool]:
+    """Read ``KEY=VALUE`` pairs, each value as the type the catalog gives its key."""
+    params: dict[str, str | int | bool] = {}
+    for pair in pairs:
+        key, equals, value = pair.partition("=")
+        if not equals or not key.isidentifier():
+            raise ClientError(
+                f"--param needs KEY=VALUE with a plain name, got {pair!r}",
+            )
+        if key in params:
+            raise ClientError(f"--param {key} was given more than once")
+        if key not in parameters:
+            raise ClientError(
+                f"--param {key} is not a parameter of this visual; it takes: "
+                f"{', '.join(parameters) or 'none'}",
+            )
+        params[key] = _workspace_param_value(key=key, value=value, kind=parameters[key])
+    return params
+
+
+def _workspace_param_value(*, key: str, value: str, kind: str) -> str | int | bool:
+    """Read ``value`` as a catalog parameter ``kind``: string, integer or boolean."""
+    if kind == "integer":
+        if not (value.isascii() and value.removeprefix("-").isdecimal()):
+            raise ClientError(f"--param {key} needs an integer, got {value!r}")
+        return int(value)
+    if kind == "boolean":
+        if value not in {"true", "false"}:
+            raise ClientError(f"--param {key} needs true or false, got {value!r}")
+        return value == "true"
+    return value
+
+
+def _visual_parameters(client: Client, *, visual_type: str) -> dict[str, str]:
+    """Return the parameters a visual takes, by name, with their catalog types."""
+    catalog = from_plain(client.get("/api/visuals"), dict[str, object])
+    visuals = from_plain(catalog.get("visuals"), list[dict[str, object]], default=[])
+    for visual in visuals:
+        if visual.get("type") == visual_type:
+            schemas = from_plain(
+                visual.get("parameter_schema"),
+                dict[str, dict[str, object]],
+                default={},
+            )
+            return {
+                name: from_plain(schema.get("type"), str, default="")
+                for name, schema in schemas.items()
+            }
+    raise ClientError(f"{visual_type!r} is not a visual in the catalog")
+
+
 def _print_workspace(payload: object) -> None:
     """Print workspace and visual identifiers in a compact readable form."""
-    state = DictCodec.coerce(payload)
-    workspace_id = StrCodec.coerce(state.get("id"), "unknown")
-    revision = IntCodec.coerce(state.get("revision"))
-    focused = StrCodec.coerce(state.get("focused_instance"), "none")
+    state = from_plain(payload, dict[str, object])
+    workspace_id = from_plain(state.get("id"), str, default="unknown")
+    revision = from_plain(state.get("revision"), int, default=0)
+    focused = from_plain(state.get("focused_instance"), str, default="none")
     echo(f"workspace {workspace_id} revision {revision} focused {focused}")
-    visuals = ListCodec.mappings(state.get("visuals"))
+    visuals = from_plain(state.get("visuals"), list[dict[str, object]], default=[])
     if not visuals:
         echo("  (no visuals)")
         return
     for visual in visuals:
-        instance_id = StrCodec.coerce(visual.get("id"), "unknown")
-        visual_type = StrCodec.coerce(visual.get("type"), "unknown")
-        placement = StrCodec.coerce(visual.get("placement"), "main")
-        record_id = StrCodec.coerce(visual.get("record_id"))
+        instance_id = from_plain(visual.get("id"), str, default="unknown")
+        visual_type = from_plain(visual.get("type"), str, default="unknown")
+        placement = from_plain(visual.get("placement"), str, default="main")
+        record_id = from_plain(visual.get("record_id"), str, default="")
         target = f" record={record_id}" if record_id else ""
         echo(f"  {visual_type} {instance_id} {placement}{target}")
 
@@ -2841,6 +2974,7 @@ class _WorkspaceArgs(Protocol):
     subject: list[str]
     record: str | None
     placement: str | None
+    param: list[str]
 
 
 # The leading ``@`` is optional; a single ``:`` separates an optional room.
@@ -3040,8 +3174,8 @@ def _apply_create_defaults(kind: Inquiry.InquiryKind, body: dict[str, object]) -
 def _submitted_ref(target_id: uuid.UUID, client: Client) -> Ref:
     """Look up a just-created UUID's user-facing ``Kind#seq`` ref."""
     kind, _target_id, view = client.get_inquiry(UuidRef(uuid=target_id))
-    self_view = DictCodec.coerce(view["self"])
-    return SeqRef(kind=kind, seq=IntCodec.coerce(self_view["seq"], 0))
+    self_view = from_plain(view["self"], dict[str, object])
+    return SeqRef(kind=kind, seq=from_plain(self_view["seq"], int))
 
 
 def _created_line(ref: Ref, new_id: uuid.UUID) -> str:
@@ -3139,29 +3273,37 @@ def _query_rows(
     return rows
 
 
-# ``metric`` is not a kind/field/edge/relation word, so its first appearance is
-# unambiguously the grid-tail marker. Returns ``None`` when ``rest`` carries no
-# ``metric`` word (an ordinary list/create/edit command).
 def _split_metric_tail(
     rest: Sequence[str],
 ) -> tuple[Sequence[str], Sequence[str]] | None:
-    """Split ``rest`` at the first ``metric`` keyword into ``(before, tail)``."""
+    """Split a grid marker after a complete subject, query, or create clause."""
     for index, token_text in enumerate(rest):
-        if token_text.lower() == "metric":
+        if token_text.lower() == "metric" and _metric_prefix(rest[:index]):
             return rest[:index], rest[index + 1 :]
     return None
 
 
-# ``run`` is not a field, kind, edge, or relation word on an AgentSession, so its first
-# appearance is unambiguously the resume marker. Returns ``None`` for an ordinary
-# list/show command.
+def _metric_prefix(tokens: Sequence[str]) -> bool:
+    """Whether a grid marker may follow these complete grammar clauses."""
+    try:
+        if starts_with_ref(tokens):
+            return consume_ref(tokens, 0, kind_hint="Experiment")[1] == len(tokens)
+        return parse_list_query("Experiment", tokens) is not None or bool(
+            parse_actions(tokens),
+        )
+    except ClientError:
+        return False
+
+
 def _split_run_tail(
     rest: Sequence[str],
 ) -> tuple[Sequence[str], Sequence[str]] | None:
-    """Split ``rest`` at the ``run`` keyword into ``(subject, tail)``."""
-    for index, token_text in enumerate(rest):
-        if token_text.lower() == "run":
-            return rest[:index], rest[index + 1 :]
+    """Split a resume marker only immediately after its session subject."""
+    if not starts_with_ref(rest):
+        return None
+    _, consumed = consume_ref(rest, 0, kind_hint="AgentSession")
+    if consumed < len(rest) and rest[consumed].lower() == "run":
+        return rest[:consumed], rest[consumed + 1 :]
     return None
 
 
@@ -3216,7 +3358,7 @@ def _resolve_set_value(action: SetField, client: Client) -> object:
 
 
 def _arg_str(args: argparse.Namespace, name: str) -> str:
-    return StrCodec.coerce(_arg_values(args).get(name), "")
+    return from_plain(_arg_values(args).get(name), str, default="")
 
 
 class _ListMutation(Protocol):
@@ -3234,12 +3376,12 @@ def _arg_values(args: argparse.Namespace) -> Mapping[str, object]:
 
 
 def _arg_int(args: argparse.Namespace, name: str) -> int:
-    return IntCodec.coerce(_arg_values(args).get(name), 0)
+    return from_plain(_arg_values(args).get(name), int, default=0)
 
 
 def _arg_text(args: argparse.Namespace) -> list[str]:
-    value = _arg_values(args).get("text")
-    return [str(item) for item in ListCodec.coerce(value)]
+    value = from_plain(_arg_values(args).get("text"), list[object], default=[])
+    return [str(item) for item in value]
 
 
 def _arg_bool(args: argparse.Namespace, name: str) -> bool:
@@ -3247,10 +3389,15 @@ def _arg_bool(args: argparse.Namespace, name: str) -> bool:
 
 
 def _arg_width(args: argparse.Namespace) -> int | None:
-    value = _arg_values(args).get("width")
-    return None if value is None else IntCodec.coerce(value, 0)
+    return from_plain(_arg_values(args).get("width"), int, default=None)
 
 
 def _ref_ids(refs: object) -> list[str]:
     """Peer ids from a relationship projection (a list of IssueEdge ref dicts)."""
-    return [pid for ref in ListCodec.mappings(refs) if (pid := str(ref.get("id")))]
+    if refs is None:
+        return []
+    return [
+        pid
+        for ref in from_plain(refs, list[dict[str, object]])
+        if (pid := str(ref.get("id")))
+    ]

@@ -26,8 +26,10 @@ import uuid  # noqa: TC003 -- Handler signature resolved by FastAPI at request t
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from trackinizer.lib.custom_json import FloatCodec, MutableJSON
+from trackinizer.lib.codec import from_plain
 from trackinizer.server.api._deps import get_store
+from trackinizer.server.api.locks import require_unlocked
+from trackinizer.server.api.session_access import require_chat_opener_of
 from trackinizer.server.auth import (
     AuthIdentity,
     assert_account_active,
@@ -40,6 +42,9 @@ from trackinizer.wire.bodies import (
     FieldMutation,
     FieldOp,
     FieldSet,
+)
+from trackinizer.wire.json_types import (  # noqa: TC001 -- Handler return type resolved by FastAPI at request time.
+    MutableJSON,
 )
 from trackinizer.wire.routes import (
     InquiryFieldRoute,
@@ -84,6 +89,8 @@ def _make_put(route: InquiryFieldRoute) -> Callable[..., Awaitable[MutableJSON]]
         request: Request,
         identity: Annotated[AuthIdentity, Depends(require_role("writer"))],
     ) -> MutableJSON:
+        await require_unlocked(request, identity, [target_id])
+        await require_chat_opener_of(request, identity, target_id)
         store = get_store(request)
         if body.mode == "cas":
             change_id = await _run_compare_and_set(
@@ -119,6 +126,8 @@ def _make_patch(route: InquiryFieldRoute) -> Callable[..., Awaitable[MutableJSON
         request: Request,
         identity: Annotated[AuthIdentity, Depends(require_role("writer"))],
     ) -> MutableJSON:
+        await require_unlocked(request, identity, [target_id])
+        await require_chat_opener_of(request, identity, target_id)
         store = get_store(request)
         change_id = await _run_patch(route, target_id, body, store, identity)
         return _mutation_response(target_id, change_id)
@@ -138,6 +147,8 @@ def _make_delete(route: InquiryFieldRoute) -> Callable[..., Awaitable[MutableJSO
         request: Request,
         identity: Annotated[AuthIdentity, Depends(require_role("writer"))],
     ) -> MutableJSON:
+        await require_unlocked(request, identity, [target_id])
+        await require_chat_opener_of(request, identity, target_id)
         store = get_store(request)
         change_id = await _clear_value(route, target_id, body, store, identity)
         return _mutation_response(target_id, change_id)
@@ -183,7 +194,7 @@ async def _set_value(
         return await store.set_cost_axis(
             target_id,
             cast(_CostAxis, route.cost_axis),
-            FloatCodec.coerce(value),
+            from_plain(value, float),
             api_key_id=identity.api_key_id,
             actor=actor,
             reason=reason,
@@ -211,7 +222,7 @@ async def _run_patch(
     # add_<stem> setter, so they carry no add_method/sub_method; handle
     # them before the list-method dispatch.
     if route.cost_axis is not None:
-        amount = FloatCodec.coerce(body.value) * (1 if body.op == "add" else -1)
+        amount = from_plain(body.value, float) * (1 if body.op == "add" else -1)
         return await store.add_cost(
             target_id,
             Cost(**{route.cost_axis: amount}),

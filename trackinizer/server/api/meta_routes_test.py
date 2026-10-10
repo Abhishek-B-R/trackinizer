@@ -1,15 +1,12 @@
 """Tests for the unauthenticated meta routes.
 
-``/api/version``, ``/api/meta/enums``, ``/api/meta/edges``, and the SPA-vs-server drift
-guards.
+``/api/version``, ``/api/meta/enums``, ``/api/meta/fields`` and ``/api/meta/edges``.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast, get_args
+from typing import TYPE_CHECKING, cast, get_args
 
-import re
 import subprocess
 
 from fastapi import FastAPI
@@ -17,7 +14,7 @@ from fastapi.testclient import TestClient
 
 import pytest
 
-from trackinizer.lib.custom_json import DictCodec, ListCodec, StrCodec, loads
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.server.api import meta_routes
 from trackinizer.server.version import build_sha
 from trackinizer.types.columns import column_specs
@@ -37,9 +34,6 @@ if TYPE_CHECKING:
     import httpx2
 
     from trackinizer.server.store.core import Store
-
-
-_CWD: Final = Path(__file__).resolve().parent
 
 
 @pytest.fixture
@@ -74,23 +68,23 @@ def test_enums_route_reflects_the_type_literals(client: TestClient) -> None:
     """
     r = client.get("/api/meta/enums")
     assert r.status_code == 200
-    body = DictCodec.coerce(loads(r.content))
-    assert ListCodec.coerce(body["status"], str) == list(
+    body = from_plain(loads(r.content), dict[str, object])
+    assert from_plain(body["status"], list[str]) == list(
         map(str, get_args(cast(object, Issue.Status.__value__))),
     )
-    assert ListCodec.coerce(body["judgement"], str) == list(
+    assert from_plain(body["judgement"], list[str]) == list(
         map(str, get_args(cast(object, Belief.Judgement.__value__))),
     )
-    assert ListCodec.coerce(body["issue_kind"], str) == list(
+    assert from_plain(body["issue_kind"], list[str]) == list(
         map(str, get_args(cast(object, Issue.Kind.__value__))),
     )
-    assert ListCodec.coerce(body["publication_type"], str) == list(
+    assert from_plain(body["publication_type"], list[str]) == list(
         map(str, get_args(cast(object, Paper.PublicationType.__value__))),
     )
-    assert ListCodec.coerce(body["edge_kind"], str) == list(
+    assert from_plain(body["edge_kind"], list[str]) == list(
         map(str, get_args(cast(object, Edge.Kind.__value__))),
     )
-    assert ListCodec.coerce(body["inquiry_kind_all"], str) == list(
+    assert from_plain(body["inquiry_kind_all"], list[str]) == list(
         map(str, get_args(cast(object, Inquiry.InquiryKind.__value__))),
     )
 
@@ -105,7 +99,7 @@ def test_fields_route_matches_server_route_table(client: TestClient) -> None:
     """
     r = client.get("/api/meta/fields")
     assert r.status_code == 200
-    body = DictCodec.coerce(loads(r.content))
+    body = from_plain(loads(r.content), dict[str, object])
     assert body == field_owner_kind()
     # The fields that actually drifted must be present and correctly owned.
     # ``ended`` is intentionally NOT a field route: it is stamped only by
@@ -127,25 +121,25 @@ def test_edges_route_serves_topology_and_labels(client: TestClient) -> None:
     """
     r = client.get("/api/meta/edges")
     assert r.status_code == 200
-    body = DictCodec.coerce(loads(r.content))
+    body = from_plain(loads(r.content), dict[str, object])
     # The payload is topology merged with labels, one entry per kind.
     for kind, topo in edge_topology().items():
-        entry = DictCodec.coerce(body[kind])
-        assert ListCodec.coerce(entry["from_kinds"], str) == topo["from_kinds"]
-        assert ListCodec.coerce(entry["to_kinds"], str) == topo["to_kinds"]
+        entry = from_plain(body[kind], dict[str, object])
+        assert from_plain(entry["from_kinds"], list[str]) == topo["from_kinds"]
+        assert from_plain(entry["to_kinds"], list[str]) == topo["to_kinds"]
     for kind, lab in edge_labels().items():
-        entry = DictCodec.coerce(body[kind])
-        assert StrCodec.coerce(entry["forward"]) == lab["forward"]
-        assert StrCodec.coerce(entry["inverse"]) == lab["inverse"]
+        entry = from_plain(body[kind], dict[str, object])
+        assert from_plain(entry["forward"], str) == lab["forward"]
+        assert from_plain(entry["inverse"], str) == lab["inverse"]
     # Citations are Artifact -> {Belief, Experiment}; both directions agree.
     for kind in ("proves", "favors"):
-        entry = DictCodec.coerce(body[kind])
-        assert ListCodec.coerce(entry["to_kinds"], str) == ["Belief", "Experiment"]
-        assert "Paper" in ListCodec.coerce(entry["from_kinds"], str)
+        entry = from_plain(body[kind], dict[str, object])
+        assert from_plain(entry["to_kinds"], list[str]) == ["Belief", "Experiment"]
+        assert "Paper" in from_plain(entry["from_kinds"], list[str])
     # cites_paper labels are the CLI aliases, not the raw storage kind.
-    cites_paper = DictCodec.coerce(body["cites_paper"])
-    assert StrCodec.coerce(cites_paper["forward"]) == "cites"
-    assert StrCodec.coerce(cites_paper["inverse"]) == "cited_by"
+    cites_paper = from_plain(body["cites_paper"], dict[str, object])
+    assert from_plain(cites_paper["forward"], str) == "cites"
+    assert from_plain(cites_paper["inverse"], str) == "cited_by"
     # The dropped dis-edge kinds carry no entry (valence sign now).
     for gone in ("disproves", "disfavors", "refutes_experiment"):
         assert gone not in body
@@ -159,10 +153,13 @@ def test_edges_route_adds_each_kinds_annotations(client: TestClient) -> None:
     annotations each kind takes against the annotate route is pinned on PGlite
     below; here, the shape: additive, the ``Edge`` field names in field order.
     """
-    body = DictCodec.coerce(loads(client.get("/api/meta/edges").content))
+    body = from_plain(
+        loads(client.get("/api/meta/edges").content),
+        dict[str, object],
+    )
     columns = list(column_specs(Edge))
     for kind in edge_topology():
-        entry = DictCodec.coerce(body[kind])
+        entry = from_plain(body[kind], dict[str, object])
         assert set(entry) == {
             "from_kinds",
             "to_kinds",
@@ -170,7 +167,7 @@ def test_edges_route_adds_each_kinds_annotations(client: TestClient) -> None:
             "inverse",
             "annotations",
         }
-        taken = ListCodec.coerce(entry["annotations"], str)
+        taken = from_plain(entry["annotations"], list[str])
         assert taken == [column for column in columns if column in taken], kind
 
 
@@ -189,9 +186,10 @@ async def test_served_annotations_are_what_the_annotate_route_takes_on_a_real_en
     http, store = pglite_route_client
     edges = await _one_edge_per_kind(store)
     served = {
-        kind: ListCodec.coerce(DictCodec.coerce(rule)["annotations"], str)
-        for kind, rule in DictCodec.coerce(
+        kind: from_plain(from_plain(rule, dict[str, object])["annotations"], list[str])
+        for kind, rule in from_plain(
             loads((await http.get("/api/meta/edges")).content),
+            dict[str, object],
         ).items()
     }
     values: dict[str, object] = {
@@ -245,88 +243,6 @@ async def _one_edge_per_kind(store: Store) -> dict[str, tuple[uuid.UUID, uuid.UU
             actor="alice",
         )
     return edges
-
-
-def test_spa_does_not_hardcode_enum_lists() -> None:
-    """index.html must source its enum VALUES arrays from the route, not a copy.
-
-    Guards the maintenance burden the route removes: if a future edit pastes a
-    publication-type / judgement list back into the page, this fails. The five
-    ``*_VALUES`` / ``EDGE_KINDS`` arrays must stay declared EMPTY (filled from
-    ``/api/meta/enums`` at boot); a non-empty literal is a re-pasted copy.
-
-    Scoped to the array declarations only -- lone semantic uses of a member
-    (a ``switch`` case, an equality guard, a button action) are fine and do not
-    desync a dropdown, so they are not flagged.
-    """
-    html = (_CWD.parents[0] / "assets" / "index.html").read_text()
-    arrays = (
-        "STATUS_VALUES",
-        "JUDGEMENT_VALUES",
-        "ISSUE_KIND_VALUES",
-        "PUBLICATION_TYPE_VALUES",
-        "EDGE_KINDS",
-        "ALL_KINDS",
-    )
-    for name in arrays:
-        match = re.search(rf"\b{name}\s*=\s*\[(.*?)\]", html, re.DOTALL)
-        assert match is not None, f"{name} declaration not found in index.html"
-        body = match.group(1).strip()
-        assert body == "", (
-            f"{name} is hardcoded in index.html; declare it empty and fill it "
-            f"from /api/meta/enums (got: [{body[:60]}...])"
-        )
-        # A boot-filled array with no read site is dead weight: it pays a
-        # blocking-XHR cost at boot for nothing. Each array must appear beyond
-        # its declaration and its single `.push(...)` fill (>2 mentions).
-        mentions = len(re.findall(rf"\b{name}\b", html))
-        assert mentions > 2, (
-            f"{name} is filled at boot but never read ({mentions} mentions); "
-            "drop the array and its server enum key if it has no consumer"
-        )
-    # FIELD_OWNER_KIND is an object literal, derived from /api/meta/fields. It
-    # had drifted (missing AgentSession fields); pin it empty so it stays
-    # server-sourced.
-    fok = re.search(r"\bFIELD_OWNER_KIND\s*=\s*(\{.*?\})", html, re.DOTALL)
-    assert fok is not None, "FIELD_OWNER_KIND declaration not found"
-    assert fok.group(1).strip() == "{}", (
-        "FIELD_OWNER_KIND is hardcoded in index.html; declare it empty and fill "
-        "it from /api/meta/fields so it cannot lag the server route table"
-    )
-    assert "/api/meta/fields" in html, "SPA must fetch /api/meta/fields at boot"
-
-
-def test_spa_derives_edge_topology_from_route() -> None:
-    """index.html must source the edge topology from ``/api/meta/edges``.
-
-    A citation-direction change can break the SPA when edge directions are a
-    hand-typed copy of the schema. The SPA now declares ``EDGE_TOPOLOGY`` empty
-    and fills it from the route; a non-empty literal is a re-pasted copy that
-    could drift again.
-    """
-    html = (_CWD.parents[0] / "assets" / "index.html").read_text()
-    match = re.search(r"\bEDGE_TOPOLOGY\s*=\s*(\{.*?\})", html, re.DOTALL)
-    assert match is not None, "EDGE_TOPOLOGY declaration not found in index.html"
-    assert match.group(1).strip() == "{}", (
-        "EDGE_TOPOLOGY is hardcoded in index.html; declare it empty and fill it "
-        "from /api/meta/edges so a direction flip cannot desync the picker"
-    )
-    assert "/api/meta/edges" in html, "SPA must fetch /api/meta/edges at boot"
-
-
-def test_spa_drops_removed_websearch_results_wiring() -> None:
-    """index.html must not reference the removed ``WebSearch.results`` field.
-
-    The Python removal left the SPA wiring stale (submit schema, owner map,
-    detail view, edit/submit branches), so the WebSearch form 422'd. This pins
-    that none of those references return.
-    """
-    html = (_CWD.parents[0] / "assets" / "index.html").read_text()
-    for leaked in ('"typed-results"', 'results: "websearch"', 'field === "results"'):
-        assert leaked not in html, (
-            f"{leaked} is stale WebSearch.results wiring in index.html; "
-            "findings are produces edges now, not a column"
-        )
 
 
 def test_build_sha_falls_back_to_unknown(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -11,10 +11,12 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, cast
 from uuid import UUID, uuid4
 
+import json
+
 import pytest
 import pytest_asyncio
 
-from trackinizer.lib.custom_json import DictCodec, ListCodec, loads
+from trackinizer.lib.codec import from_plain, loads
 from trackinizer.lib.postgres.testing import reset_schema
 from trackinizer.server.api.export_routes import export_lines
 from trackinizer.server.embedders.stub import StubEmbedder
@@ -46,11 +48,17 @@ _LEFT_OUT: Final = frozenset(
         "api_keys",
         "applied_migrations",
         "inquiry_embeddings",
+        "inquiry_lock_log",
+        "machine_credentials",
+        "machine_enrollments",
+        "machines",
         "session_bodies",
         "session_ciphertext",
         "session_embeddings",
         "session_index_state",
+        "session_liveness",
         "users",
+        "variables",
         "visual_report_revisions",
         "visual_reports",
         "visual_workspace_operations",
@@ -58,7 +66,15 @@ _LEFT_OUT: Final = frozenset(
         "visual_workspaces",
     },
 )
-"""Tables the export omits on purpose; ``wire_export.EXPORT_TABLES`` says why."""
+"""Tables the export omits on purpose; ``wire_export.EXPORT_TABLES`` says why.
+
+``variables`` is also left out: its secret rows name values that live outside
+the database, so a restored export could not carry them, and its plain values
+are launch configuration, not graph records. ``machines`` is the same: it names
+where campaigns may run, which belongs to the deployment, not the graph.
+``machine_enrollments`` and ``machine_credentials`` hold hashes of the secrets a
+host joins with, which is access control, as ``api_keys`` is.
+"""
 
 
 @pytest_asyncio.fixture(loop_scope="session")
@@ -187,11 +203,11 @@ async def test_the_header_names_the_applied_migrations(store: Store) -> None:
     async with store.engine.acquire() as conn:
         applied = await conn.fetch("SELECT name FROM applied_migrations")
 
-    header = DictCodec.coerce(loads(next(iter(export_lines(graph)))))
+    header = from_plain(loads(next(iter(export_lines(graph)))), dict[str, object])
 
     assert header["format"] == EXPORT_FORMAT
     assert header["version"] == EXPORT_VERSION
-    migrations = ListCodec.coerce(header["migrations"])
+    migrations = from_plain(header["migrations"], list[object])
     assert migrations[0] == "schema.sql"
     assert sorted(map(str, migrations)) == sorted(
         cast(str, row["name"]) for row in applied
@@ -211,7 +227,7 @@ async def test_every_line_is_json_and_an_unchanged_graph_exports_identically(
 
     assert first == second
     lines = first.decode().splitlines()
-    assert all(isinstance(loads(line), dict) for line in lines)
+    assert all(isinstance(json.loads(line), dict) for line in lines)
     assert len(lines) > 1 + len(EXPORT_TABLES)
 
 

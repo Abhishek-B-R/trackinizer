@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, NamedTuple, Self, cast
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import json
 import logging
@@ -49,7 +49,7 @@ import httpx2
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.absent import ABSENT, Absent
-from trackinizer.lib.custom_json import JSONValue
+from trackinizer.lib.codec import PlainTree
 from trackinizer.types.inquiries import Inquiry, Issue
 from trackinizer.wire.refs import Ref, SeqRef, UuidRef
 from trackinizer.wire.routes import (
@@ -71,12 +71,21 @@ if TYPE_CHECKING:
     import pydantic
 
     from trackinizer.wire import (
+        wire_machine_host,
+        wire_machines,
         wire_metrics,
         wire_metrics_query,
         wire_session_ir,
         wire_sessions,
+        wire_variables,
     )
     from trackinizer.wire.filters import Filter
+    from trackinizer.wire.wire_machine_host import (
+        EnrollResponse,
+        HeartbeatResponse,
+        JoinResponse,
+    )
+    from trackinizer.wire.wire_machines import Facts, Machine, MachineDetail
     from trackinizer.wire.wire_metrics import (
         LogMetricsResponse,
         MetricPoint,
@@ -99,6 +108,7 @@ if TYPE_CHECKING:
         SessionStartResponse,
         WorkspaceMessageContext,
     )
+    from trackinizer.wire.wire_variables import Variable
 else:
     from wrapt import lazy_import
 
@@ -114,6 +124,11 @@ else:
     # touch it, so its pydantic-model build stays off the cold-start path.
     wire_metrics = lazy_import("trackinizer.wire.wire_metrics")
     wire_metrics_query = lazy_import("trackinizer.wire.wire_metrics_query")
+    # Same lazy-bind for ``wire_machines``: only the machine methods touch it.
+    wire_machines = lazy_import("trackinizer.wire.wire_machines")
+    wire_machine_host = lazy_import("trackinizer.wire.wire_machine_host")
+    # Same lazy-bind for ``wire_variables``: only the variable methods touch it.
+    wire_variables = lazy_import("trackinizer.wire.wire_variables")
     pydantic = lazy_import("pydantic")
 
 
@@ -137,13 +152,15 @@ def server_url(raw: str, source: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ClientError(f"{source} has invalid URL {raw!r}")
-    if parsed.username or parsed.password:
+    user = parsed.username or ""
+    password = parsed.password or ""
+    if user or password:
         raise ClientError(
             f"{source} URL must not embed credentials; use api_key instead",
         )
     if parsed.query or parsed.fragment:
         raise ClientError(f"{source} URL must not contain query or fragment")
-    if not parsed.hostname:
+    if parsed.hostname is None:
         raise ClientError(f"{source} has invalid URL {raw!r}: missing host")
     # ``parsed.port`` raises ``ValueError`` for a non-numeric or out-of-range
     # port (urllib only validates it on access), so a malformed port would
@@ -239,23 +256,24 @@ class Client:
         path: str,
         *,
         params: Mapping[str, object] | None = None,
-    ) -> JSONValue:
-        """Send a GET request."""
-        return self._request("GET", path, params=params)
+        timeout: float | None = None,
+    ) -> PlainTree:
+        """Send a GET request; ``timeout`` replaces the read timeout for it."""
+        return self._request("GET", path, params=params, timeout=timeout)
 
-    def post(self, path: str, *, body: object = None) -> JSONValue:
+    def post(self, path: str, *, body: object = None) -> PlainTree:
         """Send a POST request."""
         return self._request("POST", path, body=body)
 
-    def put(self, path: str, *, body: object = None) -> JSONValue:
+    def put(self, path: str, *, body: object = None) -> PlainTree:
         """Send a PUT request."""
         return self._request("PUT", path, body=body)
 
-    def patch(self, path: str, *, body: object = None) -> JSONValue:
+    def patch(self, path: str, *, body: object = None) -> PlainTree:
         """Send a PATCH request."""
         return self._request("PATCH", path, body=body)
 
-    def delete(self, path: str, *, body: object = None) -> JSONValue:
+    def delete(self, path: str, *, body: object = None) -> PlainTree:
         """Send a DELETE request."""
         return self._request("DELETE", path, body=body)
 
@@ -348,7 +366,7 @@ class Client:
         offset: int = 0,
         seq_ranges: Sequence[SeqRange] = (),
         filters: Sequence[Filter] = (),
-    ) -> list[dict[str, JSONValue]]:
+    ) -> list[dict[str, PlainTree]]:
         """Fetch one page of inquiries of a given kind.
 
         Args:
@@ -403,7 +421,7 @@ class Client:
         status: Inquiry.Status | None = None,
         seq_ranges: Sequence[SeqRange] = (),
         filters: Sequence[Filter] = (),
-    ) -> list[dict[str, JSONValue]]:
+    ) -> list[dict[str, PlainTree]]:
         """Fetch EVERY matching row, paging past the server's per-request cap.
 
         ``list_kind`` is bounded by ``MAX_LIST_LIMIT`` (the route rejects a
@@ -436,7 +454,7 @@ class Client:
           rows: All matching inquiry rows as dicts, concatenated from pages.
 
         """
-        rows: list[dict[str, JSONValue]] = []
+        rows: list[dict[str, PlainTree]] = []
         offset = 0
         while True:
             page = self.list_kind(
@@ -455,25 +473,25 @@ class Client:
     def get_inquiry(
         self,
         ref: Ref,
-    ) -> tuple[Inquiry.InquiryKind, uuid.UUID, dict[str, JSONValue]]:
+    ) -> tuple[Inquiry.InquiryKind, uuid.UUID, dict[str, PlainTree]]:
         """Resolve and fetch the SPA detail view (self + edges + changes).
 
         Args:
           ref: Ref.
 
         Returns:
-          result: The tuple[Inquiry.InquiryKind, uuid.UUID, dict[str, JSONValue]].
+          result: The tuple[Inquiry.InquiryKind, uuid.UUID, dict[str, PlainTree]].
 
         """
         kind, target_id = self.resolve_id(ref)
         where = f"/api/web/get/{target_id}"
         return kind, target_id, dict(_require_mapping(self.get(where), where))
 
-    def next_issue(self) -> dict[str, JSONValue] | None:
+    def next_issue(self) -> dict[str, PlainTree] | None:
         """Next issue.
 
         Returns:
-          result: The dict[str, JSONValue] | None.
+          result: The dict[str, PlainTree] | None.
 
         """
         where = "/api/inquiries/next_issue"
@@ -488,7 +506,7 @@ class Client:
         owner: Inquiry.Actor,
         actor: Inquiry.Actor | None = None,
         reason: str = "",
-    ) -> dict[str, JSONValue] | None:
+    ) -> dict[str, PlainTree] | None:
         """Atomically claim the next available Issue for ``owner``.
 
         ONE request, deliberately -- never :meth:`next_issue` followed by an
@@ -633,7 +651,7 @@ class Client:
             else:
                 return
 
-    def recent_changes(self, *, limit: int = 50) -> list[dict[str, JSONValue]]:
+    def recent_changes(self, *, limit: int = 50) -> list[dict[str, PlainTree]]:
         """Fetch the most recent change rows, newest first.
 
         Args:
@@ -657,7 +675,7 @@ class Client:
         *,
         semantic: bool = True,
         limit: int = 20,
-    ) -> dict[str, JSONValue]:
+    ) -> dict[str, PlainTree]:
         """Search captured sessions: embeddings + full text, RRF-merged.
 
         Args:
@@ -931,7 +949,7 @@ class Client:
             body["note"] = note
         if valence is not None:
             body["valence"] = valence
-        if labels:
+        if labels is not None and labels:
             body["labels"] = list(labels)
         if reason:
             body["reason"] = reason
@@ -1502,7 +1520,7 @@ class Client:
           experiment_id: Experiment ID to query.
           masks: Field predicates selecting cells.
           sort: Asc/desc ordering by value.
-          limit: Max rows (None = all matching).
+          limit: Max rows, at most ``MAX_LIST_LIMIT`` (None = up to that cap).
 
         Returns:
           result: (key, step, value) points matching the masks.
@@ -1559,10 +1577,10 @@ class Client:
         """Cross-experiment masked read/rank over the given experiments.
 
         Args:
-          experiment_ids: Experiment IDs to rank across.
+          experiment_ids: Experiment IDs to rank across, at most ``MAX_LIST_LIMIT``.
           masks: Field predicates selecting cells.
           sort: Asc/desc ordering by value.
-          limit: Max rows (None = all matching).
+          limit: Max rows, at most ``MAX_LIST_LIMIT`` (None = up to that cap).
 
         Returns:
           result: Ranked rows with experiment ID and metric values.
@@ -1668,10 +1686,7 @@ class Client:
             "GET",
             where,
             params={"wait_sec": wait_sec} if wait_sec else None,
-            # Margin over the requested hold: the server returns empty AT the
-            # timeout, so a read deadline equal to it races that response and
-            # turns a normal empty result into a transport error.
-            timeout=wait_sec + 10.0 if wait_sec else None,
+            timeout=wire_sessions.inbound_read_timeout(wait_sec),
         )
         drained = _validate_model(wire_sessions.DrainInboundResponse, response, where)
         return [(m.text, m.source, m.room, m.context) for m in drained.messages]
@@ -1707,6 +1722,314 @@ class Client:
             wire_sessions.SEND_MESSAGE_PATH,
         ).delivered
 
+    def read_workspace(self, workspace_id: uuid.UUID) -> dict[str, PlainTree]:
+        """Read a canvas: its revision, visuals and focus.
+
+        Args:
+          workspace_id: The canvas.
+
+        Returns:
+          state: The workspace state as the server returns it.
+
+        """
+        where = f"/api/workspaces/{workspace_id}"
+        return dict(_require_mapping(self.get(where), where))
+
+    def apply_workspace_operation(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        operation: Mapping[str, object],
+    ) -> dict[str, PlainTree]:
+        """Apply one canvas operation to the live revision, once more if it moved.
+
+        Args:
+          workspace_id: The canvas.
+          operation: A ``show``, ``hide``, ``focus`` or ``place`` operation.
+
+        Returns:
+          state: The updated workspace state.
+
+        """
+        where = f"/api/workspaces/{workspace_id}/operations"
+        try:
+            applied = self.post(
+                where,
+                body={
+                    "revision": self._revision_of(workspace_id),
+                    "operation": operation,
+                },
+            )
+        except ClientError as error:
+            if error.status_code != 409:
+                raise
+            # The 409 body names the live state, but the error text cuts it short.
+            applied = self.post(
+                where,
+                body={
+                    "revision": self._revision_of(workspace_id),
+                    "operation": operation,
+                },
+            )
+        return dict(_require_mapping(applied, where))
+
+    def navigate(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        route: str,
+    ) -> dict[str, PlainTree]:
+        """Move a canvas's page to ``route``; it is an event, so no revision is read.
+
+        Args:
+          workspace_id: The canvas.
+          route: A ``#/...`` hash.
+
+        Returns:
+          state: The workspace state, which a navigation does not change.
+
+        """
+        where = f"/api/workspaces/{workspace_id}/operations"
+        moved = self.post(
+            where,
+            body={"revision": 0, "operation": {"kind": "navigate", "route": route}},
+        )
+        return dict(_require_mapping(moved, where))
+
+    def highlight(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        ids: Sequence[uuid.UUID],
+    ) -> dict[str, PlainTree]:
+        """Mark inquiries on a canvas's page; an event, so no revision is read.
+
+        Args:
+          workspace_id: The canvas.
+          ids: The inquiries to mark, at most 50; empty clears the marks.
+
+        Returns:
+          state: The workspace state, which a highlight does not change.
+
+        """
+        where = f"/api/workspaces/{workspace_id}/operations"
+        marked = self.post(
+            where,
+            body={
+                "revision": 0,
+                "operation": {"kind": "highlight", "ids": [str(i) for i in ids]},
+            },
+        )
+        return dict(_require_mapping(marked, where))
+
+    def _revision_of(self, workspace_id: uuid.UUID) -> int:
+        """Return the canvas's live revision."""
+        where = f"/api/workspaces/{workspace_id}"
+        revision = _require_field(self.read_workspace(workspace_id), "revision", where)
+        if not isinstance(revision, int):
+            raise ClientError(f"{where} returned a malformed revision {revision!r}")
+        return revision
+
+    def list_variables(self) -> list[Variable]:
+        """Return the org's variables, sorted by name; a secret's value is ``None``."""
+        where = wire_variables.VARIABLES_PATH
+        response = self._request("GET", where)
+        return _validate_model(wire_variables.VariableList, response, where).variables
+
+    def put_variable(self, name: str, *, value: str, secret: bool) -> None:
+        """Set one org variable; ``secret`` stores the value write-only.
+
+        Args:
+          name: Environment-variable name.
+          value: The value to store.
+          secret: Store ``value`` in the server's secret backend.
+
+        """
+        try:
+            body = wire_variables.VariablePut(value=value, secret=secret)
+        except pydantic.ValidationError:
+            # Not chained: pydantic's message carries the rejected input.
+            raise ClientError(f"variable {name!r} needs a non-empty value") from None
+        self._request(
+            "PUT",
+            wire_variables.VARIABLE_PATH.format(name=quote(name, safe="")),
+            body=body.model_dump(mode="json"),
+        )
+
+    def delete_variable(self, name: str) -> None:
+        """Delete one org variable; the server answers 404 when it is absent."""
+        self._request(
+            "DELETE",
+            wire_variables.VARIABLE_PATH.format(name=quote(name, safe="")),
+        )
+
+    def list_machines(self) -> list[Machine]:
+        """Return every registered machine, sorted by name."""
+        where = wire_machines.MACHINES_PATH
+        response = self._request("GET", where)
+        return _validate_model(wire_machines.MachineList, response, where).machines
+
+    def get_machine(self, name: str) -> MachineDetail:
+        """Return one machine; the server answers 404 when it is not registered."""
+        where = wire_machines.MACHINE_PATH.format(name=quote(name, safe=""))
+        response = self._request("GET", where)
+        return _validate_model(wire_machines.MachineDetail, response, where)
+
+    def put_machine(
+        self,
+        name: str,
+        *,
+        role: str | None = None,
+        how: str | None = None,
+    ) -> None:
+        """Register a machine, or change the fields named; ``""`` clears a field.
+
+        Args:
+          name: Machine name.
+          role: New role, or ``None`` to keep it.
+          how: New how line, or ``None`` to keep it.
+
+        """
+        try:
+            body = wire_machines.MachinePut(role=role, how=how)
+        except pydantic.ValidationError as err:
+            # Not chained: only the field and the rule are shown, never the input.
+            problems = "; ".join(f"{e['loc'][0]}: {e['msg']}" for e in err.errors())
+            raise ClientError(f"machine {name!r} {problems}") from None
+        self._request(
+            "PUT",
+            wire_machines.MACHINE_PATH.format(name=quote(name, safe="")),
+            body=body.model_dump(mode="json", exclude_none=True),
+        )
+
+    def change_machine_labels(
+        self,
+        name: str,
+        *,
+        add: Sequence[str] = (),
+        remove: Sequence[str] = (),
+    ) -> None:
+        """Add labels, then remove labels; the server answers 404 when absent.
+
+        Args:
+          name: Machine name.
+          add: Labels to add.
+          remove: Labels to remove.
+
+        """
+        body = wire_machines.MachineLabels(add=list(add), remove=list(remove))
+        self._request(
+            "PATCH",
+            wire_machines.MACHINE_LABELS_PATH.format(name=quote(name, safe="")),
+            body=body.model_dump(mode="json"),
+        )
+
+    def delete_machine(self, name: str) -> None:
+        """Unregister a machine; the server answers 404 when it is absent."""
+        self._request(
+            "DELETE",
+            wire_machines.MACHINE_PATH.format(name=quote(name, safe="")),
+        )
+
+    def enroll_machine(self, name: str) -> EnrollResponse:
+        """Register a machine if new and issue a one-use enrollment token (admin).
+
+        Args:
+          name: Machine name.
+
+        Returns:
+          enrolled: The token, shown once, and when it expires.
+
+        """
+        where = wire_machine_host.ENROLL_PATH
+        response = self._request("POST", where, body={"name": name})
+        return _validate_secret_model(wire_machine_host.EnrollResponse, response, where)
+
+    def join_machine(
+        self,
+        name: str,
+        *,
+        token: str,
+        instance: uuid.UUID,
+        host_version: str,
+        facts: Facts,
+    ) -> JoinResponse:
+        """Exchange an enrollment token for a machine credential.
+
+        The request is sent once: a retry after a lost answer would find the token
+        used. No other credential is needed.
+
+        Args:
+          name: Machine name the token was issued for.
+          token: The enrollment token; never shown in an error.
+          instance: The host's own id, kept across its restarts.
+          host_version: The host software's version.
+          facts: What the host reports about itself.
+
+        Returns:
+          joined: The machine id and the credential, shown once.
+
+        """
+        where = wire_machine_host.JOIN_PATH
+        body = _build_body(
+            wire_machine_host.JoinRequest,
+            f"join of machine {name!r}",
+            name=name,
+            token=token,
+            instance=instance,
+            host_version=host_version,
+            facts=facts,
+        )
+        response = self._request(
+            "POST",
+            where,
+            body=body.model_dump(mode="json"),
+            retry_attempts=1,
+        )
+        return _validate_secret_model(wire_machine_host.JoinResponse, response, where)
+
+    def heartbeat_machine(
+        self,
+        machine_id: uuid.UUID,
+        *,
+        instance: uuid.UUID,
+        host_version: str,
+        facts: Facts | None = None,
+    ) -> HeartbeatResponse:
+        """Report that the host is alive, authenticated by its machine credential.
+
+        Args:
+          machine_id: The machine's id, from joining.
+          instance: The host's id; a second id is refused until the first is silent.
+          host_version: The host software's version.
+          facts: What changed about the host, or ``None`` to keep the stored facts.
+
+        Returns:
+          beat: The server's clock at the heartbeat.
+
+        """
+        where = wire_machine_host.HEARTBEAT_PATH.format(machine_id=machine_id)
+        body = _build_body(
+            wire_machine_host.HeartbeatRequest,
+            f"heartbeat of machine {machine_id}",
+            instance=instance,
+            host_version=host_version,
+            facts=facts,
+        )
+        response = self._request(
+            "POST",
+            where,
+            body=body.model_dump(mode="json", exclude_none=True),
+        )
+        return _validate_model(wire_machine_host.HeartbeatResponse, response, where)
+
+    def revoke_machine(self, name: str) -> None:
+        """Take a machine out of service (admin); the server answers 404 when absent."""
+        self._request(
+            "POST",
+            wire_machine_host.REVOKE_PATH.format(name=quote(name, safe="")),
+        )
+
     def _patch_field(
         self,
         target_id: uuid.UUID,
@@ -1732,7 +2055,7 @@ class Client:
         change_id: uuid.UUID | None = None,
         retry_attempts: int = 3,
         timeout: float | None = None,
-    ) -> JSONValue:
+    ) -> PlainTree:
         # ``retry_attempts`` is how many tries a mutating request gets after a
         # 5xx or read timeout. Three bounds the worst-case wait (~1s) while
         # covering the common cases: one bad pool socket, one transient 502.
@@ -1833,7 +2156,7 @@ class Client:
         # ``json.JSONDecodeError`` (a ``ValueError``) past the ClientError
         # contract; wrap it so callers see one error type.
         try:
-            return cast(JSONValue, response.json())
+            return cast(PlainTree, response.json())
         except ValueError as err:
             raise ClientError(
                 f"{method} {path}: malformed JSON in server response",
@@ -1900,18 +2223,18 @@ def _truncate(text: str, limit: int = 2_048) -> str:
 
 # A server response of the wrong JSON type would otherwise leak a raw ``TypeError`` when
 # a caller subscripts it, past the ClientError contract.
-def _require_mapping(payload: object, where: str) -> Mapping[str, JSONValue]:
+def _require_mapping(payload: object, where: str) -> Mapping[str, PlainTree]:
     """Return ``payload`` as a mapping, or raise a wrapped ``ClientError``."""
     if not isinstance(payload, Mapping):
         raise ClientError(f"{where} returned a malformed payload: {payload!r}")
-    return cast(Mapping[str, JSONValue], payload)
+    return cast(Mapping[str, PlainTree], payload)
 
 
-def _require_list(payload: object, where: str) -> list[JSONValue]:
+def _require_list(payload: object, where: str) -> list[PlainTree]:
     """Return ``payload`` as a list, or raise a wrapped ``ClientError``."""
     if not isinstance(payload, list):
         raise ClientError(f"{where} returned a malformed payload: {payload!r}")
-    return cast(list[JSONValue], payload)
+    return cast(list[PlainTree], payload)
 
 
 def _require_field(payload: object, field: str, where: str) -> object:
@@ -1944,6 +2267,32 @@ def _validate_model[M: pydantic.BaseModel](
         raise ClientError(f"{where} returned a malformed payload: {err}") from err
 
 
+def _build_body[M: pydantic.BaseModel](
+    model: type[M],
+    what: str,
+    **fields: object,
+) -> M:
+    """Build a request body, or raise a ``ClientError`` that never quotes a field."""
+    try:
+        return model.model_validate(fields)
+    except pydantic.ValidationError as err:
+        # Not chained: only the field and the rule are shown, never the input.
+        problems = "; ".join(f"{e['loc'][0]}: {e['msg']}" for e in err.errors())
+        raise ClientError(f"{what} {problems}") from None
+
+
+def _validate_secret_model[M: pydantic.BaseModel](
+    model: type[M],
+    response: object,
+    where: str,
+) -> M:
+    """Validate a payload that carries a secret, never quoting it in an error."""
+    try:
+        return model.model_validate(response)
+    except pydantic.ValidationError:
+        raise ClientError(f"{where} returned a malformed payload") from None
+
+
 # A sequence-valued entry emits one repeated query param per element (``filter`` is the
 # current consumer), with empty elements dropped just like empty scalars. Returns a
 # tuple of ``(key, value)`` pairs, which matches httpx2's ``QueryParams`` signature
@@ -1952,10 +2301,8 @@ def _clean_params(
     params: Mapping[str, object] | None,
 ) -> tuple[tuple[str, str], ...] | None:
     """Drop ``None`` and empty values, stringifying the rest for httpx2."""
-    if not params:
-        return None
     out: list[tuple[str, str]] = []
-    for key, value in params.items():
+    for key, value in (params or {}).items():
         if value is None or value == "":
             continue
         if isinstance(value, (list, tuple)):

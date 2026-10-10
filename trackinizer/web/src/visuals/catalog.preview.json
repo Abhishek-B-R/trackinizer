@@ -1,0 +1,65 @@
+{
+  "default_visual": "trax.browse",
+  "visuals": [
+    {
+      "type": "trax.browse",
+      "version": 1,
+      "title": "Browse",
+      "description": "Browse trax records by kind and query.",
+      "requires": [],
+      "default_size": "wide",
+      "parameter_schema": {},
+      "record_kinds": []
+    },
+    {
+      "type": "trax.chat",
+      "version": 1,
+      "title": "Chat",
+      "description": "Talk with the assistant or a trax run session.",
+      "requires": [
+        "session"
+      ],
+      "default_size": "compact",
+      "parameter_schema": {},
+      "record_kinds": null
+    },
+    {
+      "type": "trax.subgraph",
+      "version": 1,
+      "title": "Context graph",
+      "description": "See a record in context: what lies near it, in the graph.",
+      "requires": [
+        "record"
+      ],
+      "default_size": "wide",
+      "parameter_schema": {
+        "hops": {"type": "integer", "default": 2, "minimum": 1, "maximum": 3, "max_length": null},
+        "highlight": {"type": "string", "default": "", "minimum": null, "maximum": null, "max_length": 512}
+      },
+      "record_kinds": null
+    },
+    {
+      "type": "trax.timeline",
+      "version": 1,
+      "title": "Lineage and timeline",
+      "description": "Any record by date, under its lead issues, over its directions, results, and signed evidence.",
+      "requires": ["record"],
+      "default_size": "wide",
+      "parameter_schema": {
+        "direction_limit": {"type": "integer", "default": 8, "minimum": 1, "maximum": 12, "max_length": null},
+        "results_per_direction": {"type": "integer", "default": 3, "minimum": 1, "maximum": 5, "max_length": null}
+      },
+      "record_kinds": null
+    },
+    {
+      "type": "trax.artifact",
+      "version": 1,
+      "title": "Artifact",
+      "description": "Read immutable shared Artifact content.",
+      "requires": ["record"],
+      "default_size": "wide",
+      "parameter_schema": {},
+      "record_kinds": ["Artifact"]
+    }
+  ]
+}

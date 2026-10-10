@@ -8,8 +8,11 @@ from typing import cast
 import inspect
 import json
 
+import pytest
+
 from trackinizer.lib.agent.sessions import sagent
 from trackinizer.lib.agent.sessions.convert import detect_format, main
+from trackinizer.lib.agent.sessions.testdata.mistype import mistyped
 from trackinizer.lib.agent.types.sessions import (
     AgentStatusResult,
     AgentToAgentMessage,
@@ -30,6 +33,7 @@ from trackinizer.lib.agent.types.sessions import (
     UserMessage,
     WebFetchResult,
 )
+from trackinizer.lib.codec import immutable
 
 
 def _read(*lines: dict[str, object] | str) -> list[SessionRecord]:
@@ -166,6 +170,41 @@ def test_write_and_fetch_results_carry_what_their_calls_named() -> None:
     assert (fetch.url, fetch.content) == ("https://x.org", "page")
 
 
+def test_a_refused_edit_or_write_keeps_its_error_not_a_change() -> None:
+    """A refused file op changed nothing; typing it as one hid the refusal."""
+    records = _read(
+        _history(
+            "assistant",
+            text="",
+            tool_calls=[
+                {
+                    "id": "e",
+                    "name": "Edit",
+                    "args": {
+                        "file_path": "/a.py",
+                        "old_string": "x",
+                        "new_string": "y",
+                    },
+                },
+                {"id": "w", "name": "Write", "args": {"path": "/b.py", "content": "z"}},
+            ],
+        ),
+        _history(
+            "tool_result",
+            call_id="e",
+            content="modified since read",
+            is_error=True,
+        ),
+        _history("tool_result", call_id="w", content="not yet read", is_error=True),
+    )
+
+    assert not _only(records, FileEditResult)
+    assert not _only(records, FileWriteResult)
+    edit, write = _only(records, UncategorizedToolResult)
+    assert (edit.content, edit.extra["is_error"]) == ("modified since read", True)
+    assert (write.content, write.extra["is_error"]) == ("not yet read", True)
+
+
 def test_a_context_override_is_a_compaction() -> None:
     records = _read({"kind": "context_override", "tokens": 12, "payload": {}})
 
@@ -275,13 +314,13 @@ def test_meta_states_model_changes_and_cumulative_usage() -> None:
         _meta(total_cost_usd=0.0, tokens={"input_tokens": 0, "output_tokens": 0}),
         _meta(total_cost_usd=1.5, tokens={"input_tokens": 10, "output_tokens": 2}),
         _meta(
-            model_id="luna-6",
+            model_id="luna-6.0",
             total_cost_usd=2.0,
             tokens={"input_tokens": 20, "output_tokens": 3},
         ),
     )
 
-    assert [c.model for c in _only(records, TurnContext)] == ["opus-5.5", "luna-6"]
+    assert [c.model for c in _only(records, TurnContext)] == ["opus-5.5", "luna-6.0"]
     usage = _only(records, TokenUsage)
     assert usage[-1].info["cost_usd"] == 2.0
     assert usage[-1].info["input_tokens"] == 20
@@ -369,6 +408,81 @@ def test_a_descriptor_error_part_marks_the_result_failed() -> None:
     assert result.content == "boom"
 
 
+def test_legacy_text_parts_join_plain_markdown_and_error_text() -> None:
+    parts: list[dict[str, object]] = [
+        {"descriptor": "text/plain", "content": "a"},
+        {"descriptor": "text/markdown", "content": "b"},
+        {"descriptor": "text/x-error", "content": "c"},
+        {"descriptor": "image/png", "content": "d"},
+    ]
+
+    assert sagent._plain(None, parts) == "abc"
+
+
+def test_a_legacy_call_without_parts_names_nothing() -> None:
+    assert sagent._legacy_call([]) == ("", "", {})
+
+
+def test_a_legacy_compound_tool_name_keeps_its_casing() -> None:
+    parts: list[dict[str, object]] = [
+        {"descriptor": "application/x-tool-webfetch", "content": {"url": "u"}},
+    ]
+
+    assert sagent._legacy_call(parts) == ("", "WebFetch", {"url": "u"})
+
+
+def test_a_stamp_is_utc() -> None:
+    assert sagent._stamp(0.5) == "1970-01-01T00:00:00.500000+00:00"
+
+
+def test_a_zero_stamp_is_absent() -> None:
+    assert sagent._stamp(0) is None
+
+
+def test_a_stamp_past_1e11_is_nanoseconds() -> None:
+    assert sagent._stamp(1e11) == "5138-11-16T09:46:40+00:00"
+    assert sagent._stamp(100_000_000_000.5) == "1970-01-01T00:01:40+00:00"
+    assert sagent._stamp(2_000_000_000_000_000_000) == "2033-05-18T03:33:20+00:00"
+
+
+def test_a_role_assistant_turn_keeps_its_thinking() -> None:
+    records = _read(
+        {
+            "kind": "message",
+            "role": "assistant",
+            "content": "",
+            "thinking_blocks": [{"thinking": "hm", "signature": "s"}],
+            "tool_calls": [{"id": "t1", "name": "Bash", "args": {"command": "ls"}}],
+        },
+    )
+
+    assert [(t.content, t.encrypted) for t in _only(records, Thinking)] == [
+        ("hm", "s"),
+    ]
+    [call] = _only(records, ToolCall)
+    assert dict(call.arguments) == {"command": "ls"}
+
+
+def test_a_role_tool_result_keeps_its_failure() -> None:
+    records = _read(
+        {"kind": "message", "role": "tool", "tool_call_id": "t", "is_error": True},
+    )
+
+    [result] = _only(records, UncategorizedToolResult)
+    assert result.extra["is_error"] is True
+
+
+def test_an_unknown_role_keeps_its_record() -> None:
+    record: dict[str, object] = {
+        "kind": "message",
+        "role": "system",
+        "content": "be terse",
+    }
+
+    [kept] = _only(_read(record), UncategorizedRecord)
+    assert dict(kept.payload) == record
+
+
 def test_the_role_family_reads_like_history() -> None:
     """The oldest ``kind: message`` records tagged by ``role``."""
     records = _read(
@@ -408,6 +522,30 @@ def test_convert_names_the_format_but_does_not_offer_it() -> None:
     assert "sagent" not in offered
 
 
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"kind": "persistent_agent", "label": "x"},
+        {"kind": "persistent_agent", "label": "x", "session_dir": 7},
+        {"kind": "history", "type": "user", "text": 3},
+        {"kind": "history", "type": "tool_result", "call_id": "c", "content": [1]},
+        {"kind": "history", "type": "assistant", "tool_calls": [{"id": 1}]},
+        {"kind": "meta", "tokens": {"input_tokens": "x"}, "spend": {"a": "b"}},
+        {"kind": "message", "descriptor": "multipart/x-tool-result", "content": [7]},
+    ],
+    ids=["no-dir", "int-dir", "int-text", "list-content", "int-id", "bad-meta", "part"],
+)
+def test_a_malformed_record_degrades_to_an_uncategorized_one(
+    record: dict[str, object],
+) -> None:
+    # Narrowing ran outside the parse's ``try``, so one bad field raised out
+    # of ``normalize`` and aborted the whole read.
+    records = _read(record, _history("user", text="after"))
+
+    assert _only(records, UncategorizedRecord)[0].payload == immutable(record)
+    assert [u.content for u in _only(records, UserMessage)] == ["after"]
+
+
 def test_sagent_is_recognized_by_its_record_kinds() -> None:
     assert sagent.is_sagent(json.dumps(_meta()) + "\n")
     assert sagent.is_sagent(json.dumps(_history("user", text="x")) + "\n")
@@ -419,7 +557,115 @@ def test_sagent_is_recognized_by_its_record_kinds() -> None:
     )
     assert sagent.is_sagent("\n" + json.dumps(_meta()) + "\n")
     assert not sagent.is_sagent("{truncated\n")
+    assert not sagent.is_sagent(json.dumps({"kind": ["meta"]}) + "\n")
     assert not sagent.is_sagent("")
+
+
+def test_a_mistyped_field_aborts_no_read() -> None:
+    """A log field of the wrong type reads as absent, as a missing one does.
+
+    One session states every record family, and each call is answered after it,
+    so a result is typed by the call it answers when its wrong field is read.
+    """
+    calls = [
+        {"id": "c1", "name": "Bash", "args": {"command": "ls"}},
+        {"id": "c2", "name": "Read", "args": {"file_path": "a.py"}},
+        {"id": "c3", "name": "Write", "args": {"path": "b.py", "content": "x"}},
+        {
+            "id": "c4",
+            "name": "Edit",
+            "args": {"file_path": "a.py", "old_string": "a", "new_string": "b"},
+        },
+        {"id": "c5", "name": "WebFetch", "args": {"url": "https://x.org"}},
+        {
+            "id": "c6",
+            "name": "AgentSpawn",
+            "args": {"label": "kid", "prompt": "go", "model_id": "m"},
+        },
+    ]
+    session: list[dict[str, object]] = [
+        _meta(
+            provider="p",
+            tokens={"input_tokens": 3, "output_tokens": 4, "cache_read_tokens": 1},
+            spend={"a": 0.5},
+            total_cost_usd=0.5,
+            num_tool_call_rounds=2,
+        ),
+        {"kind": "persistent_agent", "label": "kid", "session_dir": "/x/kid"},
+        _history("user", text="go", timestamp=1790000000.5),
+        _history(
+            "assistant",
+            text="ok",
+            timestamp=1790000000.5,
+            thinking_blocks=[{"thinking": "t", "signature": "s"}],
+            tool_calls=calls,
+        ),
+        *(
+            _history("tool_result", call_id=f"c{n}", content="a\nb", is_error=False)
+            for n in range(1, 7)
+        ),
+        _history("agent_send", text="hi", source="kid"),
+        _history("compact_complete", text="summary", tokens=12),
+        {
+            "kind": "message",
+            "descriptor": "multipart/x-model-message",
+            "_timestamp": 1_790_000_000_000_000_000,
+            "content": [
+                {
+                    "descriptor": "application/x-thinking",
+                    "content": {"thinking": "t", "signature": "s"},
+                },
+                {"descriptor": "text/plain", "content": "hi"},
+                {
+                    "descriptor": "multipart/x-tool-call",
+                    "content": [
+                        {"descriptor": "text/x-queue-id", "content": "q1"},
+                        {
+                            "descriptor": "application/x-tool-read",
+                            "content": {"path": "a"},
+                        },
+                    ],
+                },
+            ],
+        },
+        {
+            "kind": "message",
+            "descriptor": "multipart/x-tool-result",
+            "content": [
+                {"descriptor": "text/x-queue-id", "content": "q1"},
+                {"descriptor": "text/plain", "content": "body"},
+            ],
+        },
+        {"kind": "message", "descriptor": "text/x-user-message", "content": "hello"},
+        {
+            "kind": "message",
+            "role": "assistant",
+            "content": "x",
+            "thinking_blocks": [{"thinking": "t"}],
+            "tool_calls": [{"id": "r1", "name": "Bash", "input": {"command": "ls"}}],
+        },
+        {
+            "kind": "message",
+            "role": "tool",
+            "tool_call_id": "r1",
+            "content": "out",
+            "is_error": True,
+        },
+        {"kind": "context_override", "tokens": 12, "payload": {}},
+    ]
+    failed: list[str] = []
+    for index, record in enumerate(session):
+        for path, changed in mistyped(record):
+            try:
+                _read(
+                    *session[:index],
+                    cast(dict[str, object], changed),
+                    *session[index + 1 :],
+                )
+            except TypeError as error:
+                failed.append(f"{index}.{path}: {error}")
+
+    assert failed == []
 
 
 if __name__ == "__main__":

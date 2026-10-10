@@ -25,7 +25,8 @@ What it proves, per CLI:
 from __future__ import annotations
 
 from collections import deque
-from contextlib import ExitStack, asynccontextmanager, closing, nullcontext, suppress
+from contextlib import ExitStack, asynccontextmanager, closing, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Self, TextIO, cast, override
@@ -35,12 +36,14 @@ import enum
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
 import uuid
 
 from fastapi import FastAPI
+from starlette.responses import Response
 
 import httpx2
 import pytest
@@ -48,16 +51,17 @@ import uvicorn
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
+from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.lib.agent.types.sessions import SessionRecord, UserMessage
-from trackinizer.lib.custom_json import DictCodec, IntCodec, ListCodec
+from trackinizer.lib.codec import from_plain
 from trackinizer.lib.posix.relay import ThreadedRelay
 from trackinizer.lib.postgres import PGliteEngine
+from trackinizer.lib.userdirs import state_dir
 from trackinizer.server.api import query, session_ir_routes, sessions_routes
 from trackinizer.server.auth import AuthIdentity, current_user
 from trackinizer.server.embedders.stub import StubEmbedder
 from trackinizer.server.inbound import InboundQueue
 from trackinizer.server.store.core import Store
-from trackinizer.trax.run.adapters.tail import Tail
 from trackinizer.trax.run.session import (
     RunConfig,
     _drain_filesystem_loop,
@@ -65,17 +69,20 @@ from trackinizer.trax.run.session import (
     _Stats,
     run,
 )
-from trackinizer.trax.run.sink import Sink, TrackinizerSink
+from trackinizer.trax.run.sink import ResilientSink, Sink, TrackinizerSink
 from trackinizer.types.session_records import _BY_KIND
 from trackinizer.wire.wire_sessions import SessionStart, SessionStartResponse
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Awaitable, Callable, Iterator
     from datetime import datetime
+
+    from starlette.requests import Request
 
     from trackinizer.trax.run.custom_types import Event
     from trackinizer.trax.run.slash import SlashCommand
+    from trackinizer.types.streams import TraxRecord
     from trackinizer.wire.wire_session_ir import RecordBody
 
 
@@ -338,7 +345,7 @@ def _latest_session_row(
             params={"kind": "AgentSession", "limit": 50},
         )
         listing.raise_for_status()
-        rows = ListCodec.mappings(listing.json())
+        rows = from_plain(listing.json(), list[dict[str, object]])
         if cli is not None:
             rows = [r for r in rows if r.get("cli") == cli]
         return rows[0] if rows else None
@@ -366,20 +373,20 @@ def _latest_session_records(
     with httpx2.Client(base_url=base_url, timeout=30.0) as http:
         parts = http.get(f"/api/sessions/{session_id}/parts")
         parts.raise_for_status()
-        listing = DictCodec.coerce(parts.json())
-        for part in ListCodec.mappings(listing["parts"]):
+        listing = from_plain(parts.json(), dict[str, object])
+        for part in from_plain(listing["parts"], list[dict[str, object]]):
             page = http.get(
                 f"/api/sessions/{session_id}/records",
-                params={"part": IntCodec.coerce(part["part"]), "limit": 1000},
+                params={"part": from_plain(part["part"], int), "limit": 1000},
             )
             page.raise_for_status()
-            body = DictCodec.coerce(page.json())
+            body = from_plain(page.json(), dict[str, object])
             # ``RecordBody`` carries no ``part`` -- the route resolves one and
             # returns it alongside -- so stamp it here, or a caller checking
             # positions cannot tell two parts apart.
             found.extend(
                 {**record, "part": body["part"]}
-                for record in ListCodec.mappings(body["records"])
+                for record in from_plain(body["records"], list[dict[str, object]])
             )
     return found
 
@@ -437,13 +444,13 @@ def _assert_transcript_synced(base_url: str, *, cli: str) -> None:
     # position derived from its place in the file's normalized stream.
     for record in records:
         assert isinstance(record["payload"], dict)
-        assert IntCodec.coerce(record["idx"]) >= 0
+        assert from_plain(record["idx"], int) >= 0
     # Each part numbers its records from 0 with no gaps: the key is derived
     # from stream position, so a hole means a record was dropped in ingest.
     by_part: dict[int, list[int]] = {}
     for record in records:
-        part = IntCodec.coerce(record["part"])
-        by_part.setdefault(part, []).append(IntCodec.coerce(record["idx"]))
+        part = from_plain(record["part"], int)
+        by_part.setdefault(part, []).append(from_plain(record["idx"], int))
     for part, idxs in by_part.items():
         assert sorted(idxs) == list(range(len(idxs))), (
             f"gap in part {part}'s positions: {sorted(idxs)}"
@@ -456,15 +463,22 @@ def _assert_transcript_synced(base_url: str, *, cli: str) -> None:
 
 
 @pytest.mark.cli_python_subprocess
-@pytest.mark.cli_claude
-@pytest.mark.cli_codex
+@pytest.mark.cli_real_llm
 def test_trax_run_claude_syncs_session(server: str) -> None:
     """A real ``claude -p`` run captures and syncs its session to the DB."""
     if shutil.which("claude") is None:
         pytest.skip("claude binary not on PATH")
     rc = _run_capture(
         "claude",
-        ("-p", "--output-format", "stream-json", "--verbose", _PROMPT),
+        (
+            "-p",
+            "--model",
+            "haiku",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            _PROMPT,
+        ),
         server,
     )
     _skip_if_cli_unauthenticated("claude", rc, server)
@@ -472,8 +486,7 @@ def test_trax_run_claude_syncs_session(server: str) -> None:
 
 
 @pytest.mark.cli_python_subprocess
-@pytest.mark.cli_claude
-@pytest.mark.cli_codex
+@pytest.mark.cli_real_llm
 def test_trax_run_codex_syncs_session(server: str) -> None:
     """A real ``codex exec`` run captures and syncs its session to the DB."""
     if shutil.which("codex") is None:
@@ -482,6 +495,8 @@ def test_trax_run_codex_syncs_session(server: str) -> None:
         "codex",
         (
             "exec",
+            "-m",
+            "gpt-6-luna",
             "--skip-git-repo-check",
             "-c",
             "model_reasoning_summary=detailed",
@@ -532,6 +547,7 @@ class _LineAdapter:
     name: str = "fakeline"
     cli_binary: str = "fakeline"
     whole_file: bool = False
+    parent_session_env: frozenset[str] = frozenset[str]()
 
     def __init__(self, root: Path) -> None:
         self._root = root
@@ -549,7 +565,7 @@ class _LineAdapter:
         del path
         return None
 
-    def reader(self) -> Tail:
+    def reader(self) -> Tail[TraxRecord]:
         return Tail(_line_records)
 
 
@@ -630,6 +646,123 @@ def test_capture_streams_incrementally_before_close(
 
 
 @pytest.mark.cli_python_subprocess
+def test_a_synced_run_catches_the_server_up_after_an_outage(tmp_path: Path) -> None:
+    """A run that lost the server mid-session ends with the server holding all of it.
+
+    The hosted outage this models answered 502/530 from the edge while the run went
+    on working. Records captured during it reach the server once it answers again,
+    each exactly once and in order, and the session still ends.
+    """
+    outage = threading.Event()
+    app = _build_app(tmp_path / "pglite")
+    _ = app.middleware("http")(_Edge(outage=outage))
+
+    session_root = tmp_path / "sessions"
+    session_root.mkdir()
+    adapter = _LineAdapter(session_root)
+    fallback = tmp_path / "fallback.jsonl"
+    log = session_root / "live.jsonl"
+    with _ServerThread(app, _free_port()) as srv:
+        sink = ResilientSink(
+            TrackinizerSink(
+                Client(base_url=srv.base_url),
+                cli=adapter.name,
+                flush_interval_sec=0.2,
+            ),
+            fallback_path=fallback,
+            retry_sec=1.0,
+        )
+        stop = threading.Event()
+        worker = threading.Thread(
+            target=lambda: _drain_filesystem_loop(
+                adapter,
+                sink,
+                _Stats(),
+                RunConfig(cli_name=adapter.name, quiesce_seconds=0.5),
+                stop,
+                baseline=frozenset(),
+                slash_queue=deque(),
+            ),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            # Re-appended until one lands: the drain arms its watch a moment after
+            # start, and a line written before that is never reported.
+            _wait_for(
+                lambda: _appended(log, text="before") and _texts(srv.base_url) != [],
+            )
+            outage.set()
+            _append_until(log, text="during", landed=fallback.exists)
+            outage.clear()
+            _wait_for(lambda: "during" in _texts(srv.base_url))
+            _append_until(
+                log,
+                text="after",
+                landed=lambda: "after" in _texts(srv.base_url),
+            )
+        finally:
+            stop.set()
+            worker.join(timeout=5.0)
+            sink.close()
+
+        texts = _texts(srv.base_url)
+        row = _latest_session_row(srv.base_url, cli=adapter.name)
+    first_during = texts.index("during")
+    assert set(texts[:first_during]) == {"before"}
+    assert texts[first_during:] == ["during", "after"], texts
+    assert row is not None
+    assert row.get("ended") is not None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Edge:
+    """HTTP middleware that answers as a down edge would while ``outage`` is set."""
+
+    outage: threading.Event
+
+    async def __call__(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if self.outage.is_set():
+            return Response(status_code=502)
+        return await call_next(request)
+
+
+def _texts(base_url: str) -> list[str]:
+    """Return the text of each record the line adapter's session holds, in order."""
+    return [
+        str(record["text"])
+        for record in _latest_session_records(base_url, cli=_LineAdapter.name)
+    ]
+
+
+def _appended(log: Path, *, text: str) -> bool:
+    """Append ``text`` as a line and wait a beat for the drain; return True."""
+    with log.open("a") as handle:
+        _ = handle.write(f"{text}\n")
+    time.sleep(0.3)
+    return True
+
+
+def _append_until(log: Path, *, text: str, landed: Callable[[], bool]) -> None:
+    """Append ``text`` as a line, once, then wait for ``landed``."""
+    with log.open("a") as handle:
+        _ = handle.write(f"{text}\n")
+    _wait_for(landed)
+
+
+def _wait_for(condition: Callable[[], bool], *, timeout_sec: float = 20.0) -> None:
+    """Poll ``condition`` until it holds, failing the test at the timeout."""
+    deadline = time.monotonic() + timeout_sec
+    while not condition():
+        assert time.monotonic() < deadline, "timed out waiting for the run"
+        time.sleep(0.1)
+
+
+@pytest.mark.cli_python_subprocess
 def test_inbound_injection_reaches_child_end_to_end(server: str) -> None:
     """Full loop: HTTP enqueue -> poller -> relay -> child receives it.
 
@@ -696,6 +829,76 @@ def test_inbound_injection_reaches_child_end_to_end(server: str) -> None:
         assert not relay_thread.is_alive(), "relay did not stop"
         assert not poller.is_alive(), "inbound poller did not stop"
         client.close()
+
+
+@pytest.mark.cli_python_subprocess
+def test_detached_run_syncs_and_receives_inbound(server: str) -> None:
+    """A ``--detach`` host is a whole ``trax run``, not a lesser one.
+
+    It opens the synced session before it reports ready, a message routed to
+    that session reaches the hosted child, and a stop ends the session.
+    """
+    name = f"detached-{uuid.uuid4().hex[:8]}"
+    child = "import sys\nfor line in sys.stdin:\n    print('ECHO:' + line.strip(), flush=True)\n"
+    launched = _trax_cli(
+        server,
+        "run",
+        "--detach",
+        "--name",
+        name,
+        "--as",
+        name,
+        "sh",
+        "--",
+        sys.executable,
+        "-u",
+        "-c",
+        child,
+    )
+    assert launched.returncode == 0, launched.stderr
+    scrollback = (
+        state_dir() / "rekursiv-ai" / "trax" / "run" / "hosts" / name / "scrollback.log"
+    )
+    try:
+        row = _latest_session_row(server, cli="sh")
+        assert row is not None
+        client = Client(base_url=server)
+        assert client.enqueue_inbound(uuid.UUID(str(row["id"])), "routed hello") >= 1
+        client.close()
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if scrollback.exists() and b"routed hello" in scrollback.read_bytes():
+                break
+            time.sleep(0.1)
+        assert b"ECHO:" in scrollback.read_bytes()
+        assert b"routed hello" in scrollback.read_bytes()
+    finally:
+        stopped = _trax_cli(server, "run", "stop", name)
+    assert stopped.returncode == 0, stopped.stderr
+    ended = _latest_session_row(server, cli="sh")
+    assert ended is not None
+    assert ended.get("ended") is not None, "stopping the host did not end its session"
+
+
+# ``-m`` resolves the package from the working directory, so the CLI runs from the root
+# THIS checkout's package was imported from. The URL is passed explicitly because the
+# trax conftest scrubs ``TRACKINIZER_URL`` from the test process's own environment.
+def _trax_cli(server: str, *argv: str) -> subprocess.CompletedProcess[str]:
+    """Run the ``trax`` CLI against ``server`` in a fresh process."""
+    package = RunConfig.__module__.rsplit(".", 2)[0]
+    root = Path(sys.modules[RunConfig.__module__].__file__ or "").parents[
+        RunConfig.__module__.count(".")
+    ]
+    return subprocess.run(  # noqa: S603 -- fixed interpreter and module; test argv.
+        [sys.executable, "-m", package, *argv],
+        cwd=root,
+        env={**os.environ, "TRACKINIZER_URL": server},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
 
 
 class _InjectionResult(enum.Enum):
@@ -871,10 +1074,12 @@ def test_injection_closes_resources_on_every_exit(
         SimpleNamespace(sleep=no_sleep, monotonic=ticks.__next__),
     )
     pipes: list[tuple[int, int]] = []
+    identities: dict[int, tuple[int, int]] = {}
     real_pipe = os.pipe
 
     def record_pipe() -> tuple[int, int]:
         pipes.append(real_pipe())
+        identities.update((fd, _identity(fd)) for fd in pipes[-1])
         return pipes[-1]
 
     workers: list[threading.Thread] = []
@@ -891,7 +1096,6 @@ def test_injection_closes_resources_on_every_exit(
     monkeypatch.setattr(os, "pipe", record_pipe)
     monkeypatch.setattr(threading, "Thread", record_thread)
     original_stdout, original_stdin = sys.stdout, sys.stdin
-    descriptors = len(list(Path("/dev/fd").iterdir()))
     try:
         with pytest.raises(RuntimeError, match=failure) if failure else nullcontext():
             assert (
@@ -908,11 +1112,7 @@ def test_injection_closes_resources_on_every_exit(
         assert sys.stdout is original_stdout
         assert sys.stdin is original_stdin
         assert len(pipes) == 2
-        assert len(list(Path("/dev/fd").iterdir())) == descriptors
-        for pair in pipes:
-            for fd in pair:
-                with pytest.raises(OSError, match="Bad file descriptor"):
-                    os.fstat(fd)
+        assert not [fd for fd, pipe in identities.items() if _is_open_as(fd, pipe)]
         assert all(not worker.is_alive() for worker in workers)
         client.close.assert_called_once_with()
     finally:
@@ -922,12 +1122,28 @@ def test_injection_closes_resources_on_every_exit(
             output.close()
         if input_stream is not original_stdin:
             input_stream.close()
-        for pair in pipes:
-            for fd in pair:
-                with suppress(OSError):
-                    os.close(fd)
+        for fd, pipe in identities.items():
+            if _is_open_as(fd, pipe):
+                os.close(fd)
         for worker in workers:
             worker.join(timeout=2.0)
+
+
+# The pytest worker's other threads open and close descriptors throughout this
+# test, reusing any number it frees, so neither a count of the process's open
+# descriptors nor a bare ``fstat`` of a closed number can tell this test's pipes
+# from theirs. A file's (device, inode) can.
+def _identity(fd: int) -> tuple[int, int]:
+    stat = os.fstat(fd)
+    return stat.st_dev, stat.st_ino
+
+
+def _is_open_as(fd: int, identity: tuple[int, int]) -> bool:
+    """Whether ``fd`` still names the file ``identity`` was taken from."""
+    try:
+        return _identity(fd) == identity
+    except OSError:
+        return False
 
 
 # ``TOKEN_SEEN`` passes -- it positively proves the injected message reached a live
@@ -951,8 +1167,7 @@ def _assert_injection_or_skip(cli: str, result: _InjectionResult) -> None:
 
 
 @pytest.mark.cli_python_subprocess
-@pytest.mark.cli_claude
-@pytest.mark.cli_codex
+@pytest.mark.cli_real_llm
 def test_injection_reaches_real_claude_end_to_end(server: str) -> None:
     """The full messaging loop drives a live, interactive claude.
 
@@ -962,9 +1177,13 @@ def test_injection_reaches_real_claude_end_to_end(server: str) -> None:
     """
     if shutil.which("claude") is None:
         pytest.skip("claude binary not on PATH")
+    # No ``--dangerously-skip-permissions``: it now opens an acceptance dialog
+    # defaulting to "No, exit", the injected prompt lands in that dialog, and
+    # the test can only time out and skip. The question needs no tool, so no
+    # permission prompt stands in the way without it.
     result = _drive_real_cli_injection(
         "claude",
-        ["--dangerously-skip-permissions"],
+        ["--model", "haiku"],
         server,
         _INJECTION_PROMPT,
         _INJECTION_ANSWER,
@@ -973,8 +1192,7 @@ def test_injection_reaches_real_claude_end_to_end(server: str) -> None:
 
 
 @pytest.mark.cli_python_subprocess
-@pytest.mark.cli_claude
-@pytest.mark.cli_codex
+@pytest.mark.cli_real_llm
 def test_injection_reaches_real_codex_end_to_end(server: str) -> None:
     """The full messaging loop drives a live, interactive codex.
 
@@ -991,7 +1209,7 @@ def test_injection_reaches_real_codex_end_to_end(server: str) -> None:
     # a deadline elapse skips (inconclusive) instead of failing red.
     result = _drive_real_cli_injection(
         "codex",
-        ["--dangerously-bypass-approvals-and-sandbox"],
+        ["-m", "gpt-6-luna", "--dangerously-bypass-approvals-and-sandbox"],
         server,
         _INJECTION_PROMPT,
         _INJECTION_ANSWER,
@@ -1041,7 +1259,7 @@ class _StubSessionSink(Sink):
         pass
 
     @override
-    def drain_pending(self) -> list[tuple[Path, RecordBody]]:
+    def pending(self) -> list[tuple[Path, RecordBody]]:
         return []
 
     @override

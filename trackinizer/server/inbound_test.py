@@ -31,6 +31,18 @@ class TestInboundQueue:
         queue.mark_poller(session)
         assert queue.has_poller(session)
 
+    def test_active_poller_ids_lists_only_unexpired_leases(self) -> None:
+        now = [100.0]
+        queue = InboundQueue(poller_ttl_sec=45.0, _clock=lambda: now[0])
+        early, late = uuid.uuid4(), uuid.uuid4()
+        queue.mark_poller(early)
+        now[0] = 120.0
+        queue.mark_poller(late)
+        now[0] = 145.0
+        assert queue.active_poller_ids() == [late]
+        now[0] = 165.0
+        assert queue.active_poller_ids() == []
+
     def test_enqueue_then_drain_is_fifo(self) -> None:
         q = InboundQueue()
         sid = uuid.uuid4()
@@ -84,6 +96,19 @@ class TestInboundQueue:
         q.enqueue(sid, Inbound(text="hi", source="alice@x", room="sear"))
         (msg,) = q.drain(sid)
         assert (msg.text, msg.source, msg.room) == ("hi", "alice@x", "sear")
+
+    def test_a_queue_is_full_exactly_at_its_cap_and_drains_to_room(self) -> None:
+        queue = InboundQueue(max_per_session=2)
+        session = uuid.uuid4()
+
+        assert not queue.is_full(session)
+        _ = queue.enqueue(session, Inbound(text="one"))
+        assert not queue.is_full(session)
+        _ = queue.enqueue(session, Inbound(text="two"))
+        assert queue.is_full(session)
+        assert not queue.is_full(uuid.uuid4())
+        _ = queue.drain(session)
+        assert not queue.is_full(session)
 
 
 class TestAwaitMessages:
@@ -232,6 +257,50 @@ class TestAwaitMessages:
         assert delivered == [["one message"]], f"message delivered twice: {results}"
 
 
+class TestRevokingTheLeaseEndsTheHold:
+    """A session's end releases the request its own poller is parked in.
+
+    The run ends its session as it exits, with its poller parked in a hold; a
+    hold that outlived the lease kept every exit waiting out its full length.
+    """
+
+    def test_the_hold_returns_when_the_lease_is_revoked(self) -> None:
+        queue = InboundQueue()
+        session = uuid.uuid4()
+        queue.mark_poller(session)
+
+        async def run() -> list[Inbound]:
+            hold = asyncio.create_task(queue.await_messages(session, timeout_sec=3_600))
+            await asyncio.sleep(0)
+            assert queue._waiters[session]
+            queue.forget_poller(session)
+            return await asyncio.wait_for(hold, timeout=5)
+
+        assert asyncio.run(run()) == []
+        assert not queue._waiters
+
+    def test_a_released_hold_takes_nothing(self) -> None:
+        """A message queued as the poller leaves stays queued, not handed to it.
+
+        The leaving run can no longer type what it receives, so a hold that
+        drained on release would consume the message and drop it.
+        """
+        queue = InboundQueue()
+        session = uuid.uuid4()
+        queue.mark_poller(session)
+
+        async def run() -> list[Inbound]:
+            hold = asyncio.create_task(queue.await_messages(session, timeout_sec=3_600))
+            await asyncio.sleep(0)
+            assert queue._waiters[session]
+            _ = queue.enqueue(session, Inbound(text="sent as the run exits"))
+            queue.forget_poller(session)
+            return await asyncio.wait_for(hold, timeout=5)
+
+        assert asyncio.run(run()) == []
+        assert queue.pending(session) == 1
+
+
 class TestSendIdempotency:
     """``send_once`` dedups a replayed key without re-enqueuing."""
 
@@ -267,6 +336,19 @@ class TestSendIdempotency:
         second = q.send_once(key, [(sid, Inbound(text="hi"))])
         assert second == [sid]
         assert q.pending(sid) == 1
+
+    def test_a_key_remembers_who_first_sent_under_it(self) -> None:
+        q = InboundQueue(max_seen_keys=1)
+        key, other = uuid.uuid4(), uuid.uuid4()
+        sid = uuid.uuid4()
+        q.send_once(key, [(sid, Inbound(text="hi", source="ada@example.com"))])
+        q.send_once(key, [(sid, Inbound(text="hi", source="jan@other.org"))])
+
+        assert q.sender_of(key) == "ada@example.com"
+        assert q.sender_of(other) is None
+        # A key the bound pushed out is forgotten, as is one that had no sender.
+        q.send_once(other, [(sid, Inbound(text="anon"))])
+        assert (q.sender_of(key), q.sender_of(other)) == (None, None)
 
     def test_send_once_concurrent_same_key_enqueues_once(self) -> None:
         # Two concurrent same-key sends must not BOTH pass the dedup check and

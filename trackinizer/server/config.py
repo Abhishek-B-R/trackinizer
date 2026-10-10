@@ -23,11 +23,15 @@ if TYPE_CHECKING:
 
 
 __all__ = [
+    "Assistant",
+    "ChatOrgs",
     "Config",
     "ConfigError",
     "ConfigFlags",
     "build_embedder",
     "build_engine",
+    "parse_assistant",
+    "parse_chat_orgs",
     "parse_engine",
 ]
 
@@ -48,6 +52,23 @@ _DEFAULT_SESSION_MAX_AGE_SECONDS: int = (
 )  # house-ignore[globals] -- Shared default; threading would duplicate across the Config field default and the env-parse fallback.
 
 
+type ChatOrgs = Literal["single", "domain"]
+"""Who a science chat's starter shares an organisation with: everyone (``single``), or
+only those whose verified email has the starter's domain (``domain``)."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Assistant:
+    """An account whose live sessions every signed-in user may talk to.
+
+    An actor handle is first come, first served, so a session is the assistant's
+    only when the API key that opened it also belongs to ``email``.
+    """
+
+    actor: str
+    email: str
+
+
 class ConfigFlags(Protocol):
     """The parsed CLI flags :meth:`Config.from_args` reads."""
 
@@ -62,7 +83,8 @@ class ConfigFlags(Protocol):
     session_embedders: str
     web: bool
     session_max_age_seconds: int
-    no_auth: bool
+    auth: bool
+    assistant: str
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -82,19 +104,23 @@ class Config:
       embedder: Embedder backend name (inquiry_embeddings, 384-dim).
       session_embedder: Embedder backend name for session_embeddings
         semantic search (1024-dim); empty disables the semantic arm.
-      web: Mount the SPA when true.
-      oauth_google_client_id: Google OAuth client id. ``None`` makes the
-        OAuth routes 503; bearer auth is unaffected.
-      oauth_google_client_secret: Google OAuth client secret; same
-        503-on-missing behavior.
-      oauth_redirect_uri: Public callback URL registered with Google.
-        ``None`` disables OAuth.
+      web: Mount the web routes: ``/api/web``, the login page and, with
+        ``--app-dir``, the web app.
       session_secret: HMAC key for the session and OAuth-state cookies.
-        ``None`` disables session login. Must be stable across processes
+        Empty disables session login. Must be stable across processes
         sharing the cookie -- rotating it logs everyone out.
+      secrets: Secret-variable backend: ``file`` (under the user data
+        directory), ``file:/abs/path``, or ``none`` to refuse secret
+        variables. Environment only (``TRACKINIZER_SECRETS``).
       session_max_age_seconds: Session cookie TTL; defaults to 30 days.
       auth_disabled: Bypass auth -- every request becomes a synthetic
         admin. Local demos only; never in production.
+      assistant: The Chat partner of every canvas; none when unset.
+      chat_orgs: ``domain`` (the default) gives each verified email domain its own
+        organisation, consumer domains none: a user outside the starter's forks the
+        chat instead. ``single`` makes every user one organisation, so a science chat
+        is always continued by typing in it; only a server whose users are all one
+        organisation sets it. Environment only (``TRACKINIZER_CHAT_ORGS``).
 
     """
 
@@ -127,12 +153,12 @@ class Config:
     # candidates. Env: comma-separated ``TRACKINIZER_SESSION_EMBEDDERS``.
     session_embedders: tuple[str, ...] = ()
     web: bool = False
-    oauth_google_client_id: str | None = None
-    oauth_google_client_secret: str | None = None
-    oauth_redirect_uri: str | None = None
-    session_secret: str | None = None
+    session_secret: str = ""
+    secrets: str = "file"
     session_max_age_seconds: int = _DEFAULT_SESSION_MAX_AGE_SECONDS
     auth_disabled: bool = False
+    assistant: Assistant | None = None
+    chat_orgs: ChatOrgs = "domain"
 
     @classmethod
     def from_env(cls) -> Self:
@@ -145,7 +171,7 @@ class Config:
         return cls(
             engine=parse_engine(os.environ.get("TRACKINIZER_ENGINE", "pglite")),
             datadir=Path(env_datadir)
-            if (env_datadir := os.environ.get("TRACKINIZER_DATADIR"))
+            if (env_datadir := os.environ.get("TRACKINIZER_DATADIR", ""))
             else None,
             ephemeral=os.environ.get("TRACKINIZER_EPHEMERAL") == "1",
             pglite_tcp=os.environ.get("TRACKINIZER_PGLITE_TCP") == "1",
@@ -159,16 +185,12 @@ class Config:
                 os.environ.get("TRACKINIZER_SESSION_EMBEDDERS", ""),
             ),
             web=os.environ.get("TRACKINIZER_WEB") == "1",
-            oauth_google_client_id=os.environ.get("TRACKINIZER_GOOGLE_CLIENT_ID")
-            or None,
-            oauth_google_client_secret=os.environ.get(
-                "TRACKINIZER_GOOGLE_CLIENT_SECRET",
-            )
-            or None,
-            oauth_redirect_uri=os.environ.get("TRACKINIZER_OAUTH_REDIRECT_URI") or None,
-            session_secret=os.environ.get("TRACKINIZER_SESSION_SECRET") or None,
+            session_secret=os.environ.get("TRACKINIZER_SESSION_SECRET", ""),
+            secrets=secrets_from_env(),
             session_max_age_seconds=session_max_age_from_env(),
-            auth_disabled=os.environ.get("TRACKINIZER_NO_AUTH") == "1",
+            auth_disabled=auth_disabled_from_env(),
+            assistant=parse_assistant(os.environ.get("TRACKINIZER_ASSISTANT", "")),
+            chat_orgs=parse_chat_orgs(os.environ.get("TRACKINIZER_CHAT_ORGS", "")),
         )
 
     @classmethod
@@ -179,7 +201,8 @@ class Config:
           flags: Parsed arguments with engine, datadir, ephemeral, etc. fields.
 
         Returns:
-          result: Config with settings from flags; OAuth secrets from environment only.
+          result: Config with settings from flags; the session secret from the
+            environment only.
 
         """
         return cls(
@@ -193,17 +216,14 @@ class Config:
             session_embedder_dim=flags.session_embedder_dim,
             session_embedders=_parse_session_embedders(flags.session_embedders),
             web=flags.web,
-            # OAuth secrets come from the environment only, never CLI flags.
-            oauth_google_client_id=os.environ.get("TRACKINIZER_GOOGLE_CLIENT_ID")
-            or None,
-            oauth_google_client_secret=os.environ.get(
-                "TRACKINIZER_GOOGLE_CLIENT_SECRET",
-            )
-            or None,
-            oauth_redirect_uri=os.environ.get("TRACKINIZER_OAUTH_REDIRECT_URI") or None,
-            session_secret=os.environ.get("TRACKINIZER_SESSION_SECRET") or None,
+            # Secrets come from the environment only, never CLI flags.
+            session_secret=os.environ.get("TRACKINIZER_SESSION_SECRET", ""),
+            secrets=secrets_from_env(),
             session_max_age_seconds=flags.session_max_age_seconds,
-            auth_disabled=flags.no_auth,
+            auth_disabled=not flags.auth,
+            assistant=parse_assistant(flags.assistant),
+            # Like the secrets, a deployment property that no flag overrides.
+            chat_orgs=parse_chat_orgs(os.environ.get("TRACKINIZER_CHAT_ORGS", "")),
         )
 
     def maintained_embedders(self) -> tuple[str, ...]:
@@ -252,6 +272,65 @@ def session_max_age_from_env() -> int:
             f"TRACKINIZER_SESSION_MAX_AGE_SECONDS must be >= 1, got {seconds}",
         )
     return seconds
+
+
+def secrets_from_env() -> str:
+    """Read ``TRACKINIZER_SECRETS``; unset keeps the :class:`Config` default."""
+    return os.environ.get("TRACKINIZER_SECRETS", Config().secrets)
+
+
+def auth_disabled_from_env() -> bool:
+    """Whether ``TRACKINIZER_NO_AUTH=1`` asks for single-user local mode."""
+    return os.environ.get("TRACKINIZER_NO_AUTH") == "1"
+
+
+def parse_assistant(value: str) -> Assistant | None:
+    """Parse ``--assistant`` / ``$TRACKINIZER_ASSISTANT``, ``ACTOR=EMAIL``.
+
+    Args:
+      value: The flag or variable; blank means no assistant.
+
+    Returns:
+      assistant: The assistant, or None when blank.
+
+    Raises:
+      ConfigError: The value is not ``ACTOR=EMAIL``.
+
+    """
+    if not value.strip():
+        return None
+    actor, _, email = value.partition("=")
+    if not actor.strip() or not email.strip():
+        raise ConfigError(f"--assistant must be ACTOR=EMAIL, got {value!r}")
+    # users.email is stored lowercase, so only a lowercase one can match it.
+    return Assistant(actor=actor.strip(), email=email.strip().lower())
+
+
+def parse_chat_orgs(value: str) -> ChatOrgs:
+    """Parse ``$TRACKINIZER_CHAT_ORGS``: ``single`` or ``domain``; blank is ``domain``.
+
+    Blank is the safe value: a server that never set the variable must not let a
+    person from another organisation type into a chat that is not theirs.
+
+    Args:
+      value: The variable.
+
+    Returns:
+      orgs: How science chats group their users.
+
+    Raises:
+      ConfigError: The value is neither.
+
+    """
+    match value.strip():
+        case "" | "domain":
+            return "domain"
+        case "single":
+            return "single"
+        case other:
+            raise ConfigError(
+                f"TRACKINIZER_CHAT_ORGS must be single or domain, got {other!r}",
+            )
 
 
 def parse_engine(value: str) -> Literal["pglite", "pg"]:

@@ -8,6 +8,7 @@ what the ciphertext table exists to isolate.
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Final, get_args
 from uuid import uuid4
 
@@ -39,6 +40,7 @@ from trackinizer.lib.agent.types.sessions import (
     WebSearchResult,
     WebSearchResults,
 )
+from trackinizer.lib.codec import from_plain, immutable, mutable
 from trackinizer.types.session_records import (
     _BY_KIND,
     MAX_SEARCH_TEXT_BYTES,
@@ -221,6 +223,23 @@ def test_row_round_trips_through_payload() -> None:
     assert row.record() == record
 
 
+def test_a_rows_json_fields_decode_frozen_as_readers_build_them() -> None:
+    """Readers freeze each ``JSON`` field, so a stored record must decode frozen too."""
+    record = ToolCall(
+        call_id="c1",
+        name="Read",
+        arguments=immutable({"paths": ["a", "b"]}),
+        extra=immutable({"seen": [1]}),
+    )
+    row = SessionRecordRow.of(session_id=uuid4(), part=0, idx=0, record=record)
+
+    decoded = row.record()
+
+    assert decoded == record
+    assert isinstance(decoded, ToolCall)
+    assert isinstance(decoded.arguments, MappingProxyType)
+
+
 def test_row_carries_the_records_context_and_timestamp() -> None:
     """``context_id`` and ``timestamp`` are columns, read off the record."""
     record = UserMessage(content="hi", context_id=2, timestamp="2026-09-02T00:00:00Z")
@@ -298,6 +317,24 @@ def _union_members(alias: object) -> list[type]:
             continue
         stack.extend(get_args(value))
     return out
+
+
+def test_templates_decode_from_both_frozen_and_mutable_payloads() -> None:
+    record = SystemMessage(
+        content="instructions",
+        extra=immutable(
+            {"$templates": [{"role": "developer", "content": ["instructions"]}]},
+        ),
+    )
+    row = SessionRecordRow.of(session_id=uuid4(), part=0, idx=0, record=record)
+    for decoded in (
+        from_plain(row.payload, SystemMessage),
+        from_plain(mutable(row.payload), SystemMessage),
+        row.record(),
+    ):
+        assert isinstance(decoded, SystemMessage)
+        assert decoded.content == record.content
+        assert mutable(decoded.extra) == mutable(record.extra)
 
 
 if __name__ == "__main__":

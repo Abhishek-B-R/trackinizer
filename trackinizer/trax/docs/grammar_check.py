@@ -121,6 +121,18 @@ CORPUS: tuple[Case, ...] = (
     Case(label="verb cost + ref", tokens="cost issue 7 --deep"),
     Case(label="verb profile bare", tokens="profile"),
     Case(label="verb profile field set", tokens="profile work url to https://x"),
+    Case(label="verb env bare", tokens="env"),
+    Case(label="verb env set", tokens="env REGION to eu-west"),
+    Case(label="verb env secret from stdin", tokens="env secret API_TOKEN to -"),
+    Case(label="verb env delete", tokens="env REGION del"),
+    Case(label="verb machine bare", tokens="machine"),
+    Case(label="verb machine show", tokens="machine gpu-box"),
+    Case(label="verb machine field", tokens="machine gpu-box role"),
+    Case(label="verb machine set", tokens="machine gpu-box role to dev"),
+    Case(label="verb machine how from file", tokens="machine gpu-box how to @how.txt"),
+    Case(label="verb machine label add", tokens="machine gpu-box label add gpu"),
+    Case(label="verb machine label del", tokens="machine gpu-box label del gpu"),
+    Case(label="verb machine delete", tokens="machine gpu-box del"),
     # == row commands: a leading KIND, then the row grammar ===================
     # -- bare kind + list queries (no mutation) -----------------------------
     Case(label="bare kind (list all)", tokens="issue"),
@@ -277,20 +289,6 @@ CORPUS: tuple[Case, ...] = (
         tokens="experiment 42 metric at key is loss at step is 3 to 0.5",
     ),
     Case(
-        label="metric many-keys-one-step write",
-        tokens=(
-            "experiment 42 metric at step is 3 at key is loss to 0.5 "
-            "at key is acc to 0.9"
-        ),
-    ),
-    Case(
-        label="metric many-steps-one-key write",
-        tokens=(
-            "experiment 42 metric at key is loss at step is 3 to 0.5 "
-            "at step is 5 to 0.6"
-        ),
-    ),
-    Case(
         label="metric bulk write (step gt)",
         tokens="experiment 42 metric at key is loss at step gt 3 to 0.5",
     ),
@@ -332,12 +330,7 @@ CORPUS: tuple[Case, ...] = (
     # greedily to the create-then-log reading (metric-grammar.md "Create + log").
     Case(
         label="metric create + log (class a)",
-        tokens="experiment title to trm-exp031 metric at step is 3 at loss to 0.5 at acc to 0.9",
-        ambiguous=True,
-    ),
-    Case(
-        label="metric create + one-cell log (class a)",
-        tokens="experiment title to x metric at step is 3 at loss to 0.5",
+        tokens="experiment title to trm-exp031 metric at step is 3 at loss to 0.5",
         ambiguous=True,
     ),
     # == syntactic rejections (the concrete grammar refuses these) ============

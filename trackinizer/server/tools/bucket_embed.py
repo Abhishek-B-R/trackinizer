@@ -38,6 +38,8 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 import asyncio
 
+from trackinizer.lib.codec import from_plain
+
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -217,8 +219,11 @@ def _embed_one_bucket(
     pooled = _last_token_pool(output.last_hidden_state)
     truncated = pooled[: len(texts), :dim]
     normalized = functional.normalize(truncated, p=2, dim=1)
-    listed = cast(object, normalized.to(torch.float32).cpu().tolist())
-    return cast("list[list[float]]", listed)
+    # Needed: without this cast, the export (OSS copy) fails its type check.
+    return from_plain(
+        cast(object, normalized.to(torch.float32).cpu().tolist()),
+        list[list[float]],
+    )
 
 
 # Left-padded per the Qwen recipe: the last real token is at position -1 for
@@ -231,11 +236,13 @@ def _last_token_pool(last_hidden_states: torch.Tensor) -> torch.Tensor:
 
 def _dynamo_config() -> _DynamoConfig:
     """Return torch._dynamo.config (indirected so a test can inject a fake)."""
-    import torch._dynamo  # noqa: PLC0415 -- deferred so importing this module pulls no torch.
+    from torch import (  # noqa: PLC0415 -- deferred so importing this module pulls no torch.
+        _dynamo,
+    )
 
     # ``torch._dynamo.config`` is torch's own recompile-limit config surface; it
     # has no public alias, so the private access is the only path.
-    return cast("_DynamoConfig", torch._dynamo.config)  # noqa: SLF001 -- torch's own config; no public alias exists.
+    return cast("_DynamoConfig", _dynamo.config)
 
 
 class _DynamoConfig(Protocol):

@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 import pytest
 
+from trackinizer.lib.codec import immutable
 from trackinizer.wire.wire_sessions import (
     FeedCursor,
     FeedEvent,
@@ -18,7 +19,9 @@ from trackinizer.wire.wire_sessions import (
     SendMessage,
     SessionEnd,
     SessionStart,
+    inbound_read_timeout,
     session_end_path,
+    session_inbound_path,
     session_records_path,
 )
 
@@ -45,7 +48,10 @@ class TestSessionStart:
         # ``min_length=1`` alone admits "   "; a whitespace CLI is a client
         # bug (no CLI is named "   "). Mirror the rooms blank-rejection rule.
         for bad in ("   ", "\t", "\n"):
-            with pytest.raises(ValidationError):
+            with pytest.raises(
+                ValidationError,
+                match=r"Value error, value must be non-empty \[type=value_error",
+            ):
                 SessionStart(cli=bad)
 
     def test_rejects_whitespace_only_cli_session_id(self) -> None:
@@ -121,6 +127,33 @@ class TestFeedEvent:
         )
         assert event.part == -1
 
+    def test_a_frozen_message_serializes_as_plain_json(self) -> None:
+        """The store builds ``message`` with ``json_freeze``; the feed must dump it."""
+        event = FeedEvent(
+            session_id=uuid.uuid4(),
+            actor="scientist",
+            seq=0,
+            kind="UserMessage",
+            created=_NOW,
+            message=immutable({"attachments": [{"mime": "image/png"}]}),
+        )
+        assert event.model_dump(mode="json")["message"] == {
+            "attachments": [{"mime": "image/png"}],
+        }
+
+    def test_a_non_json_message_is_a_validation_error(self) -> None:
+        with pytest.raises(ValidationError):
+            FeedEvent.model_validate(
+                {
+                    "session_id": uuid.uuid4(),
+                    "actor": "scientist",
+                    "seq": 0,
+                    "kind": "UserMessage",
+                    "created": _NOW,
+                    "message": {"when": object()},
+                },
+            )
+
 
 class TestFeedCursor:
     def test_the_cursor_carries_every_order_key_component(self) -> None:
@@ -173,6 +206,11 @@ class TestRoomValidation:
         assert InboundDrainItem(text="hi", room="lab").room == "lab"
         assert InboundDrainItem(text="hi").room is None
 
+    def test_drain_item_carries_the_senders_role_or_none(self) -> None:
+        assert InboundDrainItem(text="hi").source_role is None
+        item = InboundDrainItem(text="hi", source="a@x", source_role="writer")
+        assert InboundDrainItem.model_validate_json(item.model_dump_json()) == item
+
     def test_session_start_rejects_comma_in_room(self) -> None:
         # A room name carrying ',' is ambiguous once serialized: ``trax run``
         # exports rooms comma-joined into ``TRAX_ROOMS`` (session.py), so a
@@ -201,7 +239,23 @@ class TestPaths:
         sid = uuid.uuid4()
         assert str(sid) in session_records_path(sid)
         assert session_records_path(sid).endswith("/records")
-        assert session_end_path(sid).endswith("/end")
+        assert session_end_path(sid) == f"/api/sessions/{sid}/end"
+        assert session_inbound_path(sid) == f"/api/sessions/{sid}/inbound"
+
+
+class TestInboundReadTimeout:
+    @pytest.mark.parametrize("wait_sec", [0.5, 5.0, 30.0, 120.0])
+    def test_a_drain_that_waits_gets_a_read_timeout_beyond_the_hold(
+        self,
+        wait_sec: float,
+    ) -> None:
+        timeout = inbound_read_timeout(wait_sec)
+
+        assert timeout is not None
+        assert timeout > wait_sec
+
+    def test_a_drain_that_does_not_wait_keeps_the_transport_timeout(self) -> None:
+        assert inbound_read_timeout(0.0) is None
 
 
 if __name__ == "__main__":

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager, suppress
+from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Final, cast
 from urllib.parse import quote
 from uuid import UUID, uuid4
@@ -14,48 +16,66 @@ import os
 import time
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from starlette.types import Send
 
 import asyncpg
 
-from trackinizer.lib.custom_json import IntCodec, SchemaError
+from trackinizer.addons.addon import ServerContext
+from trackinizer.addons.deployment import Deployment, supervise
+from trackinizer.lib.codec import from_plain
 from trackinizer.server.api import (
+    addons_routes,
     admin_routes,
     auth_routes,
     edge,
     edit,
     export_routes,
+    locks,
+    logout_routes,
+    machine_host_routes,
+    machines_routes,
     meta_routes,
     metrics_routes,
-    oauth_routes,
     preset_routes,
     query,
     reports_routes,
+    science_chat_routes,
     session_ir_routes,
     sessions_routes,
     submit,
     timeline_routes,
+    variables_routes,
     visuals_routes,
     workspace_routes,
 )
+from trackinizer.server.api.addons_routes import deployment_of
 from trackinizer.server.api.idempotency import ChangeIdMiddleware
 from trackinizer.server.auth import seed_no_auth_user
 from trackinizer.server.authority_sweep import authority_sweep_loop
 from trackinizer.server.config import (
     Config,
+    ConfigError,
     build_embedder,
     build_engine,
 )
 from trackinizer.server.embedders import registry
 from trackinizer.server.inbound import InboundQueue
+from trackinizer.server.secrets import parse_secrets
+from trackinizer.server.session_reaper import session_reaper_loop
 from trackinizer.server.store.core import Store
 from trackinizer.server.subscriber import push_changes_to_live_subscribers
+from trackinizer.server.visuals.catalog import default_workspace
 from trackinizer.types.errors import (
     ConflictError,
     NotFoundError,
     ValidationError,
 )
+from trackinizer.wire.wire_machine_host import JOIN_PATH
+from trackinizer.wire.wire_variables import VARIABLES_PATH
 
 
 if TYPE_CHECKING:
@@ -63,6 +83,7 @@ if TYPE_CHECKING:
 
     from starlette.types import ASGIApp, Message, Receive, Scope
 
+    from trackinizer.server.secrets import SecretSchemes
     from trackinizer.types.embedder import QueryEmbedder
 
 
@@ -70,6 +91,7 @@ _logger = logging.getLogger(__name__)
 
 
 __all__ = [
+    "ROUTERS",
     "RequestLoggingMiddleware",
     "app",
     "check_violation_handler",
@@ -77,8 +99,9 @@ __all__ = [
     "fk_violation_handler",
     "lifespan",
     "not_found_handler",
-    "schema_handler",
+    "request_validation_handler",
     "unique_violation_handler",
+    "validation_handler",
 ]
 
 
@@ -135,15 +158,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             "This is for local demos only -- never expose this server to an "
             "untrusted network.",
         )
+    # Parsed before the engine opens, so a mistyped backend stops the boot early.
+    # A deployment that ships further backends sets ``state.secret_schemes``.
+    attached: object = getattr(app.state, "secret_schemes", None)
+    if attached is None:
+        app.state.secrets = parse_secrets(config.secrets)
+    elif isinstance(attached, Mapping):
+        app.state.secrets = parse_secrets(
+            config.secrets,
+            schemes=cast("SecretSchemes", attached),
+        )
+    else:
+        raise ConfigError("state.secret_schemes must map a scheme name to a factory")
     async with build_engine(config) as engine:
         app.state.engine = engine
         app.state.store = Store(engine, embed=build_embedder(config.embedder))
         # Process-local routing buffer for inbound (world -> session) messages;
         # separate from event capture. The sessions routes read it off state.
         app.state.inbound = InboundQueue()
-        # Keep the resolved config on app.state so OAuth routes and the
-        # session-cookie path in current_user can read the signing secret
-        # and Google client credentials. main() mounts the SPA separately.
+        # Keep the resolved config on app.state so the session-cookie path in
+        # current_user, and any sign-in routes, can read the signing secret.
+        # main() mounts the SPA separately.
         app.state.config = config
         await app.state.store.bootstrap()
         if config.auth_disabled:
@@ -157,28 +192,55 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         # when its weights are absent -- never downloaded in-band -- and warmed
         # in the background when present, so the first query pays inference
         # only.
-        warm_task = _resolve_session_embedder(app, config)
-        # Subscriber push: copies committed change rows into subscribers'
-        # live-session inbound queues (doorbell-driven; see subscriber_push).
-        push_task = asyncio.create_task(
-            push_changes_to_live_subscribers(app.state.store, app.state.inbound),
-        )
-        # Authority sweep: recomputes the derived load-bearing (PageRank)
-        # columns off the request path, coalescing edge-change bursts.
-        authority_task = asyncio.create_task(authority_sweep_loop(app.state.store))
+        tasks: list[asyncio.Task[None]] = []
         try:
+            warm_task = _resolve_session_embedder(app, config)
+            if warm_task is not None:
+                tasks.append(warm_task)
+            # Subscriber push: copies committed change rows into subscribers'
+            # live-session inbound queues (doorbell-driven; see subscriber_push).
+            tasks.append(
+                asyncio.create_task(
+                    push_changes_to_live_subscribers(
+                        app.state.store,
+                        app.state.inbound,
+                    ),
+                ),
+            )
+            # Authority sweep: recomputes the derived load-bearing (PageRank)
+            # columns off the request path, coalescing edge-change bursts.
+            tasks.append(asyncio.create_task(authority_sweep_loop(app.state.store)))
+            # Session reaper: closes sessions whose run went silent (killed, host
+            # crashed), so a dead agent stops showing as live.
+            tasks.append(
+                asyncio.create_task(
+                    session_reaper_loop(app.state.store, inbound=app.state.inbound),
+                ),
+            )
+            tasks.extend(
+                _start_addon_services(
+                    deployment_of(app),
+                    context=ServerContext(
+                        store=app.state.store,
+                        inbound=app.state.inbound,
+                    ),
+                ),
+            )
             yield
         finally:
-            push_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await push_task
-            authority_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await authority_task
-            if warm_task is not None:
-                warm_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await warm_task
+            for task in tasks:
+                task.cancel()
+            for task, outcome in zip(
+                tasks,
+                await asyncio.gather(*tasks, return_exceptions=True),
+                strict=True,
+            ):
+                if isinstance(outcome, Exception):
+                    _logger.error(
+                        "background task %s failed",
+                        task.get_name(),
+                        exc_info=outcome,
+                    )
         # Bracket the engine teardown so an operator (and the shutdown-latency
         # investigation) can see where time goes: a gap BEFORE this line is
         # uvicorn draining in-flight connections; a gap until "engine closed"
@@ -200,8 +262,20 @@ def _resolve_session_embedder(
 ) -> asyncio.Task[None] | None:
     """Cache the session embedder on ``app.state``; degrade or warm as needed."""
     name = config.session_embedder
-    embedder = registry.build_session_embedder(name)
+    embedder = registry.build_cached_session_embedder(
+        name,
+        dim=config.session_embedder_dim,
+    )
     if embedder is None:
+        if name:
+            _logger.error(
+                "session embedder %r configured but its weights are NOT in the HF "
+                "cache; semantic session search is DISABLED (full-text only). "
+                "Run `python -m trackinizer.server.prep_models` on this host "
+                "to download them, then restart. A request will NEVER download "
+                "them in-band.",
+                name,
+            )
         app.state.session_embedder = None
         return None
     if registry.is_weightless(name):
@@ -209,21 +283,8 @@ def _resolve_session_embedder(
         # background warm.
         app.state.session_embedder = embedder
         return None
-    if registry.weights_present(name):
-        # A real model with cached weights is ready. Warm the lazy load off the
-        # request path so the first query pays inference only, not the load.
-        app.state.session_embedder = embedder
-        return asyncio.create_task(_warm_session_embedder(embedder))
-    _logger.error(
-        "session embedder %r configured but its weights are NOT in the HF "
-        "cache; semantic session search is DISABLED (full-text only). "
-        "Run `python -m trackinizer.server.prep_models` on this host "
-        "to download them, then restart. A request will NEVER download "
-        "them in-band.",
-        name,
-    )
-    app.state.session_embedder = None
-    return None
+    app.state.session_embedder = embedder
+    return asyncio.create_task(_warm_session_embedder(embedder))
 
 
 async def _warm_session_embedder(embedder: QueryEmbedder) -> None:
@@ -231,25 +292,47 @@ async def _warm_session_embedder(embedder: QueryEmbedder) -> None:
     _ = await embedder.embed_query("warm")
 
 
+# Each addon service is supervised on its own: a crash is logged and the service
+# restarted with backoff, so a failing addon never takes the API down with it.
+def _start_addon_services(
+    deployment: Deployment,
+    context: ServerContext,
+) -> list[asyncio.Task[None]]:
+    """Start every server service of ``deployment``; return their tasks."""
+    return [
+        asyncio.create_task(
+            supervise(f"{name}.{service.name}", run=partial(service.run, context)),
+        )
+        for name, manifest in deployment.manifests.items()
+        for service in manifest.server_services
+    ]
+
+
 # Every route module's router, in inclusion order. ``_build_app`` includes them, and
 # the web app's schema dump builds its own app from the same tuple rather than
 # copying the module-level ``app``, which tests reconfigure.
 ROUTERS: Final = (
+    addons_routes.router,
     admin_routes.router,
     auth_routes.router,
     edge.router,
     edit.router,
     export_routes.router,
+    locks.router,
+    logout_routes.router,
+    machine_host_routes.router,
+    machines_routes.router,
     meta_routes.router,
     metrics_routes.router,
-    oauth_routes.router,
     preset_routes.router,
     query.router,
     reports_routes.router,
+    science_chat_routes.router,
     session_ir_routes.router,
     sessions_routes.router,
     submit.router,
     timeline_routes.router,
+    variables_routes.router,
     visuals_routes.router,
     workspace_routes.router,
 )
@@ -262,6 +345,10 @@ def _build_app() -> FastAPI:
     built.add_middleware(RequestLoggingMiddleware)
     for router in ROUTERS:
         built.include_router(router)
+    # The visual routes read the catalog from ``app.state.visual_catalog``, so it
+    # is set on every app; ``attach_deployment`` swaps in a configured one.
+    built.state.deployment = Deployment.Config().make()
+    built.state.visual_catalog = default_workspace()
     return built
 
 
@@ -307,7 +394,9 @@ class _RequestLogSpan:
 
     async def send(self, message: Message) -> None:
         if message["type"] == "http.response.start":
-            self.status_code = IntCodec.coerce(cast(object, message["status"]))
+            # ASGI's typed message union exposes status as Any here.
+            status = cast(object, message["status"])
+            self.status_code = from_plain(status, int)
             self.response_start_sec = time.perf_counter() - self.started
             headers = list(cast(list[tuple[bytes, bytes]], message.get("headers", [])))
             headers = [
@@ -407,27 +496,47 @@ async def validation_handler(request: Request, exc: ValidationError) -> JSONResp
     )
 
 
-@app.exception_handler(SchemaError)
-async def schema_handler(request: Request, exc: SchemaError) -> JSONResponse:
-    """Translate a codec ``SchemaError`` into HTTP 422.
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """Answer 422 for a body or parameter that fails its model.
 
-    A stray key in a client-supplied record ``payload`` reaches the codec
-    through ``RecordBody``'s decode on the append-records path. It is a
-    malformed request, not a server fault, but the codec raises a
-    ``ValueError`` -- which matched no handler and so surfaced as a 500.
+    FastAPI's default answer echoes the rejected input in each error. Under
+    ``/api/variables`` that input can be a secret's value, and on the machine join
+    route it is an enrollment token, so the answer there names only each error's
+    type, location and message. An unexpected body key is also the rejected input,
+    so its location names the field as ``extra``. The route is the matched one, not
+    the URL, which a path prefix changes.
 
     Args:
-      request: FastAPI Request object (unused).
-      exc: SchemaError from codec validation.
+      request: FastAPI Request object.
+      exc: The validation failure, with the rejected input in each error.
 
     Returns:
-      response: JSON response with 422 status, detail, and code='schema'.
+      response: JSON response with 422 status and the errors.
 
     """
-    del request
+    route = request.scope.get("route")
+    if not (
+        isinstance(route, APIRoute)
+        and (route.path.startswith(VARIABLES_PATH) or route.path == JOIN_PATH)
+    ):
+        return await request_validation_exception_handler(request, exc)
+    errors = from_plain(exc.errors(), list[dict[str, object]])
     return JSONResponse(
         status_code=422,
-        content={"detail": str(exc), "code": "schema"},
+        content={
+            "detail": [
+                {
+                    "type": error["type"],
+                    "loc": _redacted_location(error),
+                    "msg": error["msg"],
+                }
+                for error in errors
+            ],
+        },
     )
 
 
@@ -534,3 +643,11 @@ async def unique_violation_handler(
         status_code=409,
         content={"detail": "unique constraint violated"},
     )
+
+
+def _redacted_location(error: dict[str, object]) -> list[str | int]:
+    """Return an error's location, without the client's key for an extra field."""
+    location = from_plain(error["loc"], list[str | int])
+    if error["type"] == "extra_forbidden":
+        return [*location[:-1], "extra"]
+    return location
