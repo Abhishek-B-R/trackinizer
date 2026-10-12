@@ -397,7 +397,8 @@ async def test_the_header_says_which_subgraph_this_is(store: Store) -> None:
     # Absent, not empty: a whole-graph export is byte-identical to the ones
     # written before selectors existed.
     assert "selector" not in from_plain(
-        loads(next(iter(export_lines(whole)))), dict[str, object]
+        loads(next(iter(export_lines(whole)))),
+        dict[str, object],
     )
 
 
