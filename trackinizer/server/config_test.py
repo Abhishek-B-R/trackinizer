@@ -21,7 +21,9 @@ from trackinizer.server.config import (
     build_engine,
     parse_assistant,
     parse_chat_orgs,
+    parse_chat_streaming,
     parse_engine,
+    parse_staff,
 )
 from trackinizer.server.embedders.stub import StubEmbedder
 
@@ -238,6 +240,7 @@ class TestFromEnv:
         "TRACKINIZER_SESSION_MAX_AGE_SECONDS",
         "TRACKINIZER_NO_AUTH",
         "TRACKINIZER_ASSISTANT",
+        "TRACKINIZER_CHAT_STREAMING",
     )
 
     def test_unset_environment_is_the_default_config(
@@ -268,6 +271,7 @@ class TestFromEnv:
             "TRACKINIZER_SESSION_MAX_AGE_SECONDS": "99",
             "TRACKINIZER_NO_AUTH": "1",
             "TRACKINIZER_ASSISTANT": "kb=K@x.y",
+            "TRACKINIZER_CHAT_STREAMING": "off",
         }
         for name, value in values.items():
             monkeypatch.setenv(name, value)
@@ -287,6 +291,7 @@ class TestFromEnv:
             session_max_age_seconds=99,
             auth_disabled=True,
             assistant=Assistant(actor="kb", email="k@x.y"),
+            chat_streaming=False,
         )
 
 
@@ -333,26 +338,28 @@ class TestParsers:
 
 
 class TestChatOrgs:
-    """``$TRACKINIZER_CHAT_ORGS`` says whether science chats group users by domain."""
+    """``$TRACKINIZER_CHAT_ORGS`` says who else continues a science chat."""
 
-    def test_a_server_groups_by_domain_unless_it_says_it_is_one_organisation(
+    def test_a_server_is_individual_unless_it_says_otherwise(
         self,
     ) -> None:
-        assert parse_chat_orgs("") == "domain"
+        assert parse_chat_orgs("") == "individual"
         assert parse_chat_orgs(" single ") == "single"
         assert parse_chat_orgs("domain") == "domain"
-        assert Config().chat_orgs == "domain"
+        assert parse_chat_orgs("individual ") == "individual"
+        assert Config().chat_orgs == "individual"
 
-    def test_a_server_without_the_variable_set_reads_domain(
+    def test_a_server_without_the_variable_set_reads_individual(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """The mode that reads least: a forgotten setting shares nothing."""
         monkeypatch.delenv("TRACKINIZER_CHAT_ORGS", raising=False)
-        assert Config.from_env().chat_orgs == "domain"
-        assert Config.from_args(_server_args(assistant="")).chat_orgs == "domain"
+        assert Config.from_env().chat_orgs == "individual"
+        assert Config.from_args(_server_args(assistant="")).chat_orgs == "individual"
 
     def test_anything_else_is_a_config_error(self) -> None:
-        with pytest.raises(ConfigError, match="single or domain"):
+        with pytest.raises(ConfigError, match="single, domain or individual"):
             parse_chat_orgs("company")
 
     def test_both_ways_to_build_a_config_read_the_environment(
@@ -362,6 +369,35 @@ class TestChatOrgs:
         monkeypatch.setenv("TRACKINIZER_CHAT_ORGS", "single")
         assert Config.from_env().chat_orgs == "single"
         assert Config.from_args(_server_args(assistant="")).chat_orgs == "single"
+
+
+class TestChatStreaming:
+    """``$TRACKINIZER_CHAT_STREAMING`` holds a chat's answer in writing; on unless off."""
+
+    @pytest.mark.parametrize(("raw", "streaming"), [("", True), (" on ", True)])
+    def test_a_server_streams_unless_it_says_off(
+        self,
+        raw: str,
+        streaming: bool,
+    ) -> None:
+        assert parse_chat_streaming(raw) is streaming
+        assert parse_chat_streaming("off") is False
+        assert Config().chat_streaming is True
+
+    @pytest.mark.parametrize("raw", ["no", "1", "On", "false"])
+    def test_anything_else_is_a_config_error(self, raw: str) -> None:
+        with pytest.raises(ConfigError, match="CHAT_STREAMING must be on or off"):
+            parse_chat_streaming(raw)
+
+    def test_both_ways_to_build_a_config_read_the_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("TRACKINIZER_CHAT_STREAMING", "off")
+        assert Config.from_env().chat_streaming is False
+        assert Config.from_args(_server_args()).chat_streaming is False
+        monkeypatch.delenv("TRACKINIZER_CHAT_STREAMING")
+        assert Config.from_args(_server_args()).chat_streaming is True
 
 
 class TestAssistant:
@@ -415,6 +451,59 @@ class TestAssistant:
             Config.from_env()
 
 
+class TestStaff:
+    """``--staff PATTERNS`` names who holds the ``staff`` audience; unset names nobody."""
+
+    def test_nothing_set_means_nobody_is_staff(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("TRACKINIZER_STAFF", raising=False)
+        assert Config().staff == ()
+        assert Config.from_env().staff == ()
+        assert Config.from_args(_server_args()).staff == ()
+
+    def test_blank_means_nobody(self) -> None:
+        assert parse_staff("") == ()
+        assert parse_staff("  ,  ") == ()
+
+    def test_patterns_are_split_trimmed_and_lowercased(self) -> None:
+        assert parse_staff(" Ada@Example.com, *@Corp.EXAMPLE ") == (
+            "ada@example.com",
+            "*@corp.example",
+        )
+
+    def test_a_repeated_pattern_is_kept_once(self) -> None:
+        assert parse_staff("a@x.y,A@X.Y") == ("a@x.y",)
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["staff", "*", "@x.y", "a@", "*@", "a*@x.y", "*@*.y", "a@b@c.d", "a b@x.y"],
+    )
+    def test_a_pattern_that_is_not_an_email_or_a_domain_is_a_config_error(
+        self,
+        raw: str,
+    ) -> None:
+        with pytest.raises(ConfigError, match="--staff"):
+            parse_staff(raw)
+
+    def test_the_flag_and_the_environment_supply_the_patterns(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("TRACKINIZER_STAFF", "*@x.y")
+        assert Config.from_env().staff == ("*@x.y",)
+        assert Config.from_args(_server_args(staff="a@x.y")).staff == ("a@x.y",)
+
+    def test_a_malformed_environment_value_is_a_config_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("TRACKINIZER_STAFF", "*")
+        with pytest.raises(ConfigError, match="--staff"):
+            Config.from_env()
+
+
 class TestSecrets:
     """``secrets`` names the secret backend and comes from the environment only."""
 
@@ -465,12 +554,13 @@ def _server_args(**overrides: object) -> ConfigFlags:
         "auth": True,
         "session_max_age_seconds": 30 * 24 * 60 * 60,
         "assistant": "",
+        "staff": "",
     }
     base.update(overrides)
     return cast(ConfigFlags, argparse.Namespace(**base))
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

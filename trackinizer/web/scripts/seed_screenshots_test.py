@@ -11,7 +11,8 @@ import itertools
 import re
 import uuid
 
-from trackinizer.lib.codec import from_plain
+from treekle import from_plain
+
 from trackinizer.types.edges import EDGE_POLICIES, kind_group_members
 from trackinizer.types.inquiries import Inquiry
 from trackinizer.web.scripts.graph_structure import Link, Node, Structure
@@ -22,7 +23,8 @@ from trackinizer.wire.wire_sessions import SessionStart, SessionStartResponse
 
 
 if TYPE_CHECKING:
-    from trackinizer.lib.codec import PlainTree
+    from treekle import PlainTree
+
     from trackinizer.wire.wire_session_ir import ManifestBody
     from trackinizer.wire.wire_sessions import SessionEnd
 
@@ -368,6 +370,6 @@ def _end(edge: Mapping[str, object], end: str, ids: Sequence[uuid.UUID]) -> uuid
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

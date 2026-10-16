@@ -8,6 +8,7 @@ import pytest
 
 from trackinizer.server.visuals.catalog import (
     ContextGraphVisual,
+    FilesVisual,
     ParameterDescription,
     StaticVisual,
     TimelineVisual,
@@ -22,11 +23,24 @@ def test_default_workspace_builds_the_default_catalog() -> None:
     assert default_workspace().catalog() == default_catalog()
     assert [visual.type for visual in default_catalog().visuals] == [
         "trax.browse",
-        "trax.chat",
         "trax.subgraph",
         "trax.timeline",
         "trax.artifact",
+        "trax.summary",
+        "trax.files",
     ]
+
+
+def test_a_type_that_is_not_registered_has_no_description() -> None:
+    """A show of an unknown type is refused by the lookup, not by an exception."""
+    workspace = default_workspace()
+    assert workspace.visual("x.unknown") is None
+    summary = workspace.visual("trax.summary")
+    assert summary is not None
+    assert (summary.requires, summary.record_kinds) == (
+        ["record"],
+        ["Issue", "AgentSession"],
+    )
 
 
 def test_static_visual_is_configured_by_data() -> None:
@@ -35,14 +49,14 @@ def test_static_visual_is_configured_by_data() -> None:
         type="x.notes",
         title="Notes",
         description="Free-form notes.",
-        requires=["session"],
+        requires=["record"],
         default_size="compact",
     ).make()
     described = visual.describe()
     assert (described.type, described.title, described.requires) == (
         "x.notes",
         "Notes",
-        ["session"],
+        ["record"],
     )
     assert described.default_size == "compact"
     assert described.parameter_schema == {}
@@ -62,10 +76,11 @@ def test_record_visuals_name_the_kinds_they_accept() -> None:
     kinds = {visual.type: visual.record_kinds for visual in default_catalog().visuals}
     assert kinds == {
         "trax.browse": [],
-        "trax.chat": None,
         "trax.subgraph": None,
         "trax.timeline": None,
         "trax.artifact": ["Artifact"],
+        "trax.summary": ["Issue", "AgentSession"],
+        "trax.files": None,
     }
 
 
@@ -96,6 +111,46 @@ def test_context_graph_bounds_its_reach_and_its_highlight() -> None:
         "",
         512,
     )
+
+
+def test_files_takes_any_record_and_bounds_its_narrowing() -> None:
+    """The files view draws any record; its path and file are capped at 512."""
+    described = FilesVisual.Config().make().describe()
+    assert described.model_dump() == {
+        "type": "trax.files",
+        "version": 1,
+        "title": "Files",
+        "description": (
+            "A record's files and what changed in them, each change with its diff."
+        ),
+        "requires": ["record"],
+        "default_size": "wide",
+        "parameter_schema": {
+            "path": {
+                "type": "string",
+                "default": "",
+                "minimum": None,
+                "maximum": None,
+                "max_length": 512,
+            },
+            "changed": {
+                "type": "boolean",
+                "default": False,
+                "minimum": None,
+                "maximum": None,
+                "max_length": None,
+            },
+            "file": {
+                "type": "string",
+                "default": "",
+                "minimum": None,
+                "maximum": None,
+                "max_length": 512,
+            },
+        },
+        "record_kinds": None,
+    }
+    assert default_workspace().visual("trax.files") == described
 
 
 def test_context_graph_default_reach_past_three_hops_is_a_config_error() -> None:
@@ -152,6 +207,6 @@ def test_parameter_bounds_that_do_not_apply_to_the_type_are_rejected(
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

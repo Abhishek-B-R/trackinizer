@@ -1,34 +1,32 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
+import { createPortal } from "react-dom";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent, type MouseEvent, type PointerEvent, type ReactNode } from "react";
 import { ApiError } from "../api/client";
 import { findRef } from "../api/detail";
 import { newUuid } from "../api/idempotency";
-import {
-  createWorkspacePreset,
-  listWorkspacePresets,
-  openWorkspacePreset,
-  type FloatingRect,
-  type WorkspacePreset,
-} from "../api/presets";
 import { getVisualCatalog, type VisualDescription } from "../api/visuals";
 import {
   applyWorkspaceOperation,
-  createDefaultWorkspace,
-  getWorkspace,
   type WorkspaceOperation,
   type WorkspaceState,
 } from "../api/workspaces";
-import { acceptWorkspace as cacheWorkspace, newerWorkspace } from "../app/canvasStream";
+import { acceptWorkspace as cacheWorkspace, newerWorkspace } from "../stations/cache";
+import { useStation } from "../stations/useStation";
 import { CrashBoundary } from "../app/CrashBoundary";
+import { useWorkbenchMounted, useWorkbenchSlot } from "../app/workbenchSlot";
+import { usePreferences } from "../preferences";
 import { parseHash } from "../router/route";
+import { useHash } from "../router/trail";
 import { useBrowserState } from "../state/store";
-import type { TileMemory } from "../state/value";
-import { type PanelSpec, usePanel } from "../ui/panel";
-import { useChatFeed } from "./chatFeed";
-import { type CanvasSizes, heldWidth, MIN_COLUMN, MIN_FLOAT, readCanvasSizes, writeCanvasSizes } from "./canvasSizes";
-import { CLICK_SLOP, EDGES, finishGesture, moveGesture, rememberedTile, resizeRect, slideDivider, snapZone, startGesture, TEAR_SLOP, withoutPlaces, withTile, type Edge, type Gesture, type Rect, type Zone } from "./floatingTile";
-import { useHoverOpen } from "./hoverOpen";
-import { chatHome, orderVisuals, SIDES } from "./layout";
+import { CanvasBar } from "./CanvasBar";
+import { forget, go, settle, step, useCanvasHistory } from "./canvasHistory";
+import { type Size, dropLegacySizes, fitSizes, heldWidth, legacyLayout, MIN_COLUMN, MIN_FLOAT, readLegacySizes, toFraction } from "./canvasSizes";
+import { HOME_ROUTE, homeSnapshot, PAGE, planRestore, type Snapshot, snapshotOf } from "./canvasSnapshot";
+import { type CanvasTab, leftTab, MAX_TABS, neighbourOf, newTabName, openTabOf, sizesOf, tabSnapshot, tabsOf } from "./canvasTabs";
+import { followColumns } from "./chatColumnState";
+import { CLICK_SLOP, EDGES, finishGesture, moveGesture, rememberedTile, resizeRect, slideDivider, snapZone, startGesture, TEAR_SLOP, withTile, type Edge, type TileMemory, type Gesture, type Rect, type Zone } from "./floatingTile";
+import { orderVisuals, SIDES } from "./layout";
+import { holds, layoutOf, useLayout, type Layout } from "./stationLayout";
 import { preloadRenderers, RENDERERS, VisualPane } from "./registry";
 import { WorkspaceActionsProvider } from "./workspaceActions";
 import "./canvas.css";
@@ -42,82 +40,57 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     staleTime: Infinity,
     retry: false,
   });
-  const created = useQuery({
-    queryKey: ["workspace", "default"],
-    queryFn: ({ signal }) => createDefaultWorkspace({ signal }),
-    staleTime: Infinity,
-    retry: false,
-  });
-  const workspaceId = created.data?.id;
   // The canvas is what the shell's stream last said (its opening frame is the
-  // first state) and what this canvas's own writes returned. This query holds
-  // that cache entry and reads only when asked to, after a refused write.
-  const remote = useQuery({
-    queryKey: ["workspace", workspaceId],
-    queryFn: async ({ signal }) => {
-      const incoming = await getWorkspace(workspaceId!, { signal });
-      return newerWorkspace(queryClient.getQueryData<WorkspaceState>(["workspace", workspaceId]), incoming);
-    },
-    enabled: false,
-    staleTime: Infinity,
-    retry: false,
-  });
-  const workspace = remote.data ? newerWorkspace(created.data, remote.data) : created.data;
+  // first state) and what this canvas's own writes returned. A read happens
+  // only when asked for, after a refused write.
+  const station = useStation();
+  const workspace = station.data;
+  const workspaceId = workspace?.id;
   const latestWorkspace = useRef(workspace);
   latestWorkspace.current = workspace;
-  const legacyPreview = import.meta.env.DEV && created.error instanceof ApiError && created.error.status === 404;
+  const legacyPreview = import.meta.env.DEV && station.error instanceof ApiError && station.error.status === 404;
   const [previewSelected, setPreviewSelected] = useState<string[] | null>(null);
-  const configure = usePanel(CONFIGURE);
+  const controlsSlot = useWorkbenchSlot();
+  useWorkbenchMounted();
   const [artifactLink, setArtifactLink] = useState("");
   const [artifactLinkError, setArtifactLinkError] = useState<string | null>(null);
-  const syncedPresetWorkspace = useRef<{ readonly id: string; readonly revision: number; readonly instructions: string | null; readonly recordId: string | null } | null>(null);
-  const instructionsDirty = useRef(false);
-  const recordIdDirty = useRef(false);
-  const saveAttempt = useRef<{ readonly signature: string; readonly key: string } | null>(null);
-  const openAttempt = useRef<{ readonly presetId: string; readonly workspaceId: string; readonly revision: number; readonly key: string } | null>(null);
-  const [presetName, setPresetName] = useState("");
-  const [presetInstructions, setPresetInstructions] = useState("");
-  const [continuationRecordId, setContinuationRecordId] = useState("");
-  const [presetError, setPresetError] = useState<string | null>(null);
-  const [presetStatus, setPresetStatus] = useState<string | null>(null);
   const [expandedMobileFloat, setExpandedMobileFloat] = useState<string | null>(null);
-  // Where floating tiles stand and whether they are folded, as this session left
-  // them: a tile by its instance id, a fold by its visual type. The browser's
-  // state remembers both across loads; these hold when it cannot store.
-  const [floatingPositions, setFloatingPositions] = useState<Record<string, { readonly left: number; readonly top: number }>>({});
-  const [foldedTypes, setFoldedTypes] = useState<Record<string, boolean>>({});
+  // Browse stays under the stage: moving DOM nodes would reset iframe documents
+  // and focus even when React keeps their components mounted.
+  const browseRef = useRef<HTMLDivElement>(null);
+  const browseSlotRef = useRef<HTMLDivElement>(null);
+  // How the station's tiles and columns were left, as fractions of the stage,
+  // and the stage they are fitted to. The station keeps the layout; the stage is
+  // measured as it resizes, and nothing is written for a fit.
+  const [layout, changeLayout] = useLayout();
+  // The open canvas tab, and what it shows: the steps Back and Forward walk are
+  // its own, as a browser tab's history is. Chat's agent changes the station's
+  // canvas, which is always the open tab.
+  const home = usePreferences().home;
+  const hash = useHash();
+  const tabs = tabsOf(layout);
+  const openTab = openTabOf(layout);
+  const historyKey = workspaceId ? tabKey(workspaceId, openTab) : null;
+  const snapshot = workspace ? snapshotOf(workspace.visuals, hash) : null;
+  const history = useCanvasHistory(historyKey, snapshot);
   const [browser, updateBrowser] = useBrowserState();
+  const [stage, setStage] = useState<Size>({ width: 0, height: 0 });
   const stageRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<TileDrag | null>(null);
   // What a drag draws over the stage: where the tile would dock, and, for a
   // docked tile, a card that follows the pointer in its place.
   const snapRef = useRef<HTMLDivElement>(null);
   const ghostRef = useRef<HTMLDivElement>(null);
-  // The sizes dragged in this browser, and the drags that set them: a column's
-  // edge, a floating window's edge or corner, the divider between two docked tiles.
+  // The drags that set the layout's sizes: a column's edge, a floating window's
+  // edge or corner, the divider between two docked tiles.
   const resizeRef = useRef<ColumnResize | null>(null);
   const windowRef = useRef<WindowResize | null>(null);
   const dividerRef = useRef<DividerDrag | null>(null);
-  const [sizes, setSizes] = useState<CanvasSizes>(readCanvasSizes);
-  // Chat the user dragged out of its column stays open under the pointer that dropped it.
-  const tornOff = useRef(false);
-  // Chat's home is a panel beside the page. While the assistant shows something
-  // it stands aside: the same tile floats over the page, folded to its bar unless
-  // the pointer or the keyboard is in it. None of that is the canvas's state.
-  const { feed, state: chatFeed } = useChatFeed();
-  const chatAside = chatFeed.aside > 0;
-  const chatTile = useRef<HTMLDivElement>(null);
-  const chatOpen = useHoverOpen(chatTile);
+  const sizes = fitSizes(layout, stage);
   const [writeError, setWriteError] = useState<string | null>(null);
-  const presets = useQuery({
-    queryKey: ["workspace-presets", workspaceId],
-    queryFn: ({ signal }) => listWorkspacePresets({ signal }),
-    enabled: !configure.collapsed && !!workspaceId,
-    retry: false,
-  });
   const active = workspace?.visuals.map((visual) => visual.type)
     ?? previewSelected ?? [catalog.data?.default_visual ?? "trax.browse"];
-  const visible: WorkspaceState["visuals"] = workspace?.visuals ?? (active.length ? active : ["trax.chat"]).map((type) => ({
+  const visible: WorkspaceState["visuals"] = workspace?.visuals ?? (active.length ? active : ["trax.browse"]).map((type) => ({
     id: type,
     type,
     version: catalog.data?.visuals.find((visual) => visual.type === type)?.version ?? 1,
@@ -127,18 +100,17 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     record_id: null,
     params: {},
   }));
-  const chat = catalog.data?.visuals.find((visual) => visual.type === "trax.chat");
   const visualTypes = useMemo(() => new Set(catalog.data?.visuals.map((visual) => visual.type)), [catalog.data]);
-  const panes = orderVisuals((visible.length ? visible : [{
-    id: "chat-disconnected", type: "trax.chat", version: chat?.version ?? 1,
-    placement: "main" as const, record_id: null, params: {},
-  }]).map((visual) => visual.type === "trax.chat" ? { ...visual, placement: chatHome(visual.placement) } : visual),
-  workspace?.focused_instance ?? null);
-  /** Whether `pane` is drawn floating over the stage: placed so, or Chat standing aside. */
-  const floats = (pane: (typeof panes)[number]) => pane.placement === "floating" || (pane.type === "trax.chat" && chatAside);
-  /** Whether floating `pane` is folded to its bar: Chat by where the pointer and the keyboard are, any other as it was left. */
-  const folded = (pane: (typeof panes)[number]) => pane.type === "trax.chat"
-    ? !chatOpen.open : foldedTypes[pane.type] ?? rememberedTile(browser, pane.type).collapsed;
+  const panes = orderVisuals(visible, workspace?.focused_instance ?? null);
+  const browse = panes.find((pane) => pane.type === PAGE);
+  /** Whether `pane` is drawn floating over the stage. */
+  const floats = (pane: (typeof panes)[number]) => pane.placement === "floating";
+  // Three columns, the left, the page's and the right, take the room Chat stands in.
+  const threeColumns = SIDES.every(({ placement }) => panes.some((pane) => pane.placement === placement && !floats(pane)))
+    && panes.some((pane) => (pane.placement ?? "main") === "main");
+  useEffect(() => followColumns(threeColumns), [threeColumns]);
+  /** Whether floating `pane` is folded to its bar, as it was left. */
+  const folded = (pane: (typeof panes)[number]) => rememberedTile(layout, pane.type, stage).collapsed;
   const route = parseHash(window.location.hash, []);
   const refRoute = /^#\/ref\/([^/?]+)\/(\d+)$/.exec(window.location.hash);
   const refKind = refRoute?.[1] ?? null;
@@ -152,19 +124,70 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
   });
   // The record the page shows, from the address alone: the page is the route.
   const currentRecordId = route.name === "lookup" ? route.id : refKind ? refId.data ?? null : null;
-  const focusedVisual = workspace?.visuals.find((visual) => visual.id === workspace.focused_instance);
-  const chatRecordId = focusedVisual?.type === "trax.artifact" && focusedVisual.record_id
-    ? focusedVisual.record_id : currentRecordId;
+
+  // The stage's size, which the layout's fractions are fitted to.
+  useLayoutEffect(() => {
+    const element = stageRef.current;
+    if (!element) return;
+    const measure = () => {
+      setStage((previous) => previous.width === element.clientWidth && previous.height === element.clientHeight
+        ? previous : { width: element.clientWidth, height: element.clientHeight });
+      projectBrowse(element, browseRef.current, browseSlotRef.current);
+    };
+    measure();
+    addEventListener("resize", measure);
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(measure);
+    observer?.observe(element);
+    if (browseSlotRef.current) {
+      observer?.observe(browseSlotRef.current);
+      observer?.observe(browseSlotRef.current.parentElement!);
+    }
+    addEventListener("scroll", measure, true);
+    return () => {
+      removeEventListener("resize", measure);
+      observer?.disconnect();
+      removeEventListener("scroll", measure, true);
+    };
+  }, [browse?.placement, panes.length]);
+
+  useLayoutEffect(() => {
+    if (stageRef.current) projectBrowse(stageRef.current, browseRef.current, browseSlotRef.current);
+  });
+
+  // A browser that kept column widths, window sizes and places before the station
+  // did: the first station it shows takes them, as fractions of its stage, unless
+  // it already holds a layout of its own, and the browser forgets them either way.
+  useEffect(() => {
+    if (!workspaceId || stage.width === 0 || stage.height === 0) return;
+    const forget = () => {
+      dropLegacySizes("canvas");
+      if (Object.keys(browser.ui.tiles).length) {
+        try {
+          updateBrowser((state) => ({ ...state, ui: { ...state.ui, tiles: {} } }));
+        } catch {
+          // Storage is off, full or holds a value this build cannot read.
+        }
+      }
+    };
+    if (!holds(layoutOf(workspace?.layout), "columns", "floating", "tiles", "share")) {
+      const patch = legacyLayout(readLegacySizes(), browser.ui.tiles, stage);
+      if (Object.keys(patch).length) {
+        changeLayout(patch, { now: true, onSaved: forget });
+        return;
+      }
+    }
+    forget();
+  }, [workspaceId, stage.width > 0 && stage.height > 0]);
 
   // What decides a floating tile's size and place; the tiles are held inside the
   // stage again when it changes, or when the stage itself does. Each is held from
-  // the place it is meant to stand at, never from where an earlier hold left it, so
-  // a tile a narrow stage pushed in returns when the stage grows back.
-  const intendedPlaces: Record<string, { readonly left: number; readonly top: number } | null> = {};
+  // the place the layout means it to stand at, never from where an earlier hold
+  // left it, so a tile a narrow stage pushed in returns when the stage grows back.
+  const latestLayout = useRef<{ layout: Layout; rects: Record<string, { readonly left: number; readonly top: number } | null> }>({ layout, rects: {} });
+  latestLayout.current = { layout, rects: {} };
   const floatingLayout = panes.filter(floats).map((pane) => {
-    const place = floatingPositions[pane.id] ?? rememberedTile(browser, pane.type).place ?? pane.floating_rect ?? null;
-    intendedPlaces[pane.id] = place && { left: place.left, top: place.top };
-    return [pane.id, intendedPlaces[pane.id], folded(pane)];
+    latestLayout.current.rects[pane.id] = pane.floating_rect ?? null;
+    return [pane.id, layout.tiles?.[pane.type]?.place ?? null, pane.floating_rect ?? null, folded(pane)];
   });
   const floatingLayoutKey = JSON.stringify(floatingLayout);
   useLayoutEffect(() => {
@@ -176,7 +199,9 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
       // On a phone the tile is a header in the flow, where a left or top only shifts it.
       if (window.innerWidth <= NARROW_VIEWPORT) return;
       for (const tile of stage.querySelectorAll<HTMLElement>(".visual-tile-floating")) {
-        const place = intendedPlaces[tile.dataset.visualInstance ?? ""];
+        const { layout: now, rects } = latestLayout.current;
+        const place = rememberedTile(now, tile.dataset.visualType ?? "", { width: stage.clientWidth, height: stage.clientHeight }).place
+          ?? rects[tile.dataset.visualInstance ?? ""];
         if (!place) continue;
         tile.style.left = `${Math.min(Math.max(0, stage.clientWidth - tile.offsetWidth), Math.max(0, place.left))}px`;
         tile.style.top = `${Math.min(Math.max(0, stage.clientHeight - tile.offsetHeight), Math.max(0, place.top))}px`;
@@ -190,40 +215,11 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
       removeEventListener("resize", hold);
       observer?.disconnect();
     };
-  }, [floatingLayoutKey]);
-
-  // Each time the assistant shows something, Chat folds out of its way at once,
-  // from under the pointer and the keyboard too.
-  useEffect(() => {
-    if (chatFeed.aside === 0) return;
-    if (tornOff.current) chatOpen.enter();
-    else chatOpen.set(false);
-    tornOff.current = false;
-    setExpandedMobileFloat(null);
-  }, [chatFeed.aside]);
-
-  useEffect(() => {
-    if (!workspace) return;
-    const previous = syncedPresetWorkspace.current;
-    if (previous?.id === workspace.id && previous.revision === workspace.revision
-      && previous.instructions === (workspace.agent_instructions ?? null)
-      && previous.recordId === (workspace.continuation_record_id ?? null)) return;
-    if (previous?.id !== workspace.id) {
-      instructionsDirty.current = false;
-      recordIdDirty.current = false;
-    }
-    if (!instructionsDirty.current) setPresetInstructions(workspace.agent_instructions ?? "");
-    if (!recordIdDirty.current) setContinuationRecordId(workspace.continuation_record_id ?? "");
-    syncedPresetWorkspace.current = {
-      id: workspace.id, revision: workspace.revision,
-      instructions: workspace.agent_instructions ?? null,
-      recordId: workspace.continuation_record_id ?? null,
-    };
-  }, [workspace]);
+  }, [floatingLayoutKey, stage.width, stage.height]);
 
   function acceptWorkspace(state: WorkspaceState) {
-    latestWorkspace.current = newerWorkspace(latestWorkspace.current, state);
     cacheWorkspace(queryClient, state);
+    if (latestWorkspace.current?.id === state.id) latestWorkspace.current = newerWorkspace(latestWorkspace.current, state);
   }
 
   useEffect(() => {
@@ -232,98 +228,48 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     return () => clearTimeout(timer);
   }, [workspaceId]);
 
+  // The page, once closed, comes back with the user's own navigation: a link, an app
+  // route, a changed hash. The server shows it again for an agent's.
+  const pageClosed = workspace !== undefined && !workspace.visuals.some((visual) => visual.type === PAGE);
+  const reopening = useRef(false);
+  useEffect(() => {
+    if (!pageClosed) return;
+    const reopen = () => {
+      if (reopening.current || latestWorkspace.current?.visuals.some((visual) => visual.type === PAGE)) return;
+      reopening.current = true;
+      void write({ kind: "show", visual_type: PAGE, placement: "main" }).finally(() => { reopening.current = false; });
+    };
+    addEventListener("hashchange", reopen);
+    addEventListener("popstate", reopen);
+    return () => {
+      removeEventListener("hashchange", reopen);
+      removeEventListener("popstate", reopen);
+    };
+  }, [pageClosed]);
+
   const change = useMutation({
+    // A station change resets the observer, preserving queued mutations' scopes.
+    mutationKey: ["workspace", workspaceId, "operation"],
     scope: { id: `workspace:${workspaceId ?? "default"}` },
-    mutationFn: async (operation: WorkspaceOperation) => {
-      const current = latestWorkspace.current;
-      if (!current) throw new Error("The workspace is not ready.");
-      return applyWorkspaceOperation(current.id, current.revision, operation, newUuid());
+    mutationFn: async ({ id, operation }: { readonly id: string; readonly operation: WorkspaceOperation }) => {
+      const current = queryClient.getQueryData<WorkspaceState>(["workspace", id]);
+      if (!current || current.id !== id) throw new Error("The workspace is not ready.");
+      return applyWorkspaceOperation(id, current.revision, operation, newUuid());
     },
     onMutate: () => setWriteError(null),
     onSuccess: acceptWorkspace,
-    onError: () => {
-      setWriteError("Could not update the canvas. Its revision may have changed; try again.");
-      void remote.refetch();
-    },
-  });
-
-  const savePreset = useMutation({
-    mutationFn: async () => {
-      const current = latestWorkspace.current;
-      if (!current) throw new Error("The workspace is not ready.");
-      const payload = {
-        name: presetName.trim(),
-        agentInstructions: presetInstructions.trim() || null,
-        continuationRecordId: continuationRecordId.trim() || currentRecordId || null,
-        floatingRects: readFloatingRects(current, stageRef.current),
-      };
-      const signature = JSON.stringify([current.id, current.revision, payload]);
-      const key = saveAttempt.current?.signature === signature ? saveAttempt.current.key : newUuid();
-      saveAttempt.current = { signature, key };
-      return createWorkspacePreset(current.id, current.revision, payload, key);
-    },
-    onMutate: () => {
-      setPresetError(null);
-      setPresetStatus(null);
-    },
-    onSuccess: async (preset) => {
-      saveAttempt.current = null;
-      instructionsDirty.current = false;
-      recordIdDirty.current = false;
-      setPresetName("");
-      setPresetStatus(`Saved “${preset.name}”.`);
-      await queryClient.invalidateQueries({ queryKey: ["workspace-presets", workspaceId] });
-    },
-    onError: (error) => {
-      if (error instanceof ApiError && error.status === 409) saveAttempt.current = null;
-      setPresetError(`Could not save this canvas. ${errorText(error)}`);
-    },
-  });
-
-  const openPreset = useMutation({
-    scope: { id: `workspace:${workspaceId ?? "default"}` },
-    mutationFn: async (preset: WorkspacePreset) => {
-      const current = latestWorkspace.current;
-      if (!current) throw new Error("The workspace is not ready.");
-      const previous = openAttempt.current;
-      const attempt = previous?.presetId === preset.id && previous.workspaceId === current.id
-        ? previous
-        : { presetId: preset.id, workspaceId: current.id, revision: current.revision, key: newUuid() };
-      openAttempt.current = attempt;
-      return { state: await openWorkspacePreset(preset.id, attempt.workspaceId, attempt.revision, attempt.key), preset };
-    },
-    onMutate: () => {
-      setPresetError(null);
-      setPresetStatus(null);
-    },
-    onSuccess: ({ state, preset }) => {
-      openAttempt.current = null;
-      instructionsDirty.current = false;
-      recordIdDirty.current = false;
-      acceptWorkspace(state);
-      setPresetInstructions(state.agent_instructions ?? "");
-      setContinuationRecordId(state.continuation_record_id ?? "");
-      setFloatingPositions({});
-      keepSizes((previous) => ({ ...previous, floating: {} }));
-      // A saved view's places and sizes show over the ones dragged before it.
-      try {
-        updateBrowser(withoutPlaces);
-      } catch {
-        // Storage is off, full or holds a value this build cannot read; the session already forgot them.
-      }
-      setPresetStatus(`Opened “${preset.name}”.`);
-    },
-    onError: (error) => {
-      if (error instanceof ApiError && error.status === 409) openAttempt.current = null;
-      setPresetError(`Could not open this saved view. ${errorText(error)}`);
-      void remote.refetch();
+    onError: (_error, { id }) => {
+      if (latestWorkspace.current?.id !== id) return;
+      setWriteError("Could not update the workbench. Its revision may have changed; try again.");
+      void station.refetch();
     },
   });
 
   async function write(operation: WorkspaceOperation): Promise<boolean> {
-    if (!latestWorkspace.current) return false;
+    const id = latestWorkspace.current?.id;
+    if (!id) return false;
     try {
-      await change.mutateAsync(operation);
+      await change.mutateAsync({ id, operation });
       return true;
     } catch {
       return false;
@@ -331,18 +277,60 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
   }
 
   /**
-   * Show Chat docked beside the page, about the record the page shows if any.
-   *
-   * A Chat already about that record, or about none on a page without one, is
-   * only focused; one about another record moves to this page's. A new Chat
-   * takes the side, where the server places it.
+   * Show `target` on the canvas, a step tab `key` has already taken: its
+   * visuals by the canvas's own operations, one after another, then its page.
+   * The tab then stands where the canvas got to, there or short of it.
    */
-  function showChat() {
-    feed.dock();
-    const existing = workspace?.visuals.find((visual) => visual.type === "trax.chat");
-    operate(existing && (existing.record_id ?? null) === chatRecordId
-      ? { kind: "focus", instance_id: existing.id }
-      : { kind: "show", visual_type: "trax.chat", record_id: chatRecordId });
+  async function restore(key: string, target: Snapshot): Promise<void> {
+    for (const operation of planRestore(latestWorkspace.current?.visuals ?? [], target)) {
+      if (!(await write(operation))) break;
+    }
+    if (target.page !== null && window.location.hash !== target.page) window.location.hash = target.page;
+    settle(key, target, snapshotOf(latestWorkspace.current?.visuals ?? [], window.location.hash));
+  }
+
+  function stepBy(by: -1 | 1) {
+    const target = historyKey ? step(historyKey, by) : null;
+    if (historyKey && target) void restore(historyKey, target);
+  }
+
+  function goHome() {
+    if (!historyKey) return;
+    const target = homeSnapshot(home);
+    go(historyKey, target);
+    void restore(historyKey, target);
+  }
+
+  /** The tabs with the open one as it is left now: what it shows, under a sheet the graph, and its sizes. */
+  function leaving(): CanvasTab[] {
+    const visuals = latestWorkspace.current?.visuals ?? [];
+    const now = snapshotOf(visuals, window.location.hash) ?? snapshotOf(visuals, HOME_ROUTE)!;
+    return tabs.map((tab) => (tab.id === openTab ? leftTab(tab, now, layout) : tab));
+  }
+
+  /** Open tab `id` of `kept`, the tabs the station keeps from now: its sizes at once, then what it shows. */
+  function switchTab(id: string, kept: CanvasTab[]) {
+    const tab = kept.find((each) => each.id === id);
+    if (!workspaceId || !tab) return;
+    changeLayout({ ...sizesOf(tab), tabs: kept, tab: id }, { now: true });
+    const key = tabKey(workspaceId, id);
+    const target = tabSnapshot(tab);
+    go(key, target);
+    void restore(key, target);
+  }
+
+  function addTab() {
+    const target = homeSnapshot(home);
+    const tab: CanvasTab = { id: newUuid(), name: newTabName(tabs), page: target.page, visuals: target.visuals.map((visual) => ({ ...visual, params: { ...visual.params } })) };
+    switchTab(tab.id, [...leaving(), tab]);
+  }
+
+  function closeTab(id: string) {
+    if (!workspaceId || tabs.length < 2) return;
+    const kept = tabs.filter((tab) => tab.id !== id);
+    if (id === openTab) switchTab(neighbourOf(tabs, id)!.id, kept);
+    else changeLayout({ tabs: kept });
+    forget(tabKey(workspaceId, id));
   }
 
   function openArtifact(event: FormEvent<HTMLFormElement>) {
@@ -362,13 +350,10 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     void write({ kind: "show", visual_type: "trax.artifact", placement: "main", record_id: parsed.id });
   }
 
-  /** Remember how the floating tile of visual type `type` was left; a browser that cannot store keeps it for the session only. */
+  /** Remember how the floating tile of visual type `type` was left, in the station's layout. */
   function rememberTile(type: string, change: Partial<TileMemory>) {
-    try {
-      updateBrowser((state) => withTile(state, type, change));
-    } catch {
-      // Storage is off, full or holds a value this build cannot read.
-    }
+    const measured = { width: stageRef.current?.clientWidth ?? 0, height: stageRef.current?.clientHeight ?? 0 };
+    changeLayout((now) => withTile(now, type, change, measured) ?? {});
   }
 
   /** Where `tile` is drawn in the stage, which the stage's hold may have moved from the place last saved. */
@@ -378,34 +363,18 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     return { left: tileRect.left - stageRect.left, top: tileRect.top - stageRect.top };
   }
 
-  function placeFloatingPane(paneId: string, type: string, place: { readonly left: number; readonly top: number }) {
-    setFloatingPositions((previous) => ({ ...previous, [paneId]: place }));
-    rememberTile(type, { place });
-  }
-
   /**
    * Stand `pane` in the column at one side of the page, or in the main strip
-   * beside it, at once: a floating tile docks there, a docked one moves, and
-   * Chat standing aside comes back.
+   * beside it, at once: a floating tile docks there, a docked one moves.
    */
   function dockTile(pane: Pane, zone: Zone) {
-    if (pane.type === "trax.chat") feed.dock();
     if (pane.placement !== zone) operate({ kind: "place", instance_id: pane.id, placement: zone });
   }
 
-  /**
-   * Float docked `pane` over the stage at `place`. Chat floats by standing
-   * aside, which is this tab's state and folds when the pointer leaves it; any
-   * other visual by its placement.
-   */
+  /** Float docked `pane` over the stage at `place`. */
   function floatTile(pane: Pane, place: { readonly left: number; readonly top: number }) {
-    placeFloatingPane(pane.id, pane.type, place);
-    if (pane.type === "trax.chat") {
-      tornOff.current = true;
-      feed.stepAside();
-    } else {
-      operate({ kind: "place", instance_id: pane.id, placement: "floating" });
-    }
+    rememberTile(pane.type, { place });
+    operate({ kind: "place", instance_id: pane.id, placement: "floating" });
   }
 
   function focusTile(pane: Pane) {
@@ -413,9 +382,6 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
   }
 
   function foldFloatingPane(type: string, collapsed: boolean) {
-    // Chat folds on its own; how it was last left is not remembered.
-    if (type === "trax.chat") return chatOpen.set(!collapsed);
-    setFoldedTypes((previous) => ({ ...previous, [type]: collapsed }));
     rememberTile(type, { collapsed });
   }
 
@@ -425,9 +391,8 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     if (!stage || !tile) return;
     const maxLeft = Math.max(0, stage.clientWidth - tile.offsetWidth);
     const maxTop = Math.max(0, stage.clientHeight - tile.offsetHeight);
-    placeFloatingPane(paneId, type, {
-      left: Math.min(maxLeft, Math.max(0, left)),
-      top: Math.min(maxTop, Math.max(0, top)),
+    rememberTile(type, {
+      place: { left: Math.min(maxLeft, Math.max(0, left)), top: Math.min(maxTop, Math.max(0, top)) },
     });
   }
 
@@ -468,8 +433,7 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
   /**
    * Each move only transforms the tile, or the card that stands for a docked
    * one, and marks where it would dock: rendering the canvas per move redrew
-   * every visual in it, Chat's whole conversation included (6 ms a move with
-   * 120 lines, against 3.3 ms so). The canvas takes the outcome once, on release.
+   * every visual in it. The canvas takes the outcome once, on release.
    */
   function updateTileDrag(event: PointerEvent<HTMLElement>) {
     const drag = dragRef.current;
@@ -518,7 +482,7 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     } else if (drag.floating) {
       // Placed before the transform goes, so no frame shows the tile back where it started.
       Object.assign(drag.tile.style, { left: `${outcome.place.left}px`, top: `${outcome.place.top}px`, right: "auto", transform: "" });
-      placeFloatingPane(drag.pane.id, drag.pane.type, outcome.place);
+      rememberTile(drag.pane.type, { place: outcome.place });
     } else {
       // Under the pointer as the card was; the stage's hold keeps the tile inside it.
       floatTile(drag.pane, {
@@ -542,17 +506,10 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     return stageRef.current?.querySelector<HTMLElement>(side === "left" ? ".visual-side-column-left" : ".visual-side-column:not(.visual-side-column-left)") ?? null;
   }
 
-  /** Keep a size the user dragged, for this page and in this browser. */
-  function keepSizes(change: (previous: CanvasSizes) => CanvasSizes) {
-    setSizes((previous) => {
-      const next = change(previous);
-      writeCanvasSizes(next);
-      return next;
-    });
-  }
-
+  /** Keep a column's width as a fraction of the stage, in the station's layout. */
   function keepColumnWidth(side: Side, width: number) {
-    keepSizes((previous) => ({ ...previous, [side]: width }));
+    const fraction = toFraction(width, stageRef.current?.clientWidth ?? 0);
+    if (fraction !== null) changeLayout((now) => ({ columns: { ...now.columns, [side]: fraction } }));
   }
 
   /** A press on an edge or a corner of a floating window: the sides it names follow the pointer, inside the stage. */
@@ -584,8 +541,11 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     if (resize?.pointerId !== event.pointerId) return;
     windowRef.current = null;
     const { left, top, width, height } = resize.rect;
-    placeFloatingPane(resize.pane.id, resize.pane.type, { left, top });
-    keepSizes((previous) => ({ ...previous, floating: { ...previous.floating, [resize.pane.type]: { width, height } } }));
+    rememberTile(resize.pane.type, { place: { left, top } });
+    const stageWidth = stageRef.current?.clientWidth ?? 0;
+    const stageHeight = stageRef.current?.clientHeight ?? 0;
+    const [wide, high] = [toFraction(width, stageWidth), toFraction(height, stageHeight)];
+    if (wide !== null && high !== null) changeLayout((now) => ({ floating: { ...now.floating, [resize.pane.type]: { width: wide, height: high } } }));
   }
 
   /**
@@ -638,7 +598,7 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     const room = drag.now.map((size, index) => size - drag.ruled[index]!);
     const even = room.reduce((sum, size) => sum + size, 0) / room.length || 1;
     const shares = Object.fromEntries(drag.tiles.map((tile, index) => [tile.dataset.visualType ?? "", Math.round((room[index]! / even) * 10_000) / 10_000]));
-    keepSizes((previous) => ({ ...previous, share: { ...previous.share, ...shares } }));
+    changeLayout((now) => ({ share: { ...now.share, ...shares } }));
   }
 
   /** A press on the edge between a column and the page: the column takes the width the pointer drags that edge to. */
@@ -695,15 +655,6 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
     void write(operation);
   }
 
-  function saveCurrentCanvas(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (presetName.trim()) savePreset.mutate();
-  }
-
-  function openSavedPreset(preset: WorkspacePreset) {
-    openPreset.mutate(preset);
-  }
-
   function toggle(type: string) {
     if (workspace) {
       const existing = workspace.visuals.find((visual) => visual.type === type);
@@ -716,6 +667,7 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
         ? { kind: "hide", instance_id: existing.id }
         : {
           kind: "show", visual_type: type,
+          ...(type === PAGE ? { placement: "main" as const } : {}),
           ...(descriptor?.requires.includes("record") && currentRecordId ? { record_id: currentRecordId } : {}),
         };
       void operate(operation);
@@ -726,32 +678,25 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
 
   const renderTile = (pane: (typeof panes)[number], index: number) => {
     const floating = floats(pane);
-    const isChat = pane.type === "trax.chat";
     const isPage = pane.type === "trax.browse";
-    const aside = floating && isChat;
     const title = catalog.data?.visuals.find((visual) => visual.type === pane.type)?.title ?? pane.type;
     const collapsed = floating && folded(pane);
-    const at = floatingPositions[pane.id] ?? rememberedTile(browser, pane.type).place ?? pane.floating_rect ?? null;
+    const at = rememberedTile(layout, pane.type, stage).place ?? pane.floating_rect ?? null;
     const size = sizes.floating[pane.type] ?? pane.floating_rect;
     const share = sizes.share[pane.type];
     return (
-    // Browse is keyed by its type, which a canvas has once: its id is the
-    // type until the server's canvas arrives, then a UUID, and a new key
-    // would remount the view inside it, which reads its data again.
-    // Chat keeps its place among its home's tiles while it stands aside, so going
-    // aside and docking never mount it again: its draft and its scroll stay.
-    <div className={`visual-tile visual-tile-${floating ? "floating" : pane.placement ?? "main"}${aside ? " visual-tile-aside" : ""}${pane.type === "trax.browse" ? " visual-tile-browse" : ""}${workspace?.focused_instance === pane.id ? " visual-tile-focused" : ""}${expandedMobileFloat === pane.id ? " visual-tile-mobile-expanded" : ""}${collapsed ? " visual-tile-collapsed" : ""}`}
+    <div className={`visual-tile visual-tile-${floating ? "floating" : pane.placement ?? "main"}${pane.type === "trax.browse" ? " visual-tile-browse" : ""}${workspace?.focused_instance === pane.id ? " visual-tile-focused" : ""}${expandedMobileFloat === pane.id ? " visual-tile-mobile-expanded" : ""}${collapsed ? " visual-tile-collapsed" : ""}`}
       key={pane.type === "trax.browse" ? pane.type : pane.id}
+      ref={isPage ? browseRef : undefined}
       data-visual-instance={pane.id}
       data-visual-type={pane.type}
-      ref={isChat ? chatTile : undefined}
-      {...(aside ? chatOpen.handlers : {})}
       style={floating ? {
         top: `${at?.top ?? 54 + index * 24}px`,
         ...(at ? { left: `${at.left}px`, right: "auto" } : {}),
         ...(size ? { width: `${size.width}px`, height: `${size.height}px` } : {}),
-        // Chat aside lies over every other floating tile, whichever strip it is drawn in.
-        zIndex: 10 + (aside ? panes.length : index),
+        zIndex: 10 + index,
+      } : isPage ? {
+        position: "fixed", left: 0, top: 0, right: "auto", width: "100%", height: "100%", clipPath: "inset(0px)",
       } : share ? { "--tile-share": share, "--tile-basis": "0px" } as CSSProperties : undefined}>
       {/* A floating window resizes by any edge or corner, as a desktop's does; folded to its bar it has no size to give. */}
       {floating && !collapsed && EDGES.map((edge) => <div key={edge} className={`visual-window-edge visual-window-edge-${edge}`} aria-hidden="true"
@@ -764,7 +709,7 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
           onPointerDown: (event: PointerEvent<HTMLElement>) => startTileDrag(event, pane, floating),
           onPointerMove: updateTileDrag, onPointerUp: stopTileDrag, onPointerCancel: cancelTileDrag,
           onLostPointerCapture: cancelTileDrag,
-        } : { onClick: () => focusTile(pane) })}>
+        } : { onClick: (event: MouseEvent<HTMLElement>) => { if (!(event.target instanceof Element && event.target.closest("button"))) focusTile(pane); } })}>
         {floating && <button className="visual-tile-drag-handle" type="button"
           aria-label={`Move ${title}`}
           title="Drag to move; use arrow keys to move"
@@ -783,16 +728,15 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
           onClick={() => setExpandedMobileFloat(expandedMobileFloat === pane.id ? null : pane.id)}>
           {expandedMobileFloat === pane.id ? "Collapse" : "Expand"}
         </button>}
-        {!isPage && <button type="button" title="Dismiss visual" disabled={change.isPending}
-          onClick={() => operate({ kind: "hide", instance_id: pane.id })}>×</button>}
+        <button type="button" title="Dismiss visual" disabled={change.isPending}
+          onClick={() => operate({ kind: "hide", instance_id: pane.id })}>×</button>
       </div>}
       <VisualPane instance={pane} workspace={workspace ?? null} onWorkspaceChanged={acceptWorkspace}
         focused={workspace?.focused_instance === pane.id}>
-        {/* A crash in the page is the app's crash screen, here, and clears when the page moves. */}
-        {pane.type === "trax.browse"
-          ? <CrashBoundary reload={() => window.location.reload()} resetKey={window.location.hash}
+        {isPage && <div className="visual-browse-content">
+          <CrashBoundary reload={() => window.location.reload()} resetKey={window.location.hash}
             frame={(crash) => <div className="view">{crash}</div>}>{children}</CrashBoundary>
-          : null}
+        </div>}
       </VisualPane>
     </div>
     );
@@ -800,14 +744,17 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
 
   /**
    * The tiles standing at `placement`, with a divider between each two that
-   * share its flow: across the main strip (`x`) or down a column (`y`). Chat
-   * standing aside keeps its place among them and takes none of the flow.
+   * share its flow: across the main strip (`x`) or down a column (`y`). A
+   * floating tile keeps its place among them and takes none of the flow.
    */
   const strip = (placement: "main" | Side, axis: "x" | "y") => {
     let flowing = 0;
     return panes.flatMap((pane, index) => {
       if ((pane.placement ?? "main") !== placement) return [];
-      const tile = renderTile(pane, index);
+      const share = sizes.share[pane.type];
+      const tile = pane.type === PAGE ? <div key="browse-slot" ref={browseSlotRef} className="visual-tile visual-browse-slot"
+        data-visual-type={PAGE}
+        style={share ? { "--tile-share": share, "--tile-basis": "0px" } as CSSProperties : undefined} /> : renderTile(pane, index);
       if (floats(pane)) return [tile];
       flowing += 1;
       return flowing === 1 ? [tile] : [
@@ -851,25 +798,21 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
       visualTypes,
     } : null}>
     <div className="visual-canvas">
-      <div className="visual-toolbar">
-        <span className="visual-toolbar-label">Canvas</span>
-        <div className="visual-toolbar-actions" role="toolbar" aria-label="Canvas controls">
-          <button className="btn ghost" type="button" disabled={!workspace || change.isPending} onClick={showChat}
-            title={chatRecordId ? "Chat about this record" : "Chat"}>Chat</button>
-          <button className="btn ghost" type="button" aria-expanded={!configure.collapsed} aria-controls="visual-configure"
-            onClick={configure.toggle}>Configure</button>
-        </div>
-      </div>
+      {workspace && <CanvasBar tabs={tabs} open={openTab} back={history.back} forward={history.forward}
+        moving={history.moving} home={home} canAdd={tabs.length < MAX_TABS}
+        actions={{
+          back: () => stepBy(-1), forward: () => stepBy(1), home: goHome, open: (id) => switchTab(id, leaving()),
+          add: addTab, close: closeTab, rename: (id, name) => changeLayout({ tabs: tabs.map((tab) => (tab.id === id ? { ...tab, name } : tab)) }),
+        }} />}
       {writeError && <p className="visual-write-error" role="alert">{writeError}</p>}
-      {!configure.collapsed && (
-        <aside className="visual-configure" id="visual-configure" aria-label="Configure visuals">
-          <div className="visual-configure-head"><h2>Visuals</h2><button className="btn ghost" type="button" onClick={() => configure.setCollapsed(true)}>Done</button></div>
+      {controlsSlot && createPortal(
+        <div className="workbench-controls" role="group" aria-label="Workbench visuals">
           {catalog.isPending && <p className="muted">Loading available visuals…</p>}
           {catalog.isError && <p role="alert">Could not load visuals. <button className="btn" type="button" onClick={() => void catalog.refetch()}>Retry</button></p>}
-          {created.isError && !legacyPreview && <p role="alert">Could not open your canvas. <button className="btn" type="button" onClick={() => void created.refetch()}>Retry</button></p>}
+          {station.isError && !legacyPreview && <p role="alert">Could not open your workbench. <button className="btn" type="button" onClick={() => void station.refetch()}>Retry</button></p>}
           {catalog.data?.visuals.map((visual) => (
             <VisualOption key={visual.type} visual={visual} checked={active.includes(visual.type)}
-              disabled={(!workspace && !legacyPreview) || change.isPending || visual.type === "trax.browse"
+              disabled={(!workspace && !legacyPreview) || change.isPending
                 || (!active.includes(visual.type) && visual.requires.includes("record") && !currentRecordId)}
               missingRecord={visual.requires.includes("record") && !currentRecordId}
               onToggle={() => toggle(visual.type)} />
@@ -884,41 +827,11 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
               </button>
               {artifactLinkError && <p role="alert">{artifactLinkError}</p>}
             </form>}
-          <section className="visual-presets" aria-label="Saved views">
-            <h3>Saved views</h3>
-            <form onSubmit={saveCurrentCanvas}>
-              <label>View name<input aria-label="Saved view name" maxLength={120} required value={presetName}
-                onChange={(event) => setPresetName(event.target.value)} /></label>
-              <label>Agent instructions <span>(optional)</span><textarea aria-label="Agent instructions"
-                maxLength={8192} rows={3} value={presetInstructions}
-                onChange={(event) => { instructionsDirty.current = true; setPresetInstructions(event.target.value); }} /></label>
-              <label>Continuation record ID <span>(optional)</span><input aria-label="Continuation record ID"
-                value={continuationRecordId} placeholder={currentRecordId ?? "Record UUID"}
-                onChange={(event) => { recordIdDirty.current = true; setContinuationRecordId(event.target.value); }} /></label>
-              <button className="btn" type="submit" disabled={!workspace || !presetName.trim() || savePreset.isPending}>
-                {savePreset.isPending ? "Saving…" : "Save canvas"}
-              </button>
-            </form>
-            {presets.isPending && <p className="muted">Loading saved views…</p>}
-            {presets.isError && <p role="alert">Could not load saved views. <button className="btn" type="button"
-              onClick={() => void presets.refetch()}>Retry</button></p>}
-            {presets.data && presets.data.length === 0 && <p className="muted">No saved views yet.</p>}
-            {presets.data && presets.data.length > 0 && <ul>
-              {presets.data.map((preset) => <li key={preset.id}>
-                <button className="btn ghost" type="button" disabled={!workspace || openPreset.isPending}
-                  aria-label={`Open ${preset.name}`} onClick={() => openSavedPreset(preset)}>
-                  Open {preset.name}
-                </button>
-                {preset.continuation_record_id && <small>Continue from {preset.continuation_record_id}</small>}
-              </li>)}
-            </ul>}
-            {presetError && <p role="alert">{presetError}</p>}
-            {presetStatus && <p className="visual-preset-status" role="status">{presetStatus}</p>}
-          </section>
-        </aside>
+        </div>,
+        controlsSlot,
       )}
       <div ref={stageRef} className={`visual-stage${panes.length > 1 ? " visual-stage-split" : ""}`}>
-        {/* The page and the other main visuals share a strip that scrolls inside itself when they outgrow it; the visuals docked at a side stand in one column there, so Chat's header never leaves the screen; floating ones lie over all three, as Chat does from inside its strip while it stands aside. */}
+        {/* The page and the other main visuals share a strip that scrolls inside itself when they outgrow it; the visuals docked at a side stand in one column there; floating ones lie over all three. */}
         {sideColumn("left")}
         {panes.some((pane) => (pane.placement ?? "main") === "main") && (
           <div className="visual-main-strip">
@@ -926,13 +839,34 @@ export function Canvas({ children }: { readonly children: ReactNode }) {
           </div>
         )}
         {sideColumn("side")}
-        {panes.map((pane, index) => pane.placement === "floating" ? renderTile(pane, index) : null)}
+        {workspace && panes.length === 0 && <p className="visual-empty">
+          Nothing on this canvas. Go to a page, or open a visual from Workbench in the sidebar.
+        </p>}
+        {panes.map((pane, index) => pane.placement === "floating" && pane.type !== PAGE ? renderTile(pane, index) : null)}
+        {browse && renderTile(browse, panes.indexOf(browse))}
         <div ref={snapRef} className="visual-snap" aria-hidden="true" />
         <div ref={ghostRef} className="visual-drag-ghost" aria-hidden="true" />
       </div>
     </div>
     </WorkspaceActionsProvider>
   );
+}
+
+/** Fit the fixed Browse tile to its docked flow slot without moving its DOM. */
+function projectBrowse(stage: HTMLElement, tile: HTMLElement | null, slot: HTMLElement | null): void {
+  if (!tile || !slot || tile.classList.contains("visual-tile-floating")) return;
+  const origin = stage.getBoundingClientRect();
+  const rect = slot.getBoundingClientRect();
+  const clip = slot.parentElement!.getBoundingClientRect();
+  const left = rect.left + slot.clientLeft;
+  const top = rect.top + slot.clientTop;
+  const width = slot.clientWidth;
+  const height = slot.clientHeight;
+  Object.assign(tile.style, {
+    left: `${left}px`, top: `${top}px`,
+    width: `${width}px`, height: `${height}px`,
+    clipPath: `inset(${Math.max(0, Math.max(clip.top, origin.top) - top)}px ${Math.max(0, left + width - Math.min(clip.right, origin.right))}px ${Math.max(0, top + height - Math.min(clip.bottom, origin.bottom))}px ${Math.max(0, Math.max(clip.left, origin.left) - left)}px)`,
+  });
 }
 
 function VisualOption({ visual, checked, disabled, missingRecord, onToggle }: {
@@ -953,30 +887,6 @@ function VisualOption({ visual, checked, disabled, missingRecord, onToggle }: {
       </span>
     </label>
   );
-}
-
-function readFloatingRects(
-  state: WorkspaceState,
-  stage: HTMLDivElement | null,
-): Readonly<Record<string, FloatingRect>> {
-  if (!stage) return {};
-  const stageRect = stage.getBoundingClientRect();
-  return Object.fromEntries(state.visuals.flatMap((visual) => {
-    // Chat floats only while it stands aside, which no saved view holds.
-    if (visual.placement !== "floating" || visual.type === "trax.chat") return [];
-    const tile = stage.querySelector<HTMLElement>(`[data-visual-instance="${visual.id}"]`);
-    if (!tile) return visual.floating_rect ? [[visual.id, visual.floating_rect]] : [];
-    const rect = tile.getBoundingClientRect();
-    const left = Math.max(0, Math.round(rect.left - stageRect.left));
-    const top = Math.max(0, Math.round(rect.top - stageRect.top));
-    const width = Math.min(2_000, Math.max(240, Math.round(rect.width)));
-    const height = Math.min(2_000, Math.max(180, Math.round(rect.height)));
-    return [[visual.id, { left, top, width, height } satisfies FloatingRect]];
-  }));
-}
-
-function errorText(error: unknown): string {
-  return error instanceof ApiError ? error.detail : error instanceof Error ? error.message : "Please try again.";
 }
 
 /** A visual as the canvas draws it: what the drag and dock functions are handed. */
@@ -1044,6 +954,11 @@ type DividerDrag = {
   now: readonly number[];
 };
 
+/** Where tab `tab` of station `station` keeps its Back and Forward steps. */
+function tabKey(station: string, tab: string): string {
+  return `${station}/${tab}`;
+}
+
 /** Where on the card that stands for a docked tile the pointer holds it, and so where the floating tile lands under it. */
 const GHOST_GRIP = { x: 60, y: 16 };
 
@@ -1052,9 +967,3 @@ const DEFAULT_COLUMN = 360;
 
 /** The canvas stacks its tiles in one column at this width and below (see canvas.css), floating ones included. */
 const NARROW_VIEWPORT = 900;
-
-/**
- * The Configure visuals panel: opened on demand by the toolbar's Configure,
- * which stays to open it again, and kept open or not for the tab.
- */
-const CONFIGURE: PanelSpec = { id: "visuals.configure", name: "visual settings", side: "right", startsCollapsed: true };

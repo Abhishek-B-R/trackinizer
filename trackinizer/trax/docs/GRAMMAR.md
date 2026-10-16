@@ -458,7 +458,7 @@ kinds resolve first, so a field can never shadow a command.
 - `trax env [secret] [NAME (action)]` -- the org's environment variables;
   see section 8a.
 - `trax machine [NAME (action)]` -- the registry of machines campaigns may
-  run on; see section 8b.
+  run on, and hosting one; see section 8b.
 - `trax id <uuid> [--format table|json] [--changes]` -- show one row by its
   global id, with no leading kind (the UUID is unique, so the kind is
   redundant). Unlike `trax <kind> <uuid>` it applies no kind typo-guard.
@@ -489,12 +489,14 @@ kinds resolve first, so a field can never shadow a command.
 - `trax send @actor[:room] TEXT...` -- inject a message into a live agent
   session addressed by its routing name (its `run --as` owner).
 - `trax run claude|gemini|codex|sh [--out FILE] [--verbose] [--dry-run]
-  [--no-sync] [--as NAME] [--room ROOM]... [--detach] [--name NAME]` --
-  wrap an agent CLI, tail its session log, and sync turn events. `--as NAME`
-  is the session's owner / routing handle (others address it `@NAME`),
-  uniquified on collision. `--detach` runs it in a background host that
-  outlives the terminal, named by `--name` (else the `--as` name, else the
-  CLI).
+  [--no-sync] [--as NAME] [--room ROOM]... [--private] [--detach]
+  [--name NAME]` -- wrap an agent CLI, tail its session log, and sync turn
+  events. `--as NAME` is the session's owner / routing handle (others address
+  it `@NAME`), uniquified on collision. `--private` starts the session hidden,
+  or hides the one a resume re-attaches: only its owner, staff and admins read
+  it; a server that will not hide it stops the run before the CLI starts.
+  `--detach` runs it in a background host that outlives the terminal, named
+  by `--name` (else the `--as` name, else the CLI).
 - `trax run ls | attach NAME | log NAME [-f] | send NAME TEXT... | stop NAME`
   -- reach a detached host: list hosts, drive one from this terminal
   (Ctrl-\ detaches), print its scrollback, type a message in, or stop it.
@@ -558,7 +560,7 @@ request (E011). `secret` is a keyword only in front of `NAME to VALUE`;
 ```
 machine_command ::= "machine" machine_tail?
 machine_tail    ::= machine_name machine_action?
-machine_action  ::= "del"
+machine_action  ::= "del" | "connect"
                  |  machine_field ( "to" value )?
                  |  "label" ( "add" | "del" ) label
 machine_field   ::= "role" | "how"
@@ -574,10 +576,17 @@ touching it.
 
 Bare `trax machine` **lists the machines**, one line each: name, role,
 labels, and `how` cut to one line (`-` stands for an empty field).
-`machine NAME` shows one machine in full, and a bare `machine_field`
+`machine NAME` shows one machine in full, with its status; a bare `machine_field`
 (`machine NAME role`) prints that field's value as stored, for scripts.
-Listing and showing need the writer role; every other form needs the admin
-role.
+Listing and showing need the writer role; `connect` uses the machine's own
+credential; every other form needs the admin role.
+
+`machine NAME connect` runs on the machine's host with the machine's own
+credential, never the profile's key, so traxd never runs it. It joins once,
+reading the one-use enrollment token from stdin (never the command line), saves
+the machine credential for this user only, then heartbeats every 15 seconds
+until the machine is revoked, and exits 0. Lost contact never stops it; it
+retries, sooner at first.
 
 `machine NAME role to ROLE` sets one field and creates the machine when it
 is new; a field left out keeps its value, and `to ''` clears one. A `value`
@@ -589,8 +598,8 @@ most 2,000 characters, and a label is any non-blank text. `label add` and
 `label del` change one label and are no-ops when it is already so.
 
 A name outside `machine_name`, or one of `enroll join init import check
-connect leave top`, is refused before any request (E012, E013). Examples in
-section 10.
+connect leave top`, is refused before any request (E012, E013).
+Examples in section 10.
 
 ## 9. Token tables
 
@@ -611,7 +620,7 @@ the same commit.
 ### Editable scalar fields (`EDITABLE_FIELDS`)
 
 `owner`, `account`, `title`, `description`, `status`, `validation`,
-`priority`, `judgement`, `confidence`, `outcome`, `config`, `source`,
+`priority`, `judgement`, `confidence`, `outcome`, `config`, `app`, `source`,
 `google_scholar_cluster_id`, `google_scholar_cites_id`,
 `abstract`, `publication_type`, `venue`, `subvenue`, `publish_date`, `query`,
 `provider`, `sha`, `url`,
@@ -784,8 +793,16 @@ trax issue 7 status to complete
 trax experiment 12 config to '{"lr": 0.1, "epochs": 2}'
 ```
 
-`config` accepts one standard JSON object. It is readable and editable, but it
-is not a filter field: structural JSON filter semantics are not defined.
+```trax
+trax issue 7 app to '{"myapp": {"budget_usd": 20}}'
+```
+
+`config` and `app` each accept one standard JSON object. Each is readable and
+editable, but neither is a filter field: structural JSON filter semantics are
+not defined. `config` is an Experiment's input settings. `app` is on every kind:
+an application's own fields on the row, under one key named for the app. An app
+finds its rows by labels and edges, which are filterable; `app` only holds what
+it knows about each one.
 
 ```trax
 trax issue 7 label add backend
@@ -1081,6 +1098,7 @@ trax machine gpu-box how to @how.txt
 trax machine gpu-box label add gpu
 trax machine gpu-box label del gpu
 trax machine gpu-box del
+printf '%s\n' "$ENROLLMENT_TOKEN" | trax machine gpu-box connect
 ```
 
 ## 11. Counterexamples

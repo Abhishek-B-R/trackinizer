@@ -41,9 +41,10 @@ import argparse
 import json
 import time
 
+from treekle import from_plain, json_loads
+
 import httpx2
 
-from trackinizer.lib.codec import from_plain, loads
 from trackinizer.trax.profile import Profile, load_profile
 
 
@@ -253,10 +254,7 @@ def _frames(frames: list[bytes], *, at_sec: float) -> str:
     parts: list[str] = []
     for frame in frames:
         try:
-            data = from_plain(
-                loads(frame.removeprefix(b"data: ")),
-                dict[str, object],
-            )
+            data = json_loads(frame.removeprefix(b"data: "), dict[str, object])
         except (json.JSONDecodeError, TypeError):
             parts.append(f"not a probe frame: {frame[:40]!r}")
             continue

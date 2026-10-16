@@ -9,16 +9,17 @@ import inspect
 import json
 import math
 
+from treekle import Invalid, json_loads
+from treekle.absent import ABSENT
+
 import pytest
 
-from trackinizer.lib.absent import ABSENT
 from trackinizer.lib.agent.sessions.unmodeled import (
     extract_unmodeled_fields,
     read_field_keeping_invalid,
     restore_unmodeled_fields,
     same_json_value,
 )
-from trackinizer.lib.codec import Invalid, loads
 
 
 class TestLosslessFields:
@@ -68,7 +69,7 @@ class TestLosslessFields:
         }
 
         stored = extract_unmodeled_fields(source, fields=fields)
-        encoded = loads(json.dumps(stored))
+        encoded = json_loads(json.dumps(stored))
         restored = restore_unmodeled_fields(
             cast(Mapping[str, object], encoded),
             {"missing": "default", "null": "now set", "value": "new", "invalid": 9},
@@ -173,7 +174,7 @@ class TestLosslessFields:
         }
 
         restored = restore_unmodeled_fields(
-            _d(loads(json.dumps(extract_unmodeled_fields(source)))),
+            _d(json_loads(json.dumps(extract_unmodeled_fields(source)))),
             {},
         )
 
@@ -288,6 +289,6 @@ def _d(value: object) -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

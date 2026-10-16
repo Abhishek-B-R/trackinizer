@@ -45,11 +45,12 @@ import threading
 import time
 import uuid
 
+from treekle import PlainTree
+from treekle.absent import ABSENT, Absent
+
 import httpx2
 
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.absent import ABSENT, Absent
-from trackinizer.lib.codec import PlainTree
 from trackinizer.types.inquiries import Inquiry, Issue
 from trackinizer.wire.refs import Ref, SeqRef, UuidRef
 from trackinizer.wire.routes import (
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
     import pydantic
 
     from trackinizer.wire import (
+        wire_code,
         wire_machine_host,
         wire_machines,
         wire_metrics,
@@ -80,6 +82,7 @@ if TYPE_CHECKING:
         wire_variables,
     )
     from trackinizer.wire.filters import Filter
+    from trackinizer.wire.wire_code import CodeSnapshot, CodeSnapshotHead
     from trackinizer.wire.wire_machine_host import (
         EnrollResponse,
         HeartbeatResponse,
@@ -129,6 +132,8 @@ else:
     wire_machine_host = lazy_import("trackinizer.wire.wire_machine_host")
     # Same lazy-bind for ``wire_variables``: only the variable methods touch it.
     wire_variables = lazy_import("trackinizer.wire.wire_variables")
+    # Same lazy-bind for ``wire_code``: only the code-store methods touch it.
+    wire_code = lazy_import("trackinizer.wire.wire_code")
     pydantic = lazy_import("pydantic")
 
 
@@ -184,6 +189,14 @@ class EdgeWrite(NamedTuple):
     created: bool
 
     changed: bool
+
+
+class ArtifactRevision(NamedTuple):
+    """One published revision of an Artifact's content."""
+
+    artifact_id: uuid.UUID
+
+    revision: int
 
 
 class Client:
@@ -366,6 +379,7 @@ class Client:
         offset: int = 0,
         seq_ranges: Sequence[SeqRange] = (),
         filters: Sequence[Filter] = (),
+        fields: Sequence[str] | None = None,
     ) -> list[dict[str, PlainTree]]:
         """Fetch one page of inquiries of a given kind.
 
@@ -376,6 +390,7 @@ class Client:
           offset: Rows to skip (not stable during concurrent writes).
           seq_ranges: Sequence intervals to include (disjoint union).
           filters: Field predicates applied before LIMIT on the server.
+          fields: Row keys to send; None sends every key.
 
         Returns:
           result: Page of matching inquiry rows as dicts.
@@ -408,6 +423,7 @@ class Client:
                             )
                             for filt in filters
                         ],
+                        "fields": None if fields is None else list(fields),
                     },
                 ),
                 "/api/inquiries",
@@ -1260,6 +1276,41 @@ class Client:
             },
         )
 
+    def transition_app(
+        self,
+        target_id: uuid.UUID,
+        *,
+        expected_from: dict[str, object] | None,
+        to: dict[str, object] | None,
+        actor: Inquiry.Actor,
+        reason: str = "",
+    ) -> None:
+        """Compare-and-set a row's ``app``; 409s if it isn't ``expected_from``.
+
+        Sent as a PUT on the ``app`` field with ``mode='cas'`` and the whole
+        object read before as the ``expected`` guard, so a field another writer
+        set since is never overwritten: a 409 means read again and merge.
+
+        Args:
+          target_id: ID of the row to rewrite.
+          expected_from: The whole ``app`` read before (guard, raises 409 if
+            mismatch); ``None`` when it was unset.
+          to: The whole new ``app``.
+          actor: Change actor for audit log.
+          reason: Optional audit note.
+
+        """
+        self.put(
+            _field_path(target_id, "app"),
+            body={
+                "actor": actor,
+                "value": to,
+                "mode": "cas",
+                "expected": expected_from,
+                "reason": reason,
+            },
+        )
+
     def purge(
         self,
         target_id: uuid.UUID,
@@ -1278,6 +1329,49 @@ class Client:
         self.delete(
             f"/api/inquiries/{target_id}",
             body={"actor": actor, "reason": reason},
+        )
+
+    def publish_artifact_content(
+        self,
+        issue_id: uuid.UUID,
+        *,
+        title: str,
+        summary: str,
+        html: str,
+        previous_id: uuid.UUID | None = None,
+    ) -> ArtifactRevision:
+        """Publish one HTML document as an Artifact revision produced by an Issue.
+
+        The server adds the Artifact ``produced_by`` the Issue and, with
+        ``previous_id``, ``supersedes`` that Artifact, in one change.
+
+        Args:
+          issue_id: The Issue that produces the Artifact.
+          title: The Artifact's title.
+          summary: One sentence shown above the page.
+          html: One complete document, every asset inline.
+          previous_id: The Artifact this revision supersedes; ``None`` starts one.
+
+        Returns:
+          revision: The Artifact and revision number the server stored.
+
+        """
+        body: dict[str, object] = {
+            "issue_id": str(issue_id),
+            "title": title,
+            "summary": summary,
+            "format": "html",
+            "html": html,
+        }
+        if previous_id is not None:
+            body["previous_artifact_id"] = str(previous_id)
+        response = cast(
+            Mapping[str, object],
+            self.post("/api/artifacts/content", body=body),
+        )
+        return ArtifactRevision(
+            artifact_id=uuid.UUID(str(response["artifact_id"])),
+            revision=cast(int, response["revision"]),
         )
 
     def session_start(self, body: SessionStart) -> SessionStartResponse:
@@ -1496,6 +1590,7 @@ class Client:
         masks: Sequence[MetricMaskClause],
         sort: Literal["asc", "desc"] | None = None,
         limit: int | None = None,
+        offset: int | None = None,
     ) -> list[MetricPoint]:
         """Read one experiment's masked metric cells (the mask-query surface).
 
@@ -1504,6 +1599,7 @@ class Client:
           masks: Field predicates selecting cells.
           sort: Asc/desc ordering by value.
           limit: Max rows, at most ``MAX_LIST_LIMIT`` (None = up to that cap).
+          offset: Selected rows to skip, to page past ``limit``.
 
         Returns:
           result: (key, step, value) points matching the masks.
@@ -1513,6 +1609,7 @@ class Client:
             masks=list(masks),
             sort=sort,
             limit=limit,
+            offset=offset,
         )
         where = wire_metrics_query.experiment_metric_query_path(experiment_id)
         response = self._request("POST", where, body=req.model_dump(mode="json"))
@@ -1551,19 +1648,22 @@ class Client:
 
     def rank_metrics(
         self,
-        experiment_ids: Sequence[uuid.UUID],
+        experiment_ids: Sequence[uuid.UUID] | Sequence[Filter],
         *,
         masks: Sequence[MetricMaskClause],
         sort: Literal["asc", "desc"] | None = None,
         limit: int | None = None,
+        offset: int | None = None,
     ) -> list[MetricRankRow]:
         """Cross-experiment masked read/rank over the given experiments.
 
         Args:
-          experiment_ids: Experiment IDs to rank across, at most ``MAX_LIST_LIMIT``.
+          experiment_ids: Experiment IDs to rank across, at most ``MAX_LIST_LIMIT``;
+            or list filters selecting the Experiments, any number of them.
           masks: Field predicates selecting cells.
           sort: Asc/desc ordering by value.
           limit: Max rows, at most ``MAX_LIST_LIMIT`` (None = up to that cap).
+          offset: Selected rows to skip, to page past ``limit``.
 
         Returns:
           result: Ranked rows with experiment ID and metric values.
@@ -1573,9 +1673,19 @@ class Client:
             masks=list(masks),
             sort=sort,
             limit=limit,
+            offset=offset,
         )
-        req = wire_metrics_query.MetricRankRequest(
-            experiment_ids=list(experiment_ids),
+        ids = [item for item in experiment_ids if isinstance(item, uuid.UUID)]
+        filters = [
+            {"field": item.field, "op": item.op, "value": item.value}
+            for item in experiment_ids
+            if not isinstance(item, uuid.UUID)
+        ]
+        req = _build_body(
+            wire_metrics_query.MetricRankRequest,
+            "metric rank",
+            experiment_ids=ids or None,
+            filters=filters or None,
             query=query,
         )
         where = wire_metrics_query.METRIC_RANK_PATH
@@ -1624,7 +1734,11 @@ class Client:
           result: Number of messages now queued for this session.
 
         """
-        body = wire_sessions.InboundEnqueueRequest(text=text).model_dump(mode="json")
+        # This client never names an asker, and an older server forbids the field.
+        body = wire_sessions.InboundEnqueueRequest(text=text).model_dump(
+            mode="json",
+            exclude={"asker"},
+        )
         where = wire_sessions.session_inbound_path(session_id)
         response = self._request("POST", where, body=body)
         return _validate_model(
@@ -1695,8 +1809,10 @@ class Client:
           result: Session IDs the message was enqueued to.
 
         """
+        # This client never names an asker, and an older server forbids the field.
         body = wire_sessions.SendMessage(actor=actor, room=room, text=text).model_dump(
             mode="json",
+            exclude={"asker"},
         )
         response = self._request("POST", wire_sessions.SEND_MESSAGE_PATH, body=body)
         return _validate_model(
@@ -1804,6 +1920,58 @@ class Client:
             },
         )
         return dict(_require_mapping(marked, where))
+
+    def set_preferences(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        change: Mapping[str, object],
+    ) -> dict[str, PlainTree]:
+        """Change the station owner's preferences, as its agent; an event, so no revision is read.
+
+        Args:
+          workspace_id: The station, whose owner's preferences change.
+          change: The keys to change; ``None`` puts a key back to its default.
+
+        Returns:
+          state: The station's state, carrying the owner's preferences after the change.
+
+        """
+        where = f"/api/workspaces/{workspace_id}/operations"
+        changed = self.post(
+            where,
+            body={
+                "revision": 0,
+                "operation": {"kind": "preferences", "change": dict(change)},
+            },
+        )
+        return dict(_require_mapping(changed, where))
+
+    def chat_window(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        hidden: bool,
+    ) -> dict[str, PlainTree]:
+        """Hide or show the browser tab's Chat window; an event, so no revision is read.
+
+        Args:
+          workspace_id: The canvas.
+          hidden: True to hide Chat, False to show it again.
+
+        Returns:
+          state: The workspace state, which the window does not change.
+
+        """
+        where = f"/api/workspaces/{workspace_id}/operations"
+        windowed = self.post(
+            where,
+            body={
+                "revision": 0,
+                "operation": {"kind": "chat", "hidden": hidden},
+            },
+        )
+        return dict(_require_mapping(windowed, where))
 
     def _revision_of(self, workspace_id: uuid.UUID) -> int:
         """Return the canvas's live revision."""
@@ -2013,6 +2181,113 @@ class Client:
             wire_machine_host.REVOKE_PATH.format(name=quote(name, safe="")),
         )
 
+    def code_missing(self, owner: str, *, hashes: Sequence[str]) -> list[str]:
+        """Return the blob hashes the code store lacks for ``owner``, in the order given.
+
+        Args:
+          owner: The email the blobs are filed under: the caller's, unless it holds
+            ``staff``.
+          hashes: Each blob's sha256 hex, at most ``MAX_MISSING_HASHES``.
+
+        Returns:
+          missing: The hashes to send with :meth:`code_put_blobs`, each once.
+
+        """
+        where = wire_code.CODE_MISSING_PATH
+        body = _build_body(
+            wire_code.CodeMissingRequest,
+            "code blob check",
+            owner=owner,
+            sha256=list(hashes),
+        )
+        response = self._request("POST", where, body=body.model_dump(mode="json"))
+        return _validate_model(wire_code.CodeMissing, response, where).missing
+
+    def code_put_blobs(self, owner: str, *, blobs: Mapping[str, str]) -> int:
+        """Store blobs for ``owner``; the server checks each hash against its text.
+
+        Args:
+          owner: The email the blobs are filed under: the caller's, unless it holds
+            ``staff``.
+          blobs: Each blob's sha256 hex to its text: at most
+            ``MAX_BLOBS_PER_REQUEST`` blobs and ``MAX_REQUEST_TEXT_BYTES`` of UTF-8.
+
+        Returns:
+          stored: How many were new to the store.
+
+        """
+        where = wire_code.CODE_BLOBS_PATH
+        body = _build_body(
+            wire_code.CodeBlobsPut,
+            "code blobs",
+            owner=owner,
+            blobs=[{"sha256": sha, "text": text} for sha, text in blobs.items()],
+        )
+        response = self._request("POST", where, body=body.model_dump(mode="json"))
+        return _validate_model(wire_code.CodeBlobsStored, response, where).stored
+
+    def code_put_snapshot(
+        self,
+        record_id: uuid.UUID,
+        *,
+        owner: str,
+        private: bool,
+        parent_record_id: uuid.UUID | None,
+        files: Mapping[str, str],
+        partial: str = "",
+    ) -> CodeSnapshotHead:
+        """File a record's code, replacing the snapshot it had.
+
+        The server answers 409 ``code_blobs_missing`` while a blob is not stored for
+        ``owner``, and 409 ``code_parent_missing`` while the parent record holds no
+        snapshot of ``owner``.
+
+        Args:
+          record_id: The record the code belongs to.
+          owner: The email the snapshot is filed under: the caller's, unless it holds
+            ``staff``.
+          private: Let ``owner`` alone read it.
+          parent_record_id: The record whose snapshot this one builds on.
+          files: Each path to its blob's sha256 hex.
+          partial: One line saying what was left out, when the upload stopped short.
+
+        Returns:
+          head: The snapshot as stored.
+
+        """
+        where = wire_code.CODE_SNAPSHOT_PATH.format(record_id=record_id)
+        body = _build_body(
+            wire_code.CodeSnapshotPut,
+            f"code snapshot of {record_id}",
+            owner=owner,
+            private=private,
+            parent_record_id=parent_record_id,
+            files=dict(files),
+            partial=partial,
+        )
+        response = self._request("PUT", where, body=body.model_dump(mode="json"))
+        return _validate_model(wire_code.CodeSnapshotHead, response, where)
+
+    def code_snapshot(self, record_id: uuid.UUID) -> CodeSnapshot | None:
+        """Return a record's code snapshot, its files sorted by path.
+
+        Args:
+          record_id: The record.
+
+        Returns:
+          snapshot: The snapshot; ``None`` when the record has none the caller reads,
+            which the server answers 404 for alike.
+
+        """
+        where = wire_code.CODE_SNAPSHOT_PATH.format(record_id=record_id)
+        try:
+            response = self._request("GET", where)
+        except ClientError as error:
+            if error.status_code == 404:
+                return None
+            raise
+        return _validate_model(wire_code.CodeSnapshot, response, where)
+
     def _patch_field(
         self,
         target_id: uuid.UUID,
@@ -2124,7 +2399,13 @@ class Client:
                 payload = None
             if isinstance(payload, dict):
                 payload_map = cast(Mapping[object, object], payload)
-                code = payload_map.get("code")
+                # A route that answers with a coded detail nests the code there.
+                detail = payload_map.get("detail")
+                code = payload_map.get("code") or (
+                    cast(Mapping[object, object], detail).get("code")
+                    if isinstance(detail, dict)
+                    else None
+                )
                 if isinstance(code, str):
                     error_code = code
             raise ClientError(
@@ -2259,8 +2540,11 @@ def _build_body[M: pydantic.BaseModel](
     try:
         return model.model_validate(fields)
     except pydantic.ValidationError as err:
-        # Not chained: only the field and the rule are shown, never the input.
-        problems = "; ".join(f"{e['loc'][0]}: {e['msg']}" for e in err.errors())
+        # Not chained: only the field and the rule are shown, never the input. A
+        # model validator's error names no field, so its ``loc`` is empty.
+        problems = "; ".join(
+            f"{e['loc'][0]}: {e['msg']}" if e["loc"] else e["msg"] for e in err.errors()
+        )
         raise ClientError(f"{what} {problems}") from None
 
 

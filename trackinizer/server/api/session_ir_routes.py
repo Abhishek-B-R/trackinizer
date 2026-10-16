@@ -9,8 +9,12 @@ AgentSession list (``trax agentsession tool_call re bar``), not a second query
 surface with its own grammar.
 
 The append requires ``writer``, and for a science chat the key that opened it; the
-reads require ``viewer``. Tenant scope is
-derived by joining to ``inquiries``, as every session route does.
+reads require ``viewer``. Each route also answers 403 ``session_audience`` to a caller
+who neither opened the session nor reads it. A read takes an ``asker`` and a ``chat``:
+the configured assistant reads for that user, on the user's rights and never its own,
+into the chat it answers them in (see ``require_session_access``), and anyone else's
+``asker`` and ``chat`` are ignored. Tenant scope is derived by joining to
+``inquiries``, as every session route does.
 """
 
 from __future__ import annotations
@@ -20,18 +24,23 @@ from typing import TYPE_CHECKING, Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from treekle import from_plain, immutable
 
-from trackinizer.lib.codec import from_plain, immutable
-from trackinizer.server.api._deps import get_store
+from trackinizer.server.api._deps import get_assistant, get_inbound, get_store
+from trackinizer.server.api._routes_shared import engine_of
 from trackinizer.server.api.session_access import (
     require_chat_opener,
+    require_session,
+    require_session_access,
     require_session_write_access,
+    resolve_asker,
 )
 from trackinizer.server.auth import AuthIdentity, require_role
 from trackinizer.server.session_reaper import revive_if_reaped
 from trackinizer.server.store.session_ir import SlashCommandRow
-from trackinizer.types.inquiries import AgentSession
+from trackinizer.server.visuals.science_chats import counts_in_chat
 from trackinizer.wire.routes import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT
+from trackinizer.wire.wire_science_chat import chat_conversation_id
 from trackinizer.wire.wire_session_ir import (
     AppendRecordsRequest,
     AppendRecordsResponse,
@@ -45,7 +54,7 @@ from trackinizer.wire.wire_session_ir import (
 
 
 if TYPE_CHECKING:
-    from trackinizer.server.store.core import Store
+    from collections.abc import Sequence
 
 
 router = APIRouter()
@@ -82,8 +91,9 @@ async def append_session_records_route(
 
     """
     store = get_store(request)
-    session = await _require_session(store, session_id)
+    session = await require_session(store, session_id)
     require_session_write_access(identity, session)
+    await require_session_access(request, identity, session=session, mode="write")
     require_chat_opener(identity, session=session)
     # A run closed for silence that uploads again was alive all along; reopen
     # its session first, or the append is refused as a write to an ended one.
@@ -120,6 +130,20 @@ async def append_session_records_route(
         at=datetime.now(UTC),
         polled=False,
     )
+    # A chat's line its assistant took from the queue is counted as posted until here,
+    # where only a session whose lines the chat counts records it.
+    conversation = chat_conversation_id(session.cli_session_id)
+    senders = _posters(body.records)
+    if conversation is not None and senders:
+        async with engine_of(request).acquire() as conn:
+            counted = await counts_in_chat(
+                conn,
+                assistant=get_assistant(request),
+                session_id=session_id,
+                conversation_id=conversation,
+            )
+        if counted:
+            get_inbound(request).recorded(conversation, senders=senders)
     return AppendRecordsResponse(
         part=part,
         written=written,
@@ -128,26 +152,37 @@ async def append_session_records_route(
     )
 
 
-@router.get(
-    "/api/sessions/{session_id}/parts",
-    dependencies=[Depends(require_role("viewer"))],
-)
+@router.get("/api/sessions/{session_id}/parts")
 async def read_session_parts_route(
     session_id: UUID,
     request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+    *,
+    asker: str | None = None,
+    chat: UUID | None = None,
 ) -> ReadPartsResponse:
     """List the files this session was captured from, in ``part`` order.
 
     Args:
       session_id: AgentSession ID to list parts from.
       request: FastAPI request (carries auth and store).
+      identity: Authenticated reader.
+      asker: The account the configured assistant reads for.
+      chat: The conversation the configured assistant reads into.
 
     Returns:
       result: ReadPartsResponse with manifest info for each part.
 
     """
     store = get_store(request)
-    await _require_session(store, session_id)
+    await require_session_access(
+        request,
+        identity,
+        session=await require_session(store, session_id),
+        mode="read",
+        asker=await resolve_asker(request, identity, email=asker),
+        chat=chat,
+    )
     manifests = await store.read_session_manifests(session_id)
     return ReadPartsResponse(
         parts=[
@@ -166,18 +201,18 @@ async def read_session_parts_route(
     )
 
 
-@router.get(
-    "/api/sessions/{session_id}/records",
-    dependencies=[Depends(require_role("viewer"))],
-)
+@router.get("/api/sessions/{session_id}/records")
 async def read_session_records_route(
     session_id: UUID,
     request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
     *,
     part: int = 0,
     after_idx: int = -1,
     limit: int = DEFAULT_LIST_LIMIT,
     plaintext_only: bool = False,
+    asker: str | None = None,
+    chat: UUID | None = None,
 ) -> ReadRecordsResponse:
     """Read one page of a part's records.
 
@@ -192,11 +227,14 @@ async def read_session_records_route(
     Args:
       session_id: AgentSession ID to read from.
       request: FastAPI request (carries auth and store).
+      identity: Authenticated reader.
       part: Which file, as ``GET .../parts`` numbers it; ``-1`` holds turns
         backfilled from the retired event log.
       after_idx: Exclusive lower bound on idx (cursor-based paging).
       limit: Max rows per page.
       plaintext_only: Omit ciphertext.
+      asker: The account the configured assistant reads for.
+      chat: The conversation the configured assistant reads into.
 
     Returns:
       result: ReadRecordsResponse with matching records.
@@ -211,7 +249,14 @@ async def read_session_records_route(
     # reader fetches every part it names, so refusing one blanks the transcript.
     # A number no file resolved to has no manifest and reads as empty.
     store = get_store(request)
-    await _require_session(store, session_id)
+    await require_session_access(
+        request,
+        identity,
+        session=await require_session(store, session_id),
+        mode="read",
+        asker=await resolve_asker(request, identity, email=asker),
+        chat=chat,
+    )
     rows = await store.read_session_records(
         session_id,
         part=part,
@@ -222,22 +267,25 @@ async def read_session_records_route(
     return ReadRecordsResponse(part=part, records=[RecordBody.of(row) for row in rows])
 
 
-@router.get(
-    "/api/sessions/{session_id}/turns",
-    dependencies=[Depends(require_role("viewer"))],
-)
+@router.get("/api/sessions/{session_id}/turns")
 async def read_recent_session_turns_route(
     session_id: UUID,
     request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
     *,
     limit: int = 20,
+    asker: str | None = None,
+    chat: UUID | None = None,
 ) -> ReadRecentTurnsResponse:
     """Read recent conversation turns without transferring intervening tools.
 
     Args:
       session_id: AgentSession ID to read from.
       request: FastAPI request carrying auth and store.
+      identity: Authenticated reader.
       limit: Maximum user and assistant turns, from 1 through 100.
+      asker: The account the configured assistant reads for.
+      chat: The conversation the configured assistant reads into.
 
     Returns:
       result: The newest turns in display order across session parts.
@@ -246,7 +294,14 @@ async def read_recent_session_turns_route(
     if limit < 1 or limit > 100:
         raise HTTPException(status_code=400, detail="limit must be in [1, 100]")
     store = get_store(request)
-    await _require_session(store, session_id)
+    await require_session_access(
+        request,
+        identity,
+        session=await require_session(store, session_id),
+        mode="read",
+        asker=await resolve_asker(request, identity, email=asker),
+        chat=chat,
+    )
     turns = await store.read_recent_session_turns(session_id, limit=limit)
     return ReadRecentTurnsResponse(
         turns=[
@@ -261,9 +316,12 @@ async def read_recent_session_turns_route(
     )
 
 
-async def _require_session(store: Store, session_id: UUID) -> AgentSession:
-    """Fetch an AgentSession row or 404; reject a non-session id."""
-    row = await store.get_inquiry(session_id)
-    if not isinstance(row, AgentSession):
-        raise HTTPException(status_code=404, detail=f"unknown session {session_id}")
-    return row
+def _posters(records: Sequence[RecordBody]) -> list[str]:
+    """Name the poster of each person's line among ``records``, in order."""
+    return [
+        sender
+        for record in records
+        if record.kind == "AgentToAgentMessage" and isinstance(record.payload, dict)
+        for sender in (record.payload.get("sender"),)
+        if isinstance(sender, str)
+    ]

@@ -8,6 +8,8 @@ from typing import cast
 import inspect
 import json
 
+from treekle import immutable
+
 import pytest
 
 from trackinizer.lib.agent.sessions import sagent
@@ -33,7 +35,6 @@ from trackinizer.lib.agent.types.sessions import (
     UserMessage,
     WebFetchResult,
 )
-from trackinizer.lib.codec import immutable
 
 
 def _read(*lines: dict[str, object] | str) -> list[SessionRecord]:
@@ -669,6 +670,6 @@ def test_a_mistyped_field_aborts_no_read() -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

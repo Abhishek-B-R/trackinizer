@@ -57,6 +57,12 @@ CREATE TABLE IF NOT EXISTS inquiries (
     description    TEXT,
     labels         TEXT[],
     subscribers    TEXT[],
+    -- What an app layered on trackinizer keeps on the row, one JSON object keyed by
+    -- app name; never read here. Mirrors ``Inquiry.app``'s ColumnSpec check.
+    app            JSONB CHECK (
+                       app IS NULL
+                       OR jsonb_typeof(app) = 'object' AND octet_length(app::text) <= 65536
+                   ),
     -- Declared provenance, supplied by the CLIENT: when the knowledge this row
     -- holds was originally recorded. NULL means the row was born here, where
     -- ``created`` already answers the question. Nullable and never defaulted --
@@ -603,7 +609,19 @@ CREATE TABLE IF NOT EXISTS users (
     -- The welcome flow's agreement: when, and to which rules version (see
     -- ``api/auth_routes.py``).
     acknowledged_at            TIMESTAMPTZ,
-    acknowledged_rules_version TEXT
+    acknowledged_rules_version TEXT,
+    -- Google's ``hd`` claim from the last login: the Workspace domain, absent for a
+    -- consumer account. A ``*@domain`` staff pattern needs it to name that domain.
+    hosted_domain TEXT
+        CHECK (hosted_domain = lower(hosted_domain) AND char_length(hosted_domain) <= 253),
+    -- Google's ``sub`` of the account that first signed in as this email. NULL until
+    -- the next login after 040. A login with another ``sub`` is refused, so a second
+    -- Google account on one address cannot reach this row's sessions and keys.
+    google_sub TEXT
+        CHECK (char_length(google_sub) BETWEEN 1 AND 255),
+    -- The user's preferences: an object of the keys they set, defaults left out
+    -- (``server/preferences.py``). NULL until they set one.
+    preferences JSONB CHECK (jsonb_typeof(preferences) = 'object')
 );
 
 -- Who set or cleared an inquiry's ``locked`` flag, and when (``api/locks.py``).
@@ -636,7 +654,10 @@ CREATE TABLE IF NOT EXISTS api_keys (
                   CHECK (role IN ('viewer', 'writer', 'admin')),
     created_at    TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     last_used_at  TIMESTAMPTZ,
-    revoked_at    TIMESTAMPTZ
+    revoked_at    TIMESTAMPTZ,
+    -- The one audience the key opens sessions into, NULL for none pinned.
+    open_into     TEXT
+        CHECK (open_into ~ '^[a-z][a-z0-9_-]{0,31}$')
 );
 
 -- Auth v2 self-heal: ``api_keys.role`` was added after Phase 1 shipped.
@@ -997,20 +1018,27 @@ CREATE TABLE IF NOT EXISTS machine_credentials (
 CREATE UNIQUE INDEX IF NOT EXISTS uq_machine_credentials_live
     ON machine_credentials (machine_id) WHERE revoked_at IS NULL;
 
--- Per-user canvas state. The companion receipt table makes retried operations
--- return the original result without applying them twice. Added in 026.
+-- Per-user canvas state. A canvas is a named station, and a user has many. Its
+-- station fields are one optional JSON object, ``station``, that only the workbench
+-- reads: ``name``, the science chat it holds (``conversation_id``) and the ``page``
+-- it was last on, each key present only when set. The app opens the station changed
+-- last. The companion receipt table makes retried operations return the original
+-- result without applying them twice. Added in 026; made stations in 042.
 CREATE TABLE IF NOT EXISTS visual_workspaces (
     id          UUID PRIMARY KEY,
     user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    is_default  BOOLEAN NOT NULL DEFAULT TRUE,
     revision    BIGINT NOT NULL DEFAULT 0 CHECK (revision >= 0),
     state       JSONB NOT NULL CHECK (jsonb_typeof(state) = 'object'),
-    session_id  UUID REFERENCES inquiries(id) ON DELETE SET NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    modified_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+    modified_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    station     JSONB CHECK (jsonb_typeof(station) = 'object')
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_visual_workspaces_default_user
-    ON visual_workspaces (user_id) WHERE is_default;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_visual_workspaces_user_station_name
+    ON visual_workspaces (user_id, (station->>'name'));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_visual_workspaces_user_station_chat
+    ON visual_workspaces (user_id, (station->>'conversation_id'));
+CREATE INDEX IF NOT EXISTS idx_visual_workspaces_user_modified
+    ON visual_workspaces (user_id, modified_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS visual_workspace_operations (
     workspace_id UUID NOT NULL REFERENCES visual_workspaces(id) ON DELETE CASCADE,
@@ -1020,18 +1048,6 @@ CREATE TABLE IF NOT EXISTS visual_workspace_operations (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (workspace_id, key)
 );
-
--- Durable canvas views and workflows. Added in 027; session attachment is transient.
-CREATE TABLE IF NOT EXISTS visual_workspace_presets (
-    id          UUID PRIMARY KEY,
-    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    name        TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 120),
-    state       JSONB NOT NULL CHECK (jsonb_typeof(state) = 'object'),
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    modified_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
-);
-CREATE INDEX IF NOT EXISTS idx_visual_workspace_presets_user_modified
-    ON visual_workspace_presets (user_id, modified_at DESC, id DESC);
 
 -- Shared reports are identified separately from their immutable revisions.
 -- Each revision owns a generic Artifact linked to the producing Issue.
@@ -1055,4 +1071,75 @@ CREATE TABLE IF NOT EXISTS visual_report_revisions (
     content_bytes BIGINT NOT NULL CHECK (content_bytes > 0),
     PRIMARY KEY (report_id, revision),
     UNIQUE (author_id, publish_key)
+);
+
+-- Who a science chat is shared with: each person posts into it as its starter does.
+-- A share follows the conversation (the ``chat:<id>`` its sessions carry), not one
+-- session, so it outlives a session the assistant reopens. No FK: a conversation is
+-- no row, and a person may be shared with before they first sign in. Added in 043.
+CREATE TABLE IF NOT EXISTS science_chat_shares (
+    conversation_id UUID NOT NULL,
+    email           TEXT NOT NULL CHECK (email = lower(email)),
+    shared_by       TEXT NOT NULL,
+    shared_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (conversation_id, email)
+);
+
+-- A science chat that was deleted: no line starts a chat under its id again, so a
+-- line naming it is refused rather than reopening it as someone else's. Added in 043.
+CREATE TABLE IF NOT EXISTS science_chat_tombstones (
+    conversation_id UUID PRIMARY KEY,
+    deleted_by      TEXT NOT NULL,
+    deleted_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+-- What each person has been given, has bought and has spent: one row per entry, each
+-- applied once by ``idem`` (Stripe's event id, or a charge's own key), and one
+-- purchase per payment. A refund or dispute that names no purchase has no email.
+-- Entries are kept under the lowercase email, with no FK to ``users``: a deleted
+-- account that signs in again keeps its debt and gets no second grant. Added in 045.
+CREATE TABLE IF NOT EXISTS credit_entries (
+    id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    email      TEXT CHECK (email = lower(email)),
+    kind       TEXT NOT NULL
+               CHECK (kind IN ('grant', 'purchase', 'chat', 'campaign', 'release', 'refund', 'dispute')),
+    usd        NUMERIC(14, 6) NOT NULL CHECK (usd >= 0),
+    ref        TEXT NOT NULL,
+    idem       TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CHECK (email IS NOT NULL OR kind IN ('refund', 'dispute'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS credit_entries_one_purchase_per_payment
+    ON credit_entries (ref) WHERE kind = 'purchase';
+
+CREATE INDEX IF NOT EXISTS credit_entries_user_created
+    ON credit_entries (email, created_at);
+
+-- One text file of code, stored once per owner by the sha256 of its UTF-8 bytes and
+-- kept zstd-compressed. Dedupe never crosses owners: a store shared between owners
+-- would let anyone learn whether a file exists. Added in 048.
+CREATE TABLE IF NOT EXISTS code_blobs (
+    owner      TEXT NOT NULL CHECK (owner <> '' AND owner = lower(owner)),
+    sha256     BYTEA NOT NULL CHECK (octet_length(sha256) = 32),
+    size       INTEGER NOT NULL CHECK (size >= 0 AND size <= 1048576),
+    data_zst   BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (owner, sha256)
+);
+
+-- The code of one record (a campaign iteration's Experiment): ``files`` maps each path
+-- to its blob's sha256 hex, and ``parent_id`` names the record whose snapshot it builds
+-- on. A private snapshot is read by its owner alone. Added in 048.
+CREATE TABLE IF NOT EXISTS code_snapshots (
+    record_id    UUID PRIMARY KEY REFERENCES inquiries(id) ON DELETE CASCADE,
+    parent_id    UUID REFERENCES code_snapshots(record_id) ON DELETE SET NULL,
+    owner        TEXT NOT NULL CHECK (owner <> '' AND owner = lower(owner)),
+    private      BOOLEAN NOT NULL DEFAULT false,
+    files        JSONB NOT NULL CHECK (jsonb_typeof(files) = 'object'),
+    file_count   INTEGER NOT NULL CHECK (file_count >= 0),
+    total_bytes  BIGINT NOT NULL CHECK (total_bytes >= 0),
+    partial      TEXT NOT NULL DEFAULT '',
+    created_by   UUID REFERENCES users(id) ON DELETE SET NULL,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );

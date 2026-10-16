@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Final
 from uuid import uuid4
 
-from trackinizer.lib.codec import immutable
+from treekle import immutable
+
 from trackinizer.wire.wire_session_ir import ManifestBody, PartBody, RecordBody
 
 
@@ -25,6 +26,6 @@ def test_frozen_json_serializes_as_plain_json() -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

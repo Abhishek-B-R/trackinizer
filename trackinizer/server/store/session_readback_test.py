@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 from uuid import UUID, uuid4
 
+from treekle import immutable
+
 import pytest
 import pytest_asyncio
 
@@ -35,7 +37,6 @@ from trackinizer.lib.agent.types.sessions import (
     Thinking,
     TurnContext,
 )
-from trackinizer.lib.codec import immutable
 from trackinizer.server.embedders.stub import StubEmbedder
 from trackinizer.server.store.core import Store
 from trackinizer.types.session_records import SessionRecordRow
@@ -68,9 +69,10 @@ async def _session_row(store: Store) -> UUID:
     session_id = uuid4()
     async with store.engine.acquire() as conn:
         await conn.execute(
-            "INSERT INTO inquiries (id, kind, seq, status, account, title) "
+            "INSERT INTO inquiries (id, kind, seq, status, account, title, "
+            "agentsession_audience) "
             "VALUES ($1, 'AgentSession', nextval('seq_agentsession'), 'active', "
-            "'tester@example.com', 'readback test')",
+            "'tester@example.com', 'readback test', 'open')",
             session_id,
         )
     return session_id
@@ -309,6 +311,6 @@ async def test_the_manifest_metadata_survives_storage(store: Store) -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

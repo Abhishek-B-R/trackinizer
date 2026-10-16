@@ -12,10 +12,11 @@ from typing import TYPE_CHECKING
 
 import uuid
 
+from treekle import from_plain
+
 import pytest
 
 from trackinizer.conftest import executed_sql, set_field_row
-from trackinizer.lib.codec import from_plain
 from trackinizer.server.api.conftest import (
     TEST_USER_EMAIL,
     install_identity,
@@ -501,6 +502,6 @@ def _assert_untouched(engine: FakeEngine) -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

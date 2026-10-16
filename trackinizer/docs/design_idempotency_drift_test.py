@@ -14,7 +14,8 @@ from typing import Final
 
 import re
 
-from trackinizer.lib.codec import from_plain
+from treekle import from_plain
+
 from trackinizer.server.store.core import Store
 
 
@@ -67,6 +68,6 @@ def test_design_idempotency_has_no_known_stale_names() -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

@@ -80,6 +80,17 @@ test("Enter sends and Shift+Enter breaks the line; a composer turned off sends n
   expect(screen.getByRole("button", { name: "Send message" })).toHaveProperty("disabled", true);
 });
 
+test("Alt+Enter sends nothing: it is the key that takes Chat full screen", async () => {
+  const send = vi.fn<(text: string, key: string) => Promise<string>>().mockResolvedValue("Queued");
+  const { box } = show(send);
+  fireEvent.change(box, { target: { value: "Line one" } });
+  fireEvent.keyDown(box, { key: "Enter", altKey: true });
+  // A send starts on the next tick.
+  await act(async () => {});
+  expect(send).not.toHaveBeenCalled();
+  expect(box).toHaveProperty("value", "Line one");
+});
+
 test("a draft its check refuses says why, sends nothing and offers no retry; editing it clears that", async () => {
   const send = vi.fn<(text: string, key: string) => Promise<string>>().mockResolvedValue("Queued");
   const { box } = show(send, (text) => (text.startsWith("@") ? "" : "Start with a target: @agent message"));
@@ -141,5 +152,20 @@ test("a send that resolves with nothing shows no receipt, and still empties the 
   fireEvent.change(box, { target: { value: "hi" } });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   await waitFor(() => expect(box).toHaveProperty("value", ""));
+  expect(screen.queryByRole("status")).toBeNull();
+});
+
+test("a draft sent as the box moves to another target still leaves the box, and shows its receipt under neither", async () => {
+  let deliver = (_receipt: string) => {};
+  const send = vi.fn((_text: string, _key: string) => new Promise<string>((resolve) => { deliver = resolve; }));
+  const { box, rerender } = show(send);
+  fireEvent.change(box, { target: { value: "start a fork" } });
+  fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+  await waitFor(() => expect(send).toHaveBeenCalledOnce());
+  rerender("session-b");
+  await act(async () => deliver("Sent."));
+  expect(box).toHaveProperty("value", "");
+  expect(screen.queryByRole("status")).toBeNull();
+  rerender("session-a");
   expect(screen.queryByRole("status")).toBeNull();
 });

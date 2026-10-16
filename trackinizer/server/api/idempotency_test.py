@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 import uuid
 
-from trackinizer.lib.codec import from_plain
+from treekle import from_plain
 
 
 if TYPE_CHECKING:
@@ -71,6 +71,6 @@ class TestMiddleware:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

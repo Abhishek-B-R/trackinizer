@@ -6,13 +6,14 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
 import io
+import sys
 
 import httpx2
 import pytest
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.trax import cli
+from trackinizer.trax import cli, machine_host
 from trackinizer.trax.machines import MACHINE_WORD, Machines
 from trackinizer.wire.wire_machines import (
     MAX_HOW_CHARS,
@@ -23,7 +24,7 @@ from trackinizer.wire.wire_machines import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
 
@@ -56,6 +57,8 @@ class _StubClient:
         self.machines = list(machines)
         self.error = error
         self.calls: list[tuple[object, ...]] = []
+        # ``connect`` reads only the URL; the host loop is stubbed.
+        self.base_url = "https://server"
 
     def list_machines(self) -> list[Machine]:
         self.calls.append(("list",))
@@ -183,6 +186,7 @@ def test_show_prints_every_field(capsys: pytest.CaptureFixture[str]) -> None:
         "role:       dev",
         "labels:     gpu, a100",
         "how:        a\\nb",
+        "status:     never",
         "updated by: alice",
         "updated:    2026-10-06T12:00:00+00:00",
     ]
@@ -504,12 +508,40 @@ def test_a_trailing_help_word_is_never_a_name_or_label(
     assert client.calls == []
 
 
+def test_connect_hands_the_host_loop_stdin_and_a_client_per_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_connect(name: str, **kwargs: object) -> None:
+        seen.update(kwargs, name=name)
+
+    monkeypatch.setattr(machine_host, "connect", fake_connect)
+    with Client("https://server", api_key="profile-key") as profile:
+        cli.parse_and_run(
+            [MACHINE_WORD, "cloud-ab12cd34", "connect"],
+            client_factory=lambda: profile,
+        )
+    client_for = cast("Callable[[str], Client]", seen["client_for"])
+    with client_for("trax_machine_x") as host:
+        assert (host.base_url, host.api_key) == ("https://server", "trax_machine_x")
+    assert seen["name"] == "cloud-ab12cd34"
+    assert seen["read_token"] == sys.stdin.readline
+
+
+def test_a_malformed_connect_is_refused_before_any_request() -> None:
+    client = _StubClient()
+    err = _refusal(["cloud-ab12cd34", "connect", "now"], client=client)
+    assert str(err).startswith("usage: trax machine")
+    assert client.calls == []
+
+
 def test_top_level_help_names_the_verb(capsys: pytest.CaptureFixture[str]) -> None:
     cli.parse_and_run(["help", MACHINE_WORD])
     assert f"Usage: trax {MACHINE_WORD}" in capsys.readouterr().out
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

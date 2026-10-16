@@ -7,11 +7,12 @@ from uuid import UUID, uuid4
 
 import json
 
+from treekle import immutable, mutable
+
 import pytest
 import pytest_asyncio
 
 from trackinizer.lib import zstd_compat
-from trackinizer.lib.codec import immutable, mutable
 from trackinizer.server.embedders.stub import StubEmbedder
 from trackinizer.server.semantic_mapper_footprint import HEAD_CHARS
 from trackinizer.server.store.core import Store
@@ -50,9 +51,10 @@ async def _session(store: Store) -> UUID:
     session_id = uuid4()
     async with store.engine.acquire() as conn:
         await conn.execute(
-            "INSERT INTO inquiries (id, kind, seq, status, account, title) "
+            "INSERT INTO inquiries (id, kind, seq, status, account, title, "
+            "agentsession_audience) "
             "VALUES ($1, 'AgentSession', nextval('seq_agentsession'), 'active', "
-            "'tester@example.com', 'offload')",
+            "'tester@example.com', 'offload', 'open')",
             session_id,
         )
     await store.upsert_session_manifest(
@@ -254,6 +256,6 @@ class TestSplicedPayload:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

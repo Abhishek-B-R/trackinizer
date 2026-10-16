@@ -11,12 +11,14 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Final, Protocol, cast, get_args, override
 
 import argparse
+import json
 import math
 import sys
 import uuid
 
+from treekle import MutablePlainTree, from_plain, json_loads
+
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.codec import from_plain
 from trackinizer.trax import render
 from trackinizer.trax.commands import Command, HelpPage
 from trackinizer.trax.context import cwd, env
@@ -222,8 +224,9 @@ class Kind(Command):
             "--lossy",
             action="store_true",
             help=(
-                "accept a resume conversion that drops records the target "
-                "format cannot express (trax agentsession 42 run codex --lossy)"
+                "accept a resume that drops records the target format cannot "
+                "express, or replays records truncated at capture to fit an "
+                "upload (trax agentsession 42 run codex --lossy)"
             ),
         )
         add_write_flags(parser)
@@ -410,7 +413,7 @@ class Kind(Command):
         target, *runner_args = tail
         boundary = runner_args.index("--") if "--" in runner_args else len(runner_args)
         options, native = runner_args[:boundary], runner_args[boundary:]
-        lossy = _arg_bool(args, "lossy") or "--lossy" in options
+        lossy = bool(_arg_values(args).get("lossy", False)) or "--lossy" in options
         forwarded = [arg for arg in options if arg != "--lossy"] + native
         ref, consumed = consume_ref(before, 0, kind_hint="AgentSession")
         if before[consumed:]:
@@ -459,7 +462,7 @@ class Kind(Command):
                 client,
                 exp_id,
                 action,
-                bulk_ok=_arg_bool(args, "makeitso"),
+                bulk_ok=bool(_arg_values(args).get("makeitso", False)),
             )
             echo(f"written: {written}")
             return
@@ -527,7 +530,7 @@ class Kind(Command):
             client,
             exp_id,
             action,
-            bulk_ok=_arg_bool(args, "makeitso"),
+            bulk_ok=bool(_arg_values(args).get("makeitso", False)),
         )
         echo(f"written: {written}")
 
@@ -664,7 +667,10 @@ class Kind(Command):
             echo(render.format_json(edge_payload), nl=False)
         else:
             echo(
-                render.format_edge(edge_payload, changes=_arg_bool(args, "changes")),
+                render.format_edge(
+                    edge_payload,
+                    changes=bool(_arg_values(args).get("changes", False)),
+                ),
                 nl=False,
             )
 
@@ -1595,7 +1601,11 @@ def run_list_query(
 
     """
     print_rows(
-        _query_rows(query, client_factory(), limit=_arg_int(args, "limit")),
+        _query_rows(
+            query,
+            client_factory(),
+            limit=from_plain(_arg_values(args).get("limit"), int, default=0),
+        ),
         _arg_str(args, "format_"),
         width=_arg_width(args),
     )
@@ -1637,7 +1647,7 @@ def run_bulk_apply(
     # The guard is keyed on match count, not command shape: a single-row match
     # is as safe as a seq-targeted edit, so only a genuinely multi-row write
     # demands explicit confirmation. This is intentional (reviewed).
-    if len(rows) > 1 and not _arg_bool(args, "makeitso"):
+    if len(rows) > 1 and not bool(_arg_values(args).get("makeitso", False)):
         echo(f"would apply to {len(rows)} rows; pass --makeitso to proceed:")
         print_rows(rows, _arg_str(args, "format_"), width=_arg_width(args))
         return
@@ -1669,7 +1679,7 @@ def run_show(
         echo(
             render.format_show(
                 payload,
-                changes=_arg_bool(args, "changes"),
+                changes=bool(_arg_values(args).get("changes", False)),
                 include_id=show_ids(),
             ),
             nl=False,
@@ -1902,7 +1912,9 @@ class Recent(Command):
         client_factory: Callable[[], Client],
     ) -> None:
         del verb
-        rows = client_factory().recent_changes(limit=_arg_int(args, "limit"))
+        rows = client_factory().recent_changes(
+            limit=from_plain(_arg_values(args).get("limit"), int, default=0),
+        )
         if _arg_str(args, "format_") == "json":
             echo(render.format_json(list(rows)), nl=False)
         else:
@@ -1974,7 +1986,7 @@ class Search(Command):
         body = client_factory().search_sessions(
             _arg_str(args, "query"),
             semantic=bool(getattr(args, "semantic", True)),
-            limit=_arg_int(args, "limit"),
+            limit=from_plain(_arg_values(args).get("limit"), int, default=0),
         )
         if _arg_str(args, "format_") == "json":
             echo(render.format_json(body), nl=False)
@@ -2252,7 +2264,7 @@ Options:
         # COMPLETE -- a single capped fetch would silently drop issues past the
         # ceiling, rendering a partial tree with no warning.
         rows = client_factory().list_kind_all("Issue")
-        if _arg_bool(args, "open_only"):
+        if bool(_arg_values(args).get("open_only", False)):
             rows = [r for r in rows if str(r.get("status") or "") == "active"]
         cls.render(rows)
 
@@ -2482,13 +2494,19 @@ Options:
     ) -> None:
         del verb
         client = client_factory()
-        ref = SeqRef(kind=KIND_LOWER[_arg_str(args, "kind")], seq=_arg_int(args, "seq"))
+        ref = SeqRef(
+            kind=KIND_LOWER[_arg_str(args, "kind")],
+            seq=from_plain(_arg_values(args).get("seq"), int, default=0),
+        )
         _, target_id = client.resolve_id(ref)
-        payload = client.cost_for(target_id, deep=_arg_bool(args, "deep"))
+        payload = client.cost_for(
+            target_id,
+            deep=bool(_arg_values(args).get("deep", False)),
+        )
         if _arg_str(args, "format_") == "json":
             echo(render.format_json(payload), nl=False)
             return
-        scope = "subtree" if _arg_bool(args, "deep") else "self"
+        scope = "subtree" if bool(_arg_values(args).get("deep", False)) else "self"
         echo(f"scope:    {scope}")
         echo(f"agent:    ${payload.get('agent_usd', 0):.6f}")
         echo(f"resource: ${payload.get('resource_usd', 0):.6f}")
@@ -2544,7 +2562,10 @@ Options:
     ) -> None:
         del verb
         client = client_factory()
-        ref = SeqRef(kind=KIND_LOWER[_arg_str(args, "kind")], seq=_arg_int(args, "seq"))
+        ref = SeqRef(
+            kind=KIND_LOWER[_arg_str(args, "kind")],
+            seq=from_plain(_arg_values(args).get("seq"), int, default=0),
+        )
         _, target_id = client.resolve_id(ref)
         confidence = client.confidence_for(target_id)
         if _arg_str(args, "format_") == "json":
@@ -2597,7 +2618,10 @@ Options:
     ) -> None:
         del verb
         client = client_factory()
-        ref = SeqRef(kind=KIND_LOWER[_arg_str(args, "kind")], seq=_arg_int(args, "seq"))
+        ref = SeqRef(
+            kind=KIND_LOWER[_arg_str(args, "kind")],
+            seq=from_plain(_arg_values(args).get("seq"), int, default=0),
+        )
         _, target_id = client.resolve_id(ref)
         scores = client.authority_for(target_id)
         if _arg_str(args, "format_") == "json":
@@ -2751,9 +2775,19 @@ class Workspace(Command):
             "trax workspace UUID show trax.timeline --record RECORD_UUID --param direction_limit=5",
             "trax workspace UUID navigate '#/list/Issue'",
             "trax workspace UUID highlight RECORD_UUID,RECORD_UUID",
+            "trax workspace UUID hide chat",
             "trax workspace UUID hide INSTANCE_UUID",
+            "trax workspace UUID theme to light",
+            "trax workspace UUID chat_style to terminal",
+            "trax workspace UUID theme to null",
         ),
-        notes=("Mutations fetch the current revision before applying one operation.",),
+        notes=(
+            "Mutations fetch the current revision before applying one operation.",
+            (
+                "KEY to VALUE sets the station owner's preference KEY (VALUE read as JSON "
+                "when it parses, else as text; null puts it back to its default)."
+            ),
+        ),
     )
 
     @classmethod
@@ -2764,7 +2798,8 @@ class Workspace(Command):
         parser.add_argument(
             "action",
             nargs="?",
-            choices=("show", "navigate", "highlight", "hide", "focus", "place"),
+            metavar="|".join((*_WORKSPACE_ACTIONS, "KEY")),
+            help=f"one of {', '.join(_WORKSPACE_ACTIONS)}, or a preference KEY followed by: to VALUE",
         )
         parser.add_argument("subject", nargs="*")
         parser.add_argument("--record")
@@ -2793,8 +2828,24 @@ class Workspace(Command):
                 raise ClientError("workspace read does not accept operation arguments")
             _print_workspace(client.read_workspace(workspace_id))
             return
+        if _is_preference(flags):
+            updated = client.set_preferences(
+                workspace_id,
+                change={flags.action or "": _preference_value(flags.subject[1])},
+            )
+            _print_workspace(updated)
+            return
+        if flags.action not in _WORKSPACE_ACTIONS:
+            raise ClientError(
+                f"unknown workspace action {flags.action!r}: use one of "
+                f"{', '.join(_WORKSPACE_ACTIONS)}, or KEY to VALUE",
+            )
         if flags.action == "highlight":
             updated = client.highlight(workspace_id, ids=_highlight_ids(flags))
+            _print_workspace(updated)
+            return
+        if _is_chat(flags):
+            updated = client.chat_window(workspace_id, hidden=flags.action == "hide")
             _print_workspace(updated)
             return
         parameters = (
@@ -2858,6 +2909,37 @@ def _workspace_operation(
             "placement": subject[1],
         }
     return operation
+
+
+def _is_preference(args: _WorkspaceArgs) -> bool:
+    """Whether the words are ``KEY to VALUE``: set the station owner's preference KEY."""
+    if args.action in _WORKSPACE_ACTIONS or args.subject[:1] != ["to"]:
+        return False
+    if (
+        len(args.subject) != 2
+        or args.record is not None
+        or args.placement is not None
+        or args.param
+    ):
+        raise ClientError(f"{args.action} to takes one VALUE and no other argument")
+    return True
+
+
+def _preference_value(text: str) -> MutablePlainTree:
+    """Read a preference's value: as JSON when it parses (``true``, ``null``), else as text."""
+    try:
+        return json_loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def _is_chat(args: _WorkspaceArgs) -> bool:
+    """Whether the action is `hide chat` or `show chat`: the tab's Chat window."""
+    if args.action not in {"hide", "show"} or args.subject != ["chat"]:
+        return False
+    if args.record is not None or args.placement is not None or args.param:
+        raise ClientError(f"{args.action} chat takes no other argument")
+    return True
 
 
 def _highlight_ids(args: _WorkspaceArgs) -> list[uuid.UUID]:
@@ -2931,6 +3013,15 @@ def _print_workspace(payload: object) -> None:
     revision = from_plain(state.get("revision"), int, default=0)
     focused = from_plain(state.get("focused_instance"), str, default="none")
     echo(f"workspace {workspace_id} revision {revision} focused {focused}")
+    preferences = from_plain(state.get("preferences"), dict[str, object], default={})
+    if preferences:
+        echo(
+            "  preferences "
+            + " ".join(
+                f"{key}={json.dumps(value)}"
+                for key, value in sorted(preferences.items())
+            ),
+        )
     visuals = from_plain(state.get("visuals"), list[dict[str, object]], default=[])
     if not visuals:
         echo("  (no visuals)")
@@ -2950,6 +3041,10 @@ def _workspace_uuid(value: str, label: str) -> uuid.UUID:
         return uuid.UUID(value)
     except ValueError as error:
         raise ClientError(f"{label} is not a valid UUID: {value!r}") from error
+
+
+_WORKSPACE_ACTIONS: Final = ("show", "navigate", "highlight", "hide", "focus", "place")
+"""The operations a workspace takes by name; any other word starts ``KEY to VALUE``."""
 
 
 class _WorkspaceArgs(Protocol):
@@ -3359,17 +3454,9 @@ def _arg_values(args: argparse.Namespace) -> Mapping[str, object]:
     return vars(args)
 
 
-def _arg_int(args: argparse.Namespace, name: str) -> int:
-    return from_plain(_arg_values(args).get(name), int, default=0)
-
-
 def _arg_text(args: argparse.Namespace) -> list[str]:
     value = from_plain(_arg_values(args).get("text"), list[object], default=[])
     return [str(item) for item in value]
-
-
-def _arg_bool(args: argparse.Namespace, name: str) -> bool:
-    return bool(_arg_values(args).get(name, False))
 
 
 def _arg_width(args: argparse.Namespace) -> int | None:

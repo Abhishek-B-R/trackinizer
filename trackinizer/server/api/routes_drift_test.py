@@ -30,6 +30,12 @@ from trackinizer.wire.routes import (
     inquiry_field_path,
     inquiry_field_routes,
 )
+from trackinizer.wire.wire_code import (
+    CODE_API_PATHS,
+    CODE_BLOBS_PATH,
+    CODE_DIFF_PATH,
+    CODE_MISSING_PATH,
+)
 from trackinizer.wire.wire_export import EXPORT_API_PATHS
 from trackinizer.wire.wire_machine_host import (
     ENROLL_PATH,
@@ -45,6 +51,11 @@ from trackinizer.wire.wire_machines import (
 from trackinizer.wire.wire_metrics import METRICS_API_PATHS
 from trackinizer.wire.wire_metrics_query import (
     METRICS_QUERY_API_PATHS,
+)
+from trackinizer.wire.wire_service_accounts import (
+    SERVICE_ACCOUNT_KEY_REVOKE_PATH,
+    SERVICE_ACCOUNT_TOKENS_PATH,
+    SERVICE_ACCOUNTS_PATH,
 )
 from trackinizer.wire.wire_sessions import SESSION_API_PATHS
 from trackinizer.wire.wire_variables import VARIABLE_PATH, VARIABLES_PATH
@@ -259,6 +270,38 @@ def test_machine_host_paths_are_registered_and_documented() -> None:
     assert "POST   /api/machines/<name>/revoke" in api_md
 
 
+def test_code_paths_are_registered_and_documented() -> None:
+    """The code-store routes exist on the live app and appear in ``docs/api.md``."""
+    registered = registered_paths(app)
+    api_md = (_CWD.parents[1] / "docs" / "api.md").read_text()
+    assert [p for p in CODE_API_PATHS if p not in registered] == []
+    for line in (
+        f"POST   {CODE_MISSING_PATH}\n",
+        f"POST   {CODE_BLOBS_PATH}\n",
+        "PUT    /api/code/records/<uuid>/snapshot\n",
+        "GET    /api/code/records/<uuid>/snapshot\n",
+        "GET    /api/code/records/<uuid>/file?path=<path>\n",
+        f"GET    {CODE_DIFF_PATH}?from=<uuid>&to=<uuid>&context=<n>\n",
+    ):
+        assert line in api_md
+
+
+def test_service_account_paths_are_registered_and_documented() -> None:
+    """The service-account routes exist on the live app and appear in ``docs/api.md``."""
+    registered = registered_paths(app)
+    api_md = (_CWD.parents[1] / "docs" / "api.md").read_text()
+    for path in (
+        SERVICE_ACCOUNTS_PATH,
+        SERVICE_ACCOUNT_TOKENS_PATH,
+        SERVICE_ACCOUNT_KEY_REVOKE_PATH,
+    ):
+        assert path in registered
+    assert f"POST   {SERVICE_ACCOUNTS_PATH}" in api_md
+    assert "POST   /api/admin/service-accounts/<uuid>/tokens\n" in api_md
+    assert "GET    /api/admin/service-accounts/<uuid>/tokens\n" in api_md
+    assert "POST   /api/admin/service-accounts/<uuid>/tokens/<uuid>/revoke\n" in api_md
+
+
 def test_derived_read_routes_are_registered_and_documented() -> None:
     """The confidence / authority read routes exist and appear in ``docs/api.md``.
 
@@ -312,6 +355,6 @@ def test_submit_tokens_are_kind_lowercased() -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

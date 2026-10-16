@@ -69,6 +69,7 @@ class TestStartSession:
                     account="tester@example.com",
                 ),
                 requested_actor="alice",
+                audience="open",
             )
 
     @pytest.mark.asyncio
@@ -116,10 +117,35 @@ class TestStartSession:
                     account="tester@example.com",
                 ),
                 requested_actor="alice",
+                audience="open",
             )
         assert sid == existing_id
         assert owner == "alice"
         assert next_seq == 0
+
+
+@pytest.mark.asyncio
+async def test_session_audiences_keep_nulls_and_omit_unknown_sessions() -> None:
+    """A lookup returns stored audiences keyed by session, including NULL."""
+    first, second, unknown = new_uuid(), new_uuid(), new_uuid()
+    conn = make_conn()
+    conn.fetch = AsyncMock(
+        return_value=[
+            {"id": first, "agentsession_audience": "open"},
+            {"id": second, "agentsession_audience": None},
+        ],
+    )
+    store, _ = make_store(conn)
+
+    assert await store.read_session_audiences([first, second, unknown]) == {
+        first: "open",
+        second: None,
+    }
+    conn.fetch.assert_awaited_once_with(
+        "SELECT id, agentsession_audience FROM inquiries "
+        "WHERE kind = 'AgentSession' AND id = ANY($1::uuid[])",
+        [first, second, unknown],
+    )
 
 
 class TestEndSession:
@@ -475,6 +501,7 @@ async def _open(store: Store) -> UUID:
     session_id, _, _ = await store.start_session(
         SubmitAgentSession(title="s", cli="claude", account="t@e"),
         requested_actor="agent",
+        audience="open",
     )
     return session_id
 
@@ -513,6 +540,6 @@ async def _close_audit(
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

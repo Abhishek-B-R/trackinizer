@@ -13,10 +13,11 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import uuid
 
+from treekle import from_plain
+
 import pytest
 import pytest_asyncio
 
-from trackinizer.lib.codec import from_plain
 from trackinizer.server.api.conftest import (
     TEST_USER_EMAIL,
     TEST_USER_ID,
@@ -758,6 +759,6 @@ async def _detail(client: httpx2.AsyncClient, name: str) -> MachineDetail:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

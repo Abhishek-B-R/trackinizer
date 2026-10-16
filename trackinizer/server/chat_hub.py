@@ -23,6 +23,7 @@ import time
 
 from pydantic import BaseModel, Field
 
+from trackinizer.server.preferences import Preferences
 from trackinizer.server.visuals.workspaces import WorkspaceState
 
 
@@ -32,10 +33,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ChangedFrame",
+    "ChatFrame",
     "ChatHub",
     "Frame",
     "HighlightFrame",
     "NavigateFrame",
+    "PreferencesFrame",
     "Subscription",
     "WorkspaceFrame",
     "iter_workspace_events",
@@ -57,8 +60,6 @@ class WorkspaceFrame(_Stamped):
 
     type: Literal["workspace"] = "workspace"
     state: WorkspaceState
-    shown: UUID | None = None
-    """The instance an agent's show brought up with this change, else None."""
 
 
 class NavigateFrame(_Stamped):
@@ -75,6 +76,24 @@ class HighlightFrame(_Stamped):
     ids: list[UUID]
 
 
+class ChatFrame(_Stamped):
+    """An agent hid or showed the tab's Chat window. Not replayed, nor stored."""
+
+    type: Literal["chat"] = "chat"
+    hidden: bool
+
+
+class PreferencesFrame(_Stamped):
+    """The station owner's preferences changed: by them, or by the station's agent.
+
+    Sent to every station of theirs, so each of their tabs shows the change. Not
+    replayed: a tab that opens reads them from the profile.
+    """
+
+    type: Literal["preferences"] = "preferences"
+    preferences: Preferences
+
+
 class ChangedFrame(_Stamped):
     """An inquiry changed, as ``/api/web/subscribe`` reports it."""
 
@@ -82,7 +101,14 @@ class ChangedFrame(_Stamped):
     id: str
 
 
-type Frame = WorkspaceFrame | NavigateFrame | HighlightFrame | ChangedFrame
+type Frame = (
+    WorkspaceFrame
+    | NavigateFrame
+    | HighlightFrame
+    | ChatFrame
+    | PreferencesFrame
+    | ChangedFrame
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True, eq=False)

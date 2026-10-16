@@ -7,11 +7,14 @@ from datetime import UTC, datetime
 import uuid
 
 from pydantic import ValidationError
+from treekle import immutable
 
 import pytest
 
-from trackinizer.lib.codec import immutable
 from trackinizer.wire.wire_sessions import (
+    CONSOLE_RELAY_MARK,
+    ConsoleRelay,
+    ConsoleTarget,
     FeedCursor,
     FeedEvent,
     InboundDrainItem,
@@ -243,6 +246,36 @@ class TestPaths:
         assert session_inbound_path(sid) == f"/api/sessions/{sid}/inbound"
 
 
+class TestConsoleRelay:
+    def test_a_relay_reads_as_one_marked_line_naming_each_target(self) -> None:
+        relay = ConsoleRelay(
+            targets=[
+                ConsoleTarget(actor="lead-2", room=None),
+                ConsoleTarget(actor="tiles-a", room="ops"),
+            ],
+            text="rerun the suite",
+        )
+
+        assert CONSOLE_RELAY_MARK == "\u2192 "
+        assert relay.line() == "\u2192 lead-2, tiles-a:ops: rerun the suite"
+
+    def test_a_relay_names_a_target_and_has_words(self) -> None:
+        target = ConsoleTarget(actor="lead-2", room=None)
+        bad_bodies: list[dict[str, object]] = [
+            {"targets": [], "text": "go"},
+            {"targets": [target], "text": ""},
+            {"targets": [target], "text": "x" * 16_385},
+        ]
+        for bad in bad_bodies:
+            with pytest.raises(ValidationError):
+                ConsoleRelay.model_validate(bad)
+
+    def test_a_target_is_a_name_the_console_could_have_sent_to(self) -> None:
+        for bad in ({"actor": " "}, {"actor": "a", "room": " "}):
+            with pytest.raises(ValidationError):
+                ConsoleTarget.model_validate(bad)
+
+
 class TestInboundReadTimeout:
     @pytest.mark.parametrize("wait_sec", [0.5, 5.0, 30.0, 120.0])
     def test_a_drain_that_waits_gets_a_read_timeout_beyond_the_hold(
@@ -259,6 +292,6 @@ class TestInboundReadTimeout:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

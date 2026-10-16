@@ -84,6 +84,9 @@ line telling an agent how to use the machine, and labels. The registry only
 records machines; it never reaches one. Listing and showing need the writer
 role; setting, labelling and deleting need the admin role.
 
+On the machine's own host, `connect` joins with the enrollment token on stdin
+and heartbeats until the machine is revoked, using the machine's own credential.
+
 ```bash
 trax machine                                           # list
 trax machine gpu-box                                   # show one
@@ -91,6 +94,7 @@ trax machine gpu-box role to dev                       # set a field (creates)
 trax machine gpu-box how to @how.txt                   # how line from a file
 trax machine gpu-box label add gpu                     # add a label
 trax machine gpu-box del                               # unregister
+trax machine gpu-box connect < token                   # on the host: join, heartbeat
 ```
 
 ## Run (CLI shim)

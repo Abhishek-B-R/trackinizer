@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final, cast, override
 from uuid import UUID, uuid4
+
+from treekle import PlainTree, immutable
 
 import pytest
 
@@ -18,11 +21,12 @@ from trackinizer.lib.agent.sessions import (
 from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.lib.agent.types.sessions import (
     IncompleteRecord,
+    ShellCommandResult,
     Thinking,
     UncategorizedRecord,
     UserMessage,
 )
-from trackinizer.lib.codec import PlainTree, immutable
+from trackinizer.trax.run.custom_types import Event
 from trackinizer.trax.run.errors import (
     CiphertextDroppedError,
     LossyConversionError,
@@ -32,6 +36,12 @@ from trackinizer.trax.run.resume import (
     _read_part,
     _undroppable,
     prepare_resume,
+)
+from trackinizer.trax.run.sink import _record_body
+from trackinizer.trax.run.truncate import (
+    MAX_RECORD_BYTES,
+    MAX_TOOL_RESULT_BYTES,
+    NOTE,
 )
 from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.wire.wire_session_ir import PartBody, RecordBody
@@ -140,12 +150,12 @@ class TestWhichTargetsResume:
         client = _FakeClient("claude_sidechain.jsonl", session_format="claude")
 
         with pytest.raises(NotResumableError, match=target):
-            prepare_resume(cast_client(client), uuid4(), target)
+            prepare_resume(cast(Client, client), uuid4(), target)
 
     def test_claude_resumes(self) -> None:
         client = _FakeClient("claude_sidechain.jsonl", session_format="claude")
 
-        written = prepare_resume(cast_client(client), uuid4(), "claude")
+        written = prepare_resume(cast(Client, client), uuid4(), "claude")
 
         assert written.path.exists()
 
@@ -154,7 +164,7 @@ class TestWhichTargetsResume:
         """``codex resume <uuid>`` re-enters a rollout, so codex is a target."""
         client = _FakeClient("codex_main.jsonl", session_format="codex")
 
-        written = prepare_resume(cast_client(client), uuid4(), "codex")
+        written = prepare_resume(cast(Client, client), uuid4(), "codex")
 
         assert written.path.exists()
         assert written.path.name.startswith("rollout-")
@@ -168,7 +178,7 @@ class TestWhichTargetsResume:
         """
         client = _FakeClient("claude_sidechain.jsonl", session_format="claude")
 
-        written = prepare_resume(cast_client(client), uuid4(), "codex", lossy=True)
+        written = prepare_resume(cast(Client, client), uuid4(), "codex", lossy=True)
 
         assert written.path.exists()
         assert client.stamped == [str(written.cli_session_id)]
@@ -178,7 +188,7 @@ class TestWhichTargetsResume:
         client = _FakeClient("claude_sidechain.jsonl", session_format="")
 
         with pytest.raises(NotResumableError, match="no part with a native format"):
-            prepare_resume(cast_client(client), uuid4(), "claude")
+            prepare_resume(cast(Client, client), uuid4(), "claude")
 
 
 class TestTheStampPrecedesTheRun:
@@ -188,7 +198,7 @@ class TestTheStampPrecedesTheRun:
         """Without it the resumed run forks a second AgentSession."""
         client = _FakeClient("claude_sidechain.jsonl", session_format="claude")
 
-        written = prepare_resume(cast_client(client), uuid4(), "claude")
+        written = prepare_resume(cast(Client, client), uuid4(), "claude")
 
         assert client.stamped == [str(written.cli_session_id)]
 
@@ -196,7 +206,7 @@ class TestTheStampPrecedesTheRun:
         """``--resume <id>`` and the file on disk have to agree."""
         client = _FakeClient("claude_sidechain.jsonl", session_format="claude")
 
-        written = prepare_resume(cast_client(client), uuid4(), "claude")
+        written = prepare_resume(cast(Client, client), uuid4(), "claude")
 
         assert written.path.stem == client.stamped[0]
 
@@ -217,28 +227,28 @@ class TestLossyConversion:
         client = _FakeClient("claude_sidechain.jsonl", session_format=source)
         client.records = [UserMessage(content="kept"), IncompleteRecord(text=text)]
         with pytest.raises(LossyConversionError, match="IncompleteRecord"):
-            prepare_resume(cast_client(client), uuid4(), target)
+            prepare_resume(cast(Client, client), uuid4(), target)
         assert client.stamped == []
 
     def test_missing_seal_stamps_nothing(self) -> None:
         client = _FakeClient("claude_sidechain.jsonl", session_format="claude")
         client.records = [Thinking(encrypted="")]
         with pytest.raises(CiphertextDroppedError, match="no longer stored"):
-            prepare_resume(cast_client(client), uuid4(), "claude")
+            prepare_resume(cast(Client, client), uuid4(), "claude")
         assert client.stamped == []
 
     def test_failed_file_write_stamps_nothing(self, tmp_path: Path) -> None:
         client = _FakeClient("claude_sidechain.jsonl", session_format="claude")
         (tmp_path / "claude").write_text("not a directory")
         with pytest.raises(NotADirectoryError):
-            prepare_resume(cast_client(client), uuid4(), "claude")
+            prepare_resume(cast(Client, client), uuid4(), "claude")
         assert client.stamped == []
 
     def test_a_claude_session_is_never_lossy(self) -> None:
         """Same format in and out: nothing to drop, no flag needed."""
         client = _FakeClient("claude_sidechain.jsonl", session_format="claude")
 
-        assert prepare_resume(cast_client(client), uuid4(), "claude").path.exists()
+        assert prepare_resume(cast(Client, client), uuid4(), "claude").path.exists()
 
     @pytest.mark.compute_large_fixture
     def test_a_lossy_cross_format_resume_is_refused_without_the_flag(self) -> None:
@@ -250,13 +260,13 @@ class TestLossyConversion:
         client = _FakeClient("codex_main.jsonl", session_format="codex")
 
         with pytest.raises(LossyConversionError, match="--lossy"):
-            prepare_resume(cast_client(client), uuid4(), "claude")
+            prepare_resume(cast(Client, client), uuid4(), "claude")
 
     @pytest.mark.compute_large_fixture
     def test_the_flag_accepts_the_loss(self) -> None:
         client = _FakeClient("codex_main.jsonl", session_format="codex")
 
-        written = prepare_resume(cast_client(client), uuid4(), "claude", lossy=True)
+        written = prepare_resume(cast(Client, client), uuid4(), "claude", lossy=True)
 
         assert written.path.exists()
 
@@ -272,7 +282,7 @@ class TestLossyConversion:
         """
         client = _FakeClient("claude_sidechain.jsonl", session_format="claude")
 
-        written = prepare_resume(cast_client(client), uuid4(), "codex", lossy=True)
+        written = prepare_resume(cast(Client, client), uuid4(), "codex", lossy=True)
 
         rebuilt = Counter(
             type(record).__name__
@@ -280,7 +290,7 @@ class TestLossyConversion:
                 StringIO(written.path.read_text(encoding="utf-8")),
             )
         )
-        records, _ = _read_part(cast_client(client), uuid4(), 0)
+        records, _ = _read_part(cast(Client, client), uuid4(), 0)
         dropped = _undroppable(records, "claude", "codex")
 
         assert "ContextClear" not in dropped, (
@@ -298,7 +308,7 @@ class TestLossyConversion:
         and demand ``--lossy`` for a transcript that loses no turn at all.
         """
         client = _FakeClient("claude_sidechain.jsonl", session_format="claude")
-        records, _ = _read_part(cast_client(client), uuid4(), 0)
+        records, _ = _read_part(cast(Client, client), uuid4(), 0)
 
         dropped = _undroppable(records, "claude", "codex")
 
@@ -332,17 +342,88 @@ class TestLossyConversion:
         client = _FakeClient("codex_main.jsonl", session_format="codex")
 
         with pytest.raises(LossyConversionError):
-            prepare_resume(cast_client(client), uuid4(), "claude")
+            prepare_resume(cast(Client, client), uuid4(), "claude")
 
         assert client.stamped == []
 
 
-def cast_client(fake: _FakeClient) -> Client:
-    """Return the fake, as the ``Client`` the resume path declares."""
-    return cast(Client, fake)
+class _CapturedClient(_FakeClient):
+    """Serves each record as capture uploaded it: bounded, so a huge one arrives cut.
+
+    Inflates the fixture's one shell result past the tool-result budget and one
+    uncategorized line past every record's, the two places a cut leaves its note.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("claude_main.jsonl", session_format="claude")
+        line = next(
+            index
+            for index, record in enumerate(self.records)
+            if isinstance(record, UncategorizedRecord)
+        )
+        self.records = [
+            _inflated(record)
+            if index == line or isinstance(record, ShellCommandResult)
+            else record
+            for index, record in enumerate(self.records)
+        ]
+
+    @override
+    def read_session_records(
+        self,
+        session_id: UUID,
+        *,
+        part: int = 0,
+        **_: object,
+    ) -> list[RecordBody]:
+        del session_id, part
+        return [
+            _record_body(idx, Event(record=record, path=Path("s.jsonl")), redactor=None)
+            for idx, record in enumerate(self.records)
+        ]
+
+
+class TestTruncatedAtCapture:
+    """A record capture cut is a transcript the model never saw."""
+
+    def test_resuming_it_is_refused_without_the_flag(self) -> None:
+        client = _CapturedClient()
+
+        with pytest.raises(LossyConversionError, match="truncated at capture"):
+            prepare_resume(cast(Client, client), uuid4(), "claude")
+
+        assert client.stamped == []
+
+    def test_the_flag_resumes_it_with_the_marker_and_without_the_note(self) -> None:
+        """The note is Trackinizer's, never the CLI's; the marker is what the model reads."""
+        client = _CapturedClient()
+
+        written = prepare_resume(cast(Client, client), uuid4(), "claude", lossy=True)
+
+        text = written.path.read_text(encoding="utf-8")
+        assert text.count("Trackinizer capture truncated") >= 2
+        assert NOTE not in text
+
+    def test_a_session_nothing_was_cut_from_needs_no_flag(self) -> None:
+        client = _CapturedClient()
+        client.records = _records("claude_main.jsonl")[0]
+
+        assert prepare_resume(cast(Client, client), uuid4(), "claude").path.exists()
+
+
+def _inflated(record: TraxRecord) -> TraxRecord:
+    """Return ``record`` grown past its budget, if it is one this suite cuts."""
+    if isinstance(record, ShellCommandResult):
+        return replace(record, stdout="x" * MAX_TOOL_RESULT_BYTES)
+    if isinstance(record, UncategorizedRecord):
+        return replace(
+            record,
+            payload=immutable({**record.payload, "content": "y" * MAX_RECORD_BYTES}),
+        )
+    return record
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

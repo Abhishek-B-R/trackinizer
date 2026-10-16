@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Final
 
 import json
 
+from treekle import MutablePlainTree, from_plain, json_loads
+
 import pytest
 
 from trackinizer.lib.agent.sessions import codex
@@ -43,7 +45,6 @@ from trackinizer.lib.agent.types.sessions import (
     WebSearchResult,
     WebSearchResults,
 )
-from trackinizer.lib.codec import MutablePlainTree, from_plain, loads
 
 
 if TYPE_CHECKING:
@@ -363,7 +364,7 @@ def test_a_foreign_subtype_is_not_written_as_a_codex_role() -> None:
 
     codex.denormalize([SystemMessage(content="", subtype="turn_duration")], out)
 
-    outer = from_plain(loads(out.getvalue().splitlines()[0]), dict[str, object])
+    outer = json_loads(out.getvalue().splitlines()[0], dict[str, object])
     payload = from_plain(outer["payload"], dict[str, object])
     assert payload["role"] == "system"
 
@@ -1623,7 +1624,7 @@ def test_a_mistyped_field_aborts_neither_the_read_nor_the_write(index: int) -> N
     The rest of the rollout stays as written, so a line read in context -- a
     result after its call, an item after its turn -- meets its wrong field there.
     """
-    record = from_plain(loads(FIXTURE[index]), dict[str, object])
+    record = json_loads(FIXTURE[index], dict[str, object])
     failed: list[str] = []
     for path, changed in mistyped(record):
         records = list(codex.normalize(StringIO(_swapped(index, changed))))
@@ -1647,6 +1648,6 @@ def _swapped(index: int, record: object) -> str:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

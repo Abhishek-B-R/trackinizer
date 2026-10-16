@@ -13,11 +13,12 @@ from typing import TYPE_CHECKING, Self, cast
 
 import uuid
 
+from treekle import PlainTree, from_plain
+from treekle.absent import Absent
+
 import pytest
 
-from trackinizer.client.client import Client, EdgeWrite
-from trackinizer.lib.absent import Absent
-from trackinizer.lib.codec import PlainTree, from_plain
+from trackinizer.client.client import ArtifactRevision, Client, EdgeWrite
 from trackinizer.trax import cli
 from trackinizer.types.inquiries import Inquiry
 from trackinizer.wire.filters import (
@@ -377,6 +378,29 @@ class FakeClient:
             ),
         )
 
+    def transition_app(
+        self,
+        target_id: uuid.UUID,
+        *,
+        expected_from: dict[str, object] | None,
+        to: dict[str, object] | None,
+        actor: Inquiry.Actor,
+        reason: str = "",
+    ) -> None:
+        """Transition app."""
+        self.calls.append(
+            (
+                "transition_app",
+                (target_id,),
+                {
+                    "expected_from": expected_from,
+                    "to": to,
+                    "actor": actor,
+                    "reason": reason,
+                },
+            ),
+        )
+
     def submit(self, kind: Inquiry.InquiryKind, body: dict[str, object]) -> uuid.UUID:
         """Submit."""
         self.calls.append(("submit", (kind, body), {}))
@@ -409,8 +433,9 @@ class FakeClient:
         offset: int = 0,
         seq_ranges: Sequence[SeqRange] = (),
         filters: Sequence[Filter] = (),
+        fields: Sequence[str] | None = None,
     ) -> list[dict[str, PlainTree]]:
-        """List kind."""
+        """List kind; ``fields`` keeps only the named keys of each row."""
         self.calls.append(
             (
                 "list_kind",
@@ -464,6 +489,8 @@ class FakeClient:
             rows = [row for row in rows if row.get("status") == status]
         for filt in filters:
             rows = [row for row in rows if bool(match_filter(_storage_view(row), filt))]
+        if fields is not None:
+            rows = [{k: v for k, v in row.items() if k in fields} for row in rows]
         return cast(
             list[dict[str, PlainTree]],
             cast(
@@ -792,6 +819,30 @@ class FakeClient:
         """Purge."""
         self.calls.append(("purge", (target_id,), {"actor": actor, "reason": reason}))
 
+    def publish_artifact_content(
+        self,
+        issue_id: uuid.UUID,
+        *,
+        title: str,
+        summary: str,
+        html: str,
+        previous_id: uuid.UUID | None = None,
+    ) -> ArtifactRevision:
+        """Publish artifact content."""
+        self.calls.append(
+            (
+                "publish_artifact_content",
+                (issue_id,),
+                {
+                    "title": title,
+                    "summary": summary,
+                    "html": html,
+                    "previous_id": previous_id,
+                },
+            ),
+        )
+        return ArtifactRevision(artifact_id=uuid.uuid4(), revision=1)
+
     def session_start(self, body: SessionStart) -> SessionStartResponse:
         """Session start."""
         self.calls.append(("session_start", (body,), {}))
@@ -909,13 +960,14 @@ class FakeClient:
         masks: Sequence[MetricMaskClause],
         sort: str | None = None,
         limit: int | None = None,
+        offset: int | None = None,
     ) -> list[MetricPoint]:
         """Query metrics."""
         self.calls.append(
             (
                 "query_metrics",
                 (experiment_id,),
-                {"masks": tuple(masks), "sort": sort, "limit": limit},
+                {"masks": tuple(masks), "sort": sort, "limit": limit, "offset": offset},
             ),
         )
         return []
@@ -939,18 +991,19 @@ class FakeClient:
 
     def rank_metrics(
         self,
-        experiment_ids: Sequence[uuid.UUID],
+        experiment_ids: Sequence[uuid.UUID] | Sequence[Filter],
         *,
         masks: Sequence[MetricMaskClause],
         sort: str | None = None,
         limit: int | None = None,
+        offset: int | None = None,
     ) -> list[MetricRankRow]:
         """Rank metrics."""
         self.calls.append(
             (
                 "rank_metrics",
                 (tuple(experiment_ids),),
-                {"masks": tuple(masks), "sort": sort, "limit": limit},
+                {"masks": tuple(masks), "sort": sort, "limit": limit, "offset": offset},
             ),
         )
         return []
@@ -1029,6 +1082,28 @@ class FakeClient:
     ) -> dict[str, PlainTree]:
         """Highlight."""
         self.calls.append(("highlight", (workspace_id,), {"ids": list(ids)}))
+        return {"id": str(workspace_id), "revision": 0, "visuals": []}
+
+    def chat_window(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        hidden: bool,
+    ) -> dict[str, PlainTree]:
+        """Hide or show Chat."""
+        self.calls.append(("chat_window", (workspace_id,), {"hidden": hidden}))
+        return {"id": str(workspace_id), "revision": 0, "visuals": []}
+
+    def set_preferences(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        change: Mapping[str, object],
+    ) -> dict[str, PlainTree]:
+        """Change the station owner's preferences."""
+        self.calls.append(
+            ("set_preferences", (workspace_id,), {"change": dict(change)}),
+        )
         return {"id": str(workspace_id), "revision": 0, "visuals": []}
 
     def add_subscriber(

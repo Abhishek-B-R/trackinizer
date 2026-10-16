@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import AxeBuilder from "@axe-core/playwright";
 import type { APIRequestContext, Page } from "@playwright/test";
-import { expect, failedResource, test, streamOpened } from "./fixtures";
+import { expect, failedResource, setPreferences, streamOpened, test } from "./fixtures";
 import { openView, post } from "./listViews";
 
 // axe's WCAG 2.0 and 2.1 A and AA rules on each main view, in both themes. Each
@@ -16,15 +16,10 @@ for (const theme of ["dark", "light"] as const) {
     // tall enough to show each view's whole content: the console's feed, a
     // transcript.
     test.use({ viewport: { width: 1280, height: 3000 } });
+    // The sign-in page, which knows no one's theme yet, follows the system's appearance.
+    test.use({ colorScheme: theme });
     test.beforeEach(async ({ page }) => {
-      // The pre-paint snippet in index.html and login.html reads this key.
-      await page.addInitScript((choice) => {
-        try {
-          localStorage.setItem("trackinizer.theme", choice);
-        } catch {
-          // about:blank has no storage.
-        }
-      }, theme);
+      await setPreferences(page.request, { theme });
       // Reduced motion ends every transition at once, so a colour axe reads is
       // the one the element settles on, not a frame of a fade.
       await page.emulateMedia({ reducedMotion: "reduce" });
@@ -174,14 +169,14 @@ for (const theme of ["dark", "light"] as const) {
       const made = await post(request, "/api/me/tokens", { name, role: "viewer" });
       expect((await request.post(`/api/me/tokens/${made.id}/revoke`)).ok()).toBe(true);
       await page.goto("/app/#/settings");
-      await expect(page.getByRole("heading", { level: 1 })).toHaveText("Your settings");
+      await expect(page.getByRole("complementary", { name: "Your settings" }).getByRole("heading", { level: 1 })).toHaveText("Your settings");
       await expect(page.getByRole("region", { name: "API tokens" }).getByRole("row").filter({ hasText: name })).toContainText("revoked");
       await audit(page, theme, "Settings");
     });
 
     test("Admin", async ({ page }) => {
       await page.goto("/app/#/admin");
-      await expect(page.getByRole("heading", { level: 1 })).toHaveText("Admin");
+      await expect(page.getByRole("complementary", { name: "Admin" }).getByRole("heading", { level: 1 })).toHaveText("Admin");
       await expect(page.getByRole("region", { name: "Users" }).getByRole("row").filter({ hasText: "no-auth@localhost" })).toBeVisible();
       await audit(page, theme, "Admin");
     });

@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 __all__ = [
     "ContextGraphVisual",
+    "FilesVisual",
     "ParameterDescription",
     "StaticVisual",
     "TimelineVisual",
@@ -79,7 +80,7 @@ class VisualDescription(BaseModel):
     version: int = Field(ge=1)
     title: str = Field(min_length=1)
     description: str
-    requires: list[Literal["record", "session"]]
+    requires: list[Literal["record"]]
     default_size: Literal["compact", "wide"]
     parameter_schema: dict[str, ParameterDescription]
     record_kinds: list[str] | None = None
@@ -106,7 +107,7 @@ class StaticVisual:
 
     class Config(Fig["StaticVisual"]):
         type: str = ""
-        """Namespaced visual type such as `trax.chat`; keep it stable."""
+        """Namespaced visual type such as `trax.browse`; keep it stable."""
 
         version: int = 1
         """Renderer version; raise it when saved parameters cannot render."""
@@ -117,8 +118,8 @@ class StaticVisual:
         description: str = ""
         """One sentence saying what the visual shows."""
 
-        requires: list[Literal["record", "session"]] = field(
-            default_factory=list[Literal["record", "session"]],
+        requires: list[Literal["record"]] = field(
+            default_factory=list[Literal["record"]],
         )
         """Targets a show operation must supply for the visual."""
 
@@ -255,6 +256,46 @@ class ContextGraphVisual:
         )
 
 
+class FilesVisual:
+    """A record's files and what changed in them, each change with its diff."""
+
+    class Config(Fig["FilesVisual"]):
+        title: str = "Files"
+        """Name shown in the Configure panel."""
+
+    def __init__(self, config: Config) -> None:
+        """Keep the configured title until projection."""
+        self.config = config
+
+    def describe(self) -> VisualDescription:
+        """Describe the view and the narrowing a caller may set.
+
+        Returns:
+          description: Inert catalog entry carrying the narrowing's bounds.
+
+        """
+        return VisualDescription(
+            type="trax.files",
+            version=1,
+            title=self.config.title,
+            description=(
+                "A record's files and what changed in them, each change with its diff."
+            ),
+            requires=["record"],
+            default_size="wide",
+            parameter_schema={
+                # A path prefix (`loop/foo/`), or a glob when it holds `*` or `?`
+                # (`**/*.py`), matched without case; empty shows every path.
+                "path": ParameterDescription(type="string", default="", max_length=512),
+                # True hides the file tree, leaving only the changed files.
+                "changed": ParameterDescription(type="boolean", default=False),
+                # A changed file's path, or a name every changed file ending in
+                # `/<name>` matches, whose diff opens; it never narrows the list.
+                "file": ParameterDescription(type="string", default="", max_length=512),
+            },
+        )
+
+
 class Workspace:
     """The trusted composition of visual configs and its initial selection."""
 
@@ -267,13 +308,6 @@ class Workspace:
                     description="Browse trax records by kind and query.",
                     record_kinds=[],
                 ),
-                StaticVisual.Config(
-                    type="trax.chat",
-                    title="Chat",
-                    description="Talk with the assistant or a trax run session.",
-                    requires=["session"],
-                    default_size="compact",
-                ),
                 ContextGraphVisual.Config(),
                 TimelineVisual.Config(),
                 StaticVisual.Config(
@@ -283,6 +317,17 @@ class Workspace:
                     requires=["record"],
                     record_kinds=["Artifact"],
                 ),
+                StaticVisual.Config(
+                    type="trax.summary",
+                    title="Campaign summary",
+                    description=(
+                        "What a campaign did, for readers who may not read its "
+                        "transcripts: its sessions, steps, phases and beliefs."
+                    ),
+                    requires=["record"],
+                    record_kinds=["Issue", "AgentSession"],
+                ),
+                FilesVisual.Config(),
             ],
         )
         """Configured visual modules available to a workspace."""

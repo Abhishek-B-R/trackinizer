@@ -63,11 +63,13 @@ from trackinizer.trax.run.redact import Redactor, redactor_from_environ
 from trackinizer.trax.run.sink import (
     FileSink,
     LockedSink,
+    PrivateNotHeldError,
     ResilientSink,
     Sink,
     TrackinizerSink,
 )
 from trackinizer.trax.run.slash import SlashCommand, SlashCommandDetector
+from trackinizer.trax.run.worktree_diff import WorktreeDiff, open_worktree_diff
 
 
 if TYPE_CHECKING:
@@ -294,6 +296,12 @@ class RunConfig:
     """Initial room membership (``--room``, repeatable); namespaces the session
     can be addressed within. See :attr:`AgentSession.rooms`."""
 
+    private: bool = False
+    """Start the session hidden (``--private``), or hide the one a resume re-attaches:
+    its transcript is read by its owner and the people who oversee alone. A server that
+    would not hold it so leaves it as it was, or ends one it opened afresh, and the
+    run stops, exit status 2, before the CLI starts."""
+
     out_path: Path | None = None
     """JSONL output file; ``None`` defaults to the `usersdirs.state_dir()`."""
 
@@ -349,6 +357,11 @@ class RunConfig:
     delivery are unchanged -- only who sees the terminal differs.
     """
 
+    diff: bool = False
+    """Show the session's net ``git diff`` of the files it edits on its Trax
+    page, refreshed each turn. Off by default; a no-op when the run is not in a
+    git work tree. See :mod:`~trackinizer.trax.run.worktree_diff`."""
+
     SUPPORTED_CLIS: ClassVar[tuple[str, ...]] = tuple(_ADAPTERS)
 
     @property
@@ -391,6 +404,9 @@ def run(config: RunConfig) -> int:
             rc = _dry_run_drain(config, adapter, sink, stats)
         else:
             rc = _spawn_and_drain(config, adapter, sink, stats)
+    except PrivateNotHeldError as err:
+        sys.stderr.write(f"[trax run] {err}\n")
+        return 2
     finally:
         sink.close()
 
@@ -465,6 +481,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Namespace this session joins; address it as @<name>:<room>. "
             "Repeatable to join several rooms."
+        ),
+    )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help=(
+            "Start the session hidden: only you, staff and admins read it. Stops "
+            "before the CLI starts if the server will not hide it."
+        ),
+    )
+    parser.add_argument(
+        "--diff",
+        action="store_true",
+        help=(
+            "Show a live git diff of the files this session edits on its Trax "
+            "page, refreshed each turn. No effect outside a git work tree."
         ),
     )
     parser.add_argument(
@@ -589,6 +621,8 @@ def _run_flags(
             cli_args=(*resume_argv(flags.cli, cli_session_id), *cli_argv),
             actor=flags.actor or os.environ.get("AGENTNAME", "Agent"),
             rooms=tuple(flags.rooms or ()),
+            private=flags.private,
+            diff=flags.diff,
             out_path=flags.out,
             verbose=flags.verbose,
             dry_run=flags.dry_run,
@@ -623,6 +657,7 @@ def _open_trackinizer_sink(
             adapter.name,
             actor=config.actor,
             rooms=config.rooms,
+            private=config.private,
             redactor=redactor,
         ),
         fallback_path=_default_out_path(adapter.name),
@@ -706,6 +741,11 @@ def _spawn_and_drain(
     baseline = _existing_session_files(adapter, config)
     stop = threading.Event()
 
+    # The net worktree diff of the files this run edits, when asked for and when
+    # the cwd is in a git work tree; ``None`` otherwise, and the drain loop then
+    # does nothing for it.
+    worktree_diff = open_worktree_diff(Path.cwd()) if config.diff else None
+
     # Slash-commands the human types (``/exit``) are handled inside the CLI and
     # never logged, so the drain thread can't see them. The relay tees the
     # human's keystrokes into a detector (main thread); detected commands queue
@@ -745,6 +785,7 @@ def _spawn_and_drain(
     # (``session_meta`` at launch), and no later event ever names it.
     armed = threading.Event()
     drain_thread = threading.Thread(
+        name="drain",
         target=partial(
             _drain_filesystem_loop,
             adapter,
@@ -757,6 +798,7 @@ def _spawn_and_drain(
             stream_queue=stream_queue,
             armed=armed,
             owner=owner,
+            worktree_diff=worktree_diff,
         ),
         daemon=True,
     )
@@ -781,7 +823,16 @@ def _spawn_and_drain(
     # existing AgentSession instead of forking a second one.
     if config.cli_session_id is not None:
         sink.set_cli_session_id(config.cli_session_id)
-    granted_actor = sink.open()
+    try:
+        granted_actor = sink.open()
+    except PrivateNotHeldError:
+        # Nothing has spawned, so the drain has nothing to finish.
+        stop.set()
+        _join_with_watchdog(
+            drain_thread,
+            deadline=time.monotonic() + _JOIN_DEADLINE_SEC,
+        )
+        raise
     # Run the CLI on a PTY we own rather than letting it inherit the terminal:
     # owning the master fd is what lets the server splice messages into the
     # live session (the human still drives the native TUI). Byte-transparent,
@@ -822,6 +873,7 @@ def _spawn_and_drain(
     poll_thread: threading.Thread | None = None
     if config.syncing and config.client is not None:
         poll_thread = threading.Thread(
+            name="inbound poll",
             target=partial(
                 _inbound_poll_loop,
                 config.client,
@@ -859,14 +911,14 @@ def _spawn_and_drain(
         # lock with a short timeout and skips locked teardown rather than
         # deadlocking against a straggler that outlived the deadline.
         deadline = time.monotonic() + _JOIN_DEADLINE_SEC
-        _join_with_watchdog(drain_thread, "drain", deadline=deadline)
+        _join_with_watchdog(drain_thread, deadline=deadline)
         # Closed BEFORE the poller is joined: it is parked in a request the server
         # holds until a message arrives or the session ends, and this close ends the
         # session. Joined first, every exit would wait out the whole hold. ``run``
         # closes again on every path; the second close is a no-op.
         sink.close()
         if poll_thread is not None:
-            _join_with_watchdog(poll_thread, "inbound poll", deadline=deadline)
+            _join_with_watchdog(poll_thread, deadline=deadline)
     return rc
 
 
@@ -933,9 +985,10 @@ def _cli_arg_value(args: tuple[str, ...], flag: str) -> str | None:
 # first; a thread still alive at the deadline (a wedged blocking call) is logged and
 # left rather than hanging ``trax run`` forever, and ``LockedSink.close`` then declines
 # to block on the lock that straggler still holds.
+# The warning names the thread by its own ``name`` (``drain`` / ``inbound poll``), which
+# also lets ``py-spy`` and tracebacks identify a straggler.
 def _join_with_watchdog(
     thread: threading.Thread,
-    name: str,
     *,
     deadline: float,
 ) -> None:
@@ -943,7 +996,7 @@ def _join_with_watchdog(
     thread.join(timeout=max(0.0, deadline - time.monotonic()))
     if thread.is_alive():
         sys.stderr.write(
-            f"[trax run] {name} thread did not stop before the teardown "
+            f"[trax run] {thread.name} thread did not stop before the teardown "
             "deadline; proceeding to close\n",
         )
 
@@ -1132,6 +1185,7 @@ def _drain_filesystem_loop(
     stream_queue: deque[bytes] | None = None,
     armed: threading.Event | None = None,
     owner: _SessionOwner | None = None,
+    worktree_diff: WorktreeDiff | None = None,
 ) -> None:
     """Watch the adapter's session dirs; emit records as lines are appended."""
     asyncio.run(
@@ -1146,6 +1200,7 @@ def _drain_filesystem_loop(
             stream_queue=stream_queue,
             armed=armed,
             owner=owner,
+            worktree_diff=worktree_diff,
         ),
     )
 
@@ -1163,6 +1218,7 @@ async def _drain_until_stopped(
     replay: bool = False,
     armed: threading.Event | None = None,
     owner: _SessionOwner | None = None,
+    worktree_diff: WorktreeDiff | None = None,
 ) -> None:
     """Follow the session logs and drain the queues until ``stop``."""
     watched = tuple(d for d in adapter.session_dirs() if d.is_dir())
@@ -1204,7 +1260,14 @@ async def _drain_until_stopped(
                 slash_queue=slash_queue,
                 stream_queue=stream_queue,
             )
-            await _drain_lines(adapter, sink, stats, config, lines)
+            await _drain_lines(
+                adapter,
+                sink,
+                stats,
+                config,
+                lines,
+                worktree_diff=worktree_diff,
+            )
             _flush(sink)
             # Wait on the LINE queue, not a clock: a captured line wakes this
             # the moment the follower delivers it. The timeout is the ceiling
@@ -1215,9 +1278,22 @@ async def _drain_until_stopped(
             # ``put_nowait`` appends, so re-queueing it would move it BEHIND
             # every line the follower delivered while this waited, and the
             # transcript would record a later turn before an earlier one.
-            with contextlib.suppress(TimeoutError):
+            #
+            # A timeout is a quiet gap -- the turn's end, near enough -- so the
+            # worktree diff refreshes there (cheap unless an edit made it due).
+            try:
                 captured = await asyncio.wait_for(lines.get(), _QUEUE_DRAIN_SEC)
-                _emit_line(adapter, sink, stats, config, captured)
+            except TimeoutError:
+                _refresh_diff(worktree_diff, sink, force=False)
+            else:
+                _emit_line(
+                    adapter,
+                    sink,
+                    stats,
+                    config,
+                    captured,
+                    worktree_diff=worktree_diff,
+                )
         # The CLI has exited (or the replay is done), so its files are final:
         # the follower reads them to their ends and returns. Cancelling it
         # instead lost any file the kernel had not named yet -- on macOS a new
@@ -1229,7 +1305,14 @@ async def _drain_until_stopped(
             while not follower.done() or not lines.empty():
                 with contextlib.suppress(TimeoutError):
                     captured = await asyncio.wait_for(lines.get(), _QUEUE_DRAIN_SEC)
-                    _emit_line(adapter, sink, stats, config, captured)
+                    _emit_line(
+                        adapter,
+                        sink,
+                        stats,
+                        config,
+                        captured,
+                        worktree_diff=worktree_diff,
+                    )
             await follower
         await _drain_queues(
             adapter,
@@ -1239,8 +1322,18 @@ async def _drain_until_stopped(
             slash_queue=slash_queue,
             stream_queue=stream_queue,
         )
-        await _drain_lines(adapter, sink, stats, config, lines)
+        await _drain_lines(
+            adapter,
+            sink,
+            stats,
+            config,
+            lines,
+            worktree_diff=worktree_diff,
+        )
         _flush(sink)
+        # The last turn's edits may have arrived with no quiet gap after them;
+        # force a final refresh while the session is still live (before close).
+        _refresh_diff(worktree_diff, sink, force=True)
     finally:
         if follower is not None:
             _ = follower.cancel()
@@ -1431,6 +1524,8 @@ async def _drain_lines(
     stats: _Stats,
     config: RunConfig,
     lines: asyncio.Queue[_Captured],
+    *,
+    worktree_diff: WorktreeDiff | None = None,
 ) -> None:
     """Emit every line the follower has delivered so far."""
     while True:
@@ -1438,7 +1533,7 @@ async def _drain_lines(
             captured = lines.get_nowait()
         except asyncio.QueueEmpty:
             return
-        _emit_line(adapter, sink, stats, config, captured)
+        _emit_line(adapter, sink, stats, config, captured, worktree_diff=worktree_diff)
 
 
 # No line-level dedup. A record's stored key is its POSITION in the file's normalized
@@ -1452,6 +1547,8 @@ def _emit_line(
     stats: _Stats,
     config: RunConfig,
     captured: _Captured,
+    *,
+    worktree_diff: WorktreeDiff | None = None,
 ) -> None:
     """Emit one captured line."""
     # Backfill the CLI's own session id (the file names it) so a fresh run
@@ -1462,7 +1559,7 @@ def _emit_line(
         sink.set_cli_session_id(cli_session_id)
     if not captured.raw.strip():
         return
-    _process_chunk(captured, adapter, sink, stats, config)
+    _process_chunk(captured, adapter, sink, stats, config, worktree_diff=worktree_diff)
 
 
 # Guarded like the file path: this runs on the drain's own loop, where an escaping error
@@ -1491,6 +1588,31 @@ def _flush(sink: Sink) -> None:
         sink.flush()
     except Exception:
         _logger.warning("trax run: sink flush failed; continuing", exc_info=True)
+
+
+# Guarded like capture: a git or sink failure here must cost one refresh, not the
+# run. Runs on the drain thread (the single sink writer); the git it may run is
+# bounded, and at idle there is no line waiting for it to block.
+def _refresh_diff(
+    worktree_diff: WorktreeDiff | None,
+    sink: Sink,
+    *,
+    force: bool,
+) -> None:
+    """Refresh the worktree diff when one is tracked, surviving a failure."""
+    if worktree_diff is None:
+        return
+    try:
+        worktree_diff.refresh(
+            sink.emit_worktree_diff,
+            now=time.monotonic(),
+            force=force,
+        )
+    except Exception:
+        _logger.warning(
+            "trax run: worktree diff refresh failed; continuing",
+            exc_info=True,
+        )
 
 
 # NOT as records: a command is handled inside the TUI and never written to the session
@@ -1557,6 +1679,8 @@ def _process_chunk(
     sink: Sink,
     stats: _Stats,
     config: RunConfig,
+    *,
+    worktree_diff: WorktreeDiff | None = None,
 ) -> None:
     """Feed one chunk to the sink; never let a bug abort capture."""
     try:
@@ -1565,6 +1689,7 @@ def _process_chunk(
             captured.path,
             captured.raw,
             restart=captured.restart,
+            on_record=None if worktree_diff is None else worktree_diff.note,
         )
     except Exception:
         # ``exc_info`` so the swallowed failure carries a traceback: without it
@@ -1627,5 +1752,7 @@ class _Flags(Protocol):
     sync: bool
     actor: str | None
     rooms: list[str] | None
+    private: bool
+    diff: bool
     detach: bool
     name: str | None

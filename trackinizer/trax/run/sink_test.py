@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeGuard, cast, override
+from typing import TYPE_CHECKING, Final, TypeGuard, cast, override
 from uuid import UUID, uuid4
 
 import asyncio
@@ -14,25 +14,63 @@ import io
 import json
 import threading
 
+from treekle import from_plain, immutable, json_loads
+
+import httpx2
 import pytest
 
 from trackinizer.client.client import Client
-from trackinizer.lib.agent.types.sessions import AssistantMessage, ToolCall, UserMessage
-from trackinizer.lib.codec import from_plain, loads
+from trackinizer.client.errors import ClientError
+from trackinizer.lib.agent.types.sessions import (
+    AgentStatusResult,
+    AgentToAgentMessage,
+    AssistantMessage,
+    ContextClear,
+    ContextCompaction,
+    ContextState,
+    FileEditResult,
+    FileReadResult,
+    FileWriteResult,
+    IncompleteRecord,
+    ShellCommandResult,
+    Splice,
+    SystemMessage,
+    Thinking,
+    TokenUsage,
+    ToolCall,
+    TurnContext,
+    UncategorizedRecord,
+    UncategorizedToolResult,
+    UserMessage,
+    WebFetchResult,
+    WebSearchResult,
+    WebSearchResults,
+)
 from trackinizer.lib.posix.follow import follow_tree
 from trackinizer.trax.run.adapters.claude import ClaudeAdapter
+from trackinizer.trax.run.adapters.codex import CodexAdapter
 from trackinizer.trax.run.adapters.iostream import IOStreamAdapter, LineCapture
 from trackinizer.trax.run.custom_types import Event
 from trackinizer.trax.run.redact import Redactor
 from trackinizer.trax.run.sink import (
     FileSink,
     LockedSink,
+    PrivateNotHeldError,
     ResilientSink,
     Sink,
     TrackinizerSink,
 )
 from trackinizer.trax.run.slash import SlashCommand
+from trackinizer.trax.run.truncate import (
+    MAX_TOOL_RESULT_BYTES,
+    encoded_size,
+    was_truncated,
+)
+from trackinizer.trax.run.worktree_diff import WORKTREE_DIFF_PART
+from trackinizer.types.session_records import _BY_KIND, SessionRecordRow
+from trackinizer.types.streams import Stderr, Stdin, Stdout
 from trackinizer.wire.wire_session_ir import (
+    AppendRecordsRequest,
     AppendRecordsResponse,
     ManifestBody,
     RecordBody,
@@ -55,6 +93,65 @@ _PART = Path("/sessions/a.jsonl")
 _OTHER = Path("/sessions/b.jsonl")
 _AT = datetime(2026, 6, 1, tzinfo=UTC)
 
+_PROXY_LIMIT: Final = 8_000_000
+"""The live proxy's request-body cap: Caddy's ``8MB`` counts decimal megabytes."""
+
+_WORKER_LOG: Final = (
+    '\x1b[2K\r\x1b[36m[w3]\x1b[0m \x1b[2m22:45:01\x1b[0m\t{"step":120,"loss":0.25}'
+    " \x1b[32m━━━━\x1b[0m\x1b[1A" + "\x00" * 28 + "\n"
+)
+"""One line of the worker logs a scientist read in bulk: a progress bar, then the
+NUL padding of a preallocated log. Each control character takes six bytes on the
+wire, which is how ~1 MB of output became an 11.39 MB record."""
+
+_OVER_THE_LIMIT: Final = '\x00\x1b[0m"' * 500_000
+"""Text one copy of which is over 8 MB on the wire: each control character
+encodes as six bytes."""
+
+_OVERSIZED: Final[dict[str, Callable[[str], TraxRecord]]] = {
+    "AgentStatusResult": lambda text: AgentStatusResult(call_id="c", content=text),
+    "AgentToAgentMessage": lambda text: AgentToAgentMessage(content=text),
+    "AssistantMessage": lambda text: AssistantMessage(content=text),
+    "ContextClear": lambda text: ContextClear(history=(UserMessage(content=text),)),
+    "ContextCompaction": lambda text: ContextCompaction(summary=text),
+    "ContextState": lambda text: ContextState(content=text),
+    "FileEditResult": lambda text: FileEditResult(
+        call_id="c",
+        edits=(Splice(before=text, after=text),),
+    ),
+    "FileReadResult": lambda text: FileReadResult(call_id="c", content=text),
+    "FileWriteResult": lambda text: FileWriteResult(call_id="c", content=text),
+    "IncompleteRecord": lambda text: IncompleteRecord(text=text),
+    "ShellCommandResult": lambda text: ShellCommandResult(call_id="c", stdout=text),
+    "Stderr": lambda text: Stderr(text=text),
+    "Stdin": lambda text: Stdin(text=text),
+    "Stdout": lambda text: Stdout(text=text),
+    "SystemMessage": lambda text: SystemMessage(content=text),
+    "Thinking": lambda text: Thinking(content=text),
+    "TokenUsage": lambda text: TokenUsage(info=immutable({"note": text})),
+    "ToolCall": lambda text: ToolCall(
+        call_id="c",
+        name="Write",
+        arguments=immutable({"content": text}),
+    ),
+    "TurnContext": lambda text: TurnContext(extra=immutable({"instructions": text})),
+    "UncategorizedRecord": lambda text: UncategorizedRecord(
+        kind="k",
+        payload=immutable({"text": text}),
+    ),
+    "UncategorizedToolResult": lambda text: UncategorizedToolResult(
+        call_id="c",
+        content=text,
+    ),
+    "UserMessage": lambda text: UserMessage(content=text),
+    "WebFetchResult": lambda text: WebFetchResult(call_id="c", content=text),
+    "WebSearchResults": lambda text: WebSearchResults(
+        call_id="c",
+        content=(WebSearchResult(snippet=text),),
+    ),
+}
+"""One record of each stored kind, holding ``text`` where that kind holds prose."""
+
 
 def _event(content: str, *, path: Path = _PART, restart: bool = False) -> Event:
     """One captured user turn from ``path``."""
@@ -72,10 +169,10 @@ class TestFileSink:
         )
         lines = buf.getvalue().splitlines()
         assert len(lines) == 2
-        first = _row(lines[0])
+        first = json_loads((lines[0]), dict[str, object])
         # Position within the part, derived and numbered from 0.
         assert first["idx"] == 0
-        assert _row(lines[1])["idx"] == 1
+        assert json_loads((lines[1]), dict[str, object])["idx"] == 1
         assert first["kind"] == "UserMessage"
         assert first["adapter"] == "codex"
         # The BASENAME, matching how the server resolves a part.
@@ -95,7 +192,9 @@ class TestFileSink:
         sink.emit("claude", _event("a1", path=_PART))
         sink.emit("claude", _event("b1", path=_OTHER))
         sink.emit("claude", _event("a2", path=_PART))
-        rows = [_row(line) for line in buf.getvalue().splitlines()]
+        rows = [
+            json_loads(line, dict[str, object]) for line in buf.getvalue().splitlines()
+        ]
         assert [(r["part_name"], r["idx"]) for r in rows] == [
             ("a.jsonl", 0),
             ("b.jsonl", 0),
@@ -116,7 +215,10 @@ class TestFileSink:
         sink.restart(_PART)
         sink.emit("claude", _event("compacted", restart=True))
         sink.emit("claude", _event("after"))
-        idxs = [_row(line)["idx"] for line in buf.getvalue().splitlines()]
+        idxs = [
+            json_loads(line, dict[str, object])["idx"]
+            for line in buf.getvalue().splitlines()
+        ]
         assert idxs == [0, 1, 0, 1]
 
     def test_slash_command_is_written_as_its_own_shape(self) -> None:
@@ -125,7 +227,7 @@ class TestFileSink:
         sink = FileSink(buf)
         sink.emit_slash_command(SlashCommand(command="model", args="opus"), _AT)
         (line,) = buf.getvalue().splitlines()
-        row = _row(line)
+        row = json_loads(line, dict[str, object])
         command = row["slash_command"]
         assert isinstance(command, dict)
         assert command["command"] == "model"
@@ -145,9 +247,9 @@ class TestFileSink:
         sink.emit_slash_command(SlashCommand(command="exit"), _AT)
         sink.emit("claude", _event("after"))
         idxs = [
-            _row(line)["idx"]
+            json_loads(line, dict[str, object])["idx"]
             for line in buf.getvalue().splitlines()
-            if "idx" in _row(line)
+            if "idx" in json_loads(line, dict[str, object])
         ]
         assert idxs == [0, 1]
 
@@ -165,6 +267,9 @@ class _FakeClient:
         self.granted_actor: str | None = None
         self.start_seq = 0
         self._id = uuid4()
+        # How the server answers a start: what it was asked, or a fixed audience.
+        self.hides = True
+        self.audience: str | None = None
 
     def session_start(self, body: SessionStart) -> SessionStartResponse:
         self.started.append(body)
@@ -172,6 +277,9 @@ class _FakeClient:
             id=self._id,
             seq=self.start_seq,
             actor=self.granted_actor or body.actor,
+            audience=("private" if body.private else "open")
+            if self.hides
+            else self.audience,
         )
 
     def append_records(
@@ -218,7 +326,10 @@ class TestFileSinkWriteBody:
         sink.write_body("claude", _PART, body)
         sink.write_body("claude", _PART, body.model_copy(update={"idx": 1}))
         sink.emit("claude", _event("after replay"))
-        idxs = [_row(line)["idx"] for line in buf.getvalue().splitlines()]
+        idxs = [
+            json_loads(line, dict[str, object])["idx"]
+            for line in buf.getvalue().splitlines()
+        ]
         assert idxs == [0, 1, 2]
 
     def test_replay_advances_only_the_replayed_file(self) -> None:
@@ -227,7 +338,9 @@ class TestFileSinkWriteBody:
         sink = FileSink(buf)
         sink.write_body("claude", _PART, RecordBody(idx=7, kind="UserMessage"))
         sink.emit("claude", _event("other", path=_OTHER))
-        rows = [_row(line) for line in buf.getvalue().splitlines()]
+        rows = [
+            json_loads(line, dict[str, object]) for line in buf.getvalue().splitlines()
+        ]
         assert [(r["part_name"], r["idx"]) for r in rows] == [
             ("a.jsonl", 7),
             ("b.jsonl", 0),
@@ -519,6 +632,57 @@ class TestTrackinizerSink:
         assert body.ended is not None
 
 
+class TestAPrivateRun:
+    """``trax run --private`` sends nothing to a server that would not hide it."""
+
+    def test_a_server_that_hides_it_takes_the_run(self) -> None:
+        client = _FakeClient()
+        sink = TrackinizerSink(cast(Client, client), "claude", private=True)
+
+        sink.open()
+        sink.emit("claude", _event("hidden"))
+        sink.close()
+
+        assert [body.private for body in client.started] == [True]
+        assert len(client.appended) == 1
+
+    def test_a_fresh_sink_records_no_refusal_so_it_can_still_open(self) -> None:
+        """The refusal reason starts EMPTY -- a null would read the same in the
+        ``if self._refusal`` guard, so assert the value: it is what lets a sink
+        that has met no refusal open instead of re-raising a stored one.
+        """
+        sink = TrackinizerSink(cast(Client, _FakeClient()), "claude", private=True)
+        assert sink._refusal == ""
+        sink.open()  # Empty reason -> opens rather than raising PrivateNotHeldError.
+        assert sink.session_id is not None
+
+    @pytest.mark.parametrize(
+        "answered",
+        [None, "open"],
+        ids=["an older server", "open"],
+    )
+    def test_a_private_run_refuses_a_server_that_does_not_hide(
+        self,
+        tmp_path: Path,
+        answered: str | None,
+    ) -> None:
+        """The session it opened anyway is ended; no later send opens another."""
+        client = _FakeClient()
+        client.hides, client.audience = False, answered
+        primary = TrackinizerSink(cast(Client, client), "claude", private=True)
+        sink = ResilientSink(primary, fallback_path=tmp_path / "fallback.jsonl")
+
+        with pytest.raises(PrivateNotHeldError):
+            _ = sink.open()
+        primary.emit("claude", _event("never sent"))
+        with pytest.raises(PrivateNotHeldError):
+            primary.sync()
+
+        assert len(client.started) == 1
+        assert len(client.ended) == 1
+        assert client.appended == []
+
+
 class TestTrackinizerSinkManifestMetadata:
     """The manifest carries what a REWRITE needs, not just what a list shows."""
 
@@ -755,6 +919,76 @@ class _OutageClient(_FakeClient):
             raise RuntimeError("server down")
 
 
+class TestWorktreeDiffSink:
+    """``emit_worktree_diff`` stores the net diff beside the records."""
+
+    def test_diff_part_is_a_restart_with_an_empty_format(self) -> None:
+        """The diff is a restart append to a formatless part, so resume skips it."""
+        client = _FakeClient()
+        sink = _instant_sink(client)
+        sink.emit_worktree_diff(
+            [
+                FileEditResult(
+                    call_id="",
+                    path="a.py",
+                    edits=(Splice(before="old\n", after="new\n"),),
+                ),
+            ],
+        )
+        [(_, name, bodies, restart)] = client.appended
+        assert name == WORKTREE_DIFF_PART
+        assert restart is True
+        assert [body.kind for body in bodies] == ["FileEditResult"]
+        manifest = client.manifests[-1]
+        assert manifest.name == WORKTREE_DIFF_PART
+        assert manifest.format == ""
+        assert manifest.records == 1
+
+    def test_the_diff_passes_the_redactor(self) -> None:
+        """A secret the diff carries is masked, like every other stored record."""
+        client = _FakeClient()
+        sink = _instant_sink(client, redactor=Redactor({"K": _VALUE}))
+        sink.emit_worktree_diff(
+            [
+                FileEditResult(
+                    call_id="",
+                    path="a.py",
+                    edits=(Splice(before="old\n", after=f"token {_VALUE}\n"),),
+                ),
+            ],
+        )
+        stored = _stored_by(client)
+        assert _VALUE_ESCAPED not in stored
+        assert "[redacted:K]" in stored
+
+    def test_file_sink_writes_the_diff_part(self) -> None:
+        """A local-file run writes the diff under the diff part's name."""
+        buf = io.StringIO()
+        sink = FileSink(buf)
+        sink.emit_worktree_diff(
+            [
+                FileEditResult(
+                    call_id="",
+                    path="a.py",
+                    edits=(Splice(before="old\n", after="new\n"),),
+                ),
+                FileEditResult(
+                    call_id="",
+                    path="b.py",
+                    edits=(Splice(before="old\n", after="two\n"),),
+                ),
+            ],
+        )
+        rows = [
+            json_loads(line, dict[str, object]) for line in buf.getvalue().splitlines()
+        ]
+        assert [row["part_name"] for row in rows] == [
+            WORKTREE_DIFF_PART,
+            WORKTREE_DIFF_PART,
+        ]
+        assert {row["kind"] for row in rows} == {"FileEditResult"}
+
+
 class TestCatchUp:
     """A run that loses the server keeps capturing, and catches it up on return."""
 
@@ -784,7 +1018,10 @@ class TestCatchUp:
         assert _sent_positions(client) == [[0], [1, 2], [3]]
         # The local file holds the outage, numbered as the server numbers it.
         assert [
-            (_row(line)["text"], _row(line)["idx"])
+            (
+                json_loads(line, dict[str, object])["text"],
+                json_loads(line, dict[str, object])["idx"],
+            )
             for line in fallback_path.read_text(encoding="utf-8").splitlines()
         ] == [("during", 1), ("still down", 2)]
         err = capsys.readouterr().err
@@ -1012,6 +1249,11 @@ class _ExplodingSink(Sink):
         raise RuntimeError("server exploded")
 
     @override
+    def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+        del records
+        raise RuntimeError("server exploded")
+
+    @override
     def flush(self) -> None:
         pass
 
@@ -1069,7 +1311,7 @@ def _fallback_texts(path: Path) -> list[str]:
     """Return the ``text`` of each record row the fallback file holds."""
     texts: list[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
-        row = _row(line)
+        row = json_loads(line, dict[str, object])
         if "text" not in row:
             continue
         text = row["text"]
@@ -1147,7 +1389,7 @@ class TestResilientSink:
         sink.flush()
         sink.close()
         idxs = [
-            _row(line)["idx"]
+            json_loads(line, dict[str, object])["idx"]
             for line in fallback_path.read_text(encoding="utf-8").splitlines()
         ]
         assert idxs == [0, 1]
@@ -1304,7 +1546,7 @@ class TestResilientSink:
         sink.close()
 
         rows = [
-            _row(line)
+            json_loads(line, dict[str, object])
             for line in fallback_path.read_text(encoding="utf-8").splitlines()
         ]
         command = rows[0]["slash_command"]
@@ -1362,8 +1604,18 @@ class TestSinkFeed:
         sink = FileSink(buf)
         kinds = sink.feed(IOStreamAdapter(), _PART, b"hello\n")
         assert kinds == ["TurnContext", "ContextClear", "Stdout"]
-        rows = [_row(line) for line in buf.getvalue().splitlines()]
+        rows = [
+            json_loads(line, dict[str, object]) for line in buf.getvalue().splitlines()
+        ]
         assert rows[-1]["text"] == "hello\n"
+
+    def test_on_record_sees_each_record_the_chunk_produced(self) -> None:
+        """The diff capture reads edited paths through ``on_record``: one per record."""
+        buf = io.StringIO()
+        sink = FileSink(buf)
+        seen: list[TraxRecord] = []
+        kinds = sink.feed(IOStreamAdapter(), _PART, b"hello\n", on_record=seen.append)
+        assert [type(record).__name__ for record in seen] == kinds
 
     def test_two_files_get_separate_readers(self) -> None:
         """A shared reader would number the second file after the first.
@@ -1377,7 +1629,9 @@ class TestSinkFeed:
         adapter = IOStreamAdapter()
         sink.feed(adapter, _PART, b"a\n")
         sink.feed(adapter, _OTHER, b"b\n")
-        rows = [_row(line) for line in buf.getvalue().splitlines()]
+        rows = [
+            json_loads(line, dict[str, object]) for line in buf.getvalue().splitlines()
+        ]
         assert [(r["part_name"], r["idx"]) for r in rows] == [
             ("a.jsonl", 0),
             ("a.jsonl", 1),
@@ -1401,7 +1655,9 @@ class TestSinkFeed:
         sink.feed(adapter, _PART, b"one\n")
         sink.feed(adapter, _PART, b"two\n")
         sink.feed(adapter, _PART, b"rewritten\n", restart=True)
-        rows = [_row(line) for line in buf.getvalue().splitlines()]
+        rows = [
+            json_loads(line, dict[str, object]) for line in buf.getvalue().splitlines()
+        ]
         assert [r["idx"] for r in rows] == [0, 1, 2, 3, 0, 1, 2]
 
     def test_the_reader_comes_from_the_adapter(self) -> None:
@@ -1471,6 +1727,10 @@ class _BlockingSink(Sink):
     @override
     def emit_slash_command(self, command: SlashCommand, at: datetime) -> None:
         del command, at
+
+    @override
+    def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+        del records
 
     @override
     def flush(self) -> None:
@@ -1692,7 +1952,10 @@ def test_consecutive_restart_chunks(
             owner = primary if destination == "locked" else sink
             readers.append(owner.readers[_PART])
         if destination == "file":
-            positions = [_row(line)["idx"] for line in output.getvalue().splitlines()]
+            positions = [
+                json_loads(line, dict[str, object])["idx"]
+                for line in output.getvalue().splitlines()
+            ]
         else:
             sink.close()
             positions = [b.idx for _, _, bodies, _ in client.appended for b in bodies]
@@ -1716,7 +1979,10 @@ def test_restart_closes_displaced_reader_without_emitting_eof() -> None:
     try:
         reader.join(timeout=1)
         assert not reader.is_alive()
-        rows = [_row(line) for line in output.getvalue().splitlines()]
+        rows = [
+            json_loads(line, dict[str, object])
+            for line in output.getvalue().splitlines()
+        ]
         assert [row["idx"] for row in rows] == [0, 1, 2] * 2
         assert [row["kind"] for row in rows] == [
             "TurnContext",
@@ -1746,7 +2012,10 @@ def test_repeated_claude_replacement_pipeline(tmp_path: Path, *, server: bool) -
         positions = (
             [b.idx for _, _, bodies, _ in client.appended for b in bodies]
             if server
-            else [_row(line)["idx"] for line in output.getvalue().splitlines()]
+            else [
+                json_loads(line, dict[str, object])["idx"]
+                for line in output.getvalue().splitlines()
+            ]
         )
         assert positions == list(range(5)) * 3
         if server:
@@ -1812,7 +2081,10 @@ def test_restart_flush_failure_preserves_old_positions_in_fallback(
         sink.feed(IOStreamAdapter(), _PART, b"new\n", restart=True)
         sink.feed(IOStreamAdapter(), _PART, b"latest\n", restart=True)
         sink.flush()
-        rows = [_row(line) for line in fallback.read_text().splitlines()]
+        rows = [
+            json_loads(line, dict[str, object])
+            for line in fallback.read_text().splitlines()
+        ]
         assert [row["idx"] for row in rows] == [0, 1, 2] * 3
         assert all(row["adapter"] == "sh" for row in rows)
     finally:
@@ -1856,7 +2128,10 @@ def test_empty_restart_chunk_resets_only_its_part(*, server: bool) -> None:
                 False,
             ]
         else:
-            parsed = [_row(line) for line in output.getvalue().splitlines()]
+            parsed = [
+                json_loads(line, dict[str, object])
+                for line in output.getvalue().splitlines()
+            ]
             rows = [(row["part_name"], row["idx"]) for row in parsed]
         assert rows == [
             (_PART.name, 0),
@@ -2048,6 +2323,123 @@ class TestRedaction:
         sink.emit("claude", _event(_carrying_the_secret()))
         assert _VALUE_ESCAPED in buf.getvalue()
 
+    def test_a_secret_cut_in_two_by_truncation_is_still_redacted(self) -> None:
+        """Redacted BEFORE the cut: the redactor knows a value's prefix, not its tail.
+
+        Cutting first leaves the end of a value at the start of the kept tail,
+        where no redactor pattern reaches it.
+        """
+        secret = "".join(f"{n:05d}" for n in range(400))
+        client = _FakeClient()
+        sink = _instant_sink(client, redactor=Redactor({"K": secret}))
+        # Mostly secret, so a cut lands inside one; still over budget once masked.
+        shell = ShellCommandResult(call_id="c", stdout=f"{secret} {'x' * 300}\n" * 420)
+        sink.emit("claude", Event(record=shell, path=_PART))
+        sink.close()
+        stored = _stored_by(client)
+        assert "Trackinizer capture truncated" in stored
+        leaked = [n for n in range(len(secret) - 16) if secret[n : n + 16] in stored]
+        assert not leaked
+
+
+class TestOneRecordOverTheProxyLimit:
+    """One captured record larger than the proxy accepts must still upload.
+
+    Uploaded through the real :class:`Client` to a transport that refuses what
+    the live proxy refuses, so the bytes measured are the bytes sent.
+    """
+
+    @pytest.mark.compute_large_fixture
+    def test_the_record_that_hit_413_uploads_with_its_marker(self) -> None:
+        """~1 MB of shell output, stated three times by codex and once for search."""
+        line = _codex_shell_line((_WORKER_LOG * 10_000)[:1_050_000])
+        reader = CodexAdapter().reader()
+        (failing,) = [
+            r for r in reader.feed(line.decode()) if isinstance(r, ShellCommandResult)
+        ]
+        assert encoded_size(_uncut(failing)) > _PROXY_LIMIT
+        server = _Server()
+        sink = TrackinizerSink(server.client(), "codex")
+
+        _ = sink.feed(CodexAdapter(), _PART, line)
+        sink.close()
+
+        assert server.uploads
+        assert max(len(upload) for upload in server.uploads) <= _PROXY_LIMIT
+        (shell,) = [r for r in server.read_back() if isinstance(r, ShellCommandResult)]
+        assert was_truncated(shell)
+        item = from_plain(shell.extra["item"], dict[str, object])
+        for kept in (shell.stdout, item["aggregated_output"], item["formatted_output"]):
+            assert isinstance(kept, str)
+            assert (
+                "[Trackinizer capture truncated: kept beginning/end; omitted " in kept
+            )
+
+    @pytest.mark.compute_large_fixture
+    @pytest.mark.parametrize("kind", sorted(_OVERSIZED))
+    def test_a_record_of_every_kind_uploads(self, kind: str) -> None:
+        """Tool results are the usual culprit, but any kind can hold 8 MB."""
+        record = _OVERSIZED[kind](_OVER_THE_LIMIT)
+        assert encoded_size(_uncut(record)) > _PROXY_LIMIT
+        server = _Server()
+        sink = TrackinizerSink(server.client(), "claude")
+
+        sink.emit("claude", Event(record=record, path=_PART))
+        sink.close()
+
+        assert max(len(upload) for upload in server.uploads) <= _PROXY_LIMIT
+        (stored,) = server.read_back()
+        assert type(stored) is type(record)
+        assert was_truncated(stored)
+
+    def test_every_kind_has_an_oversized_example(self) -> None:
+        """A kind added to the store must be proven to upload, too."""
+        assert set(_OVERSIZED) == set(_BY_KIND)
+
+
+class TestTheBatchBytesBound:
+    """A batch is bounded by its bytes, not only by its count."""
+
+    def test_mid_size_records_go_in_requests_under_4_mib(self) -> None:
+        """Twelve 400 KiB records: no count trigger fires, and no one record is cut."""
+        server = _Server()
+        sink = TrackinizerSink(server.client(), "claude", batch_size=50)
+        for n in range(12):
+            sink.emit("claude", _event(f"{n}" * (200 << 10)))
+        assert server.uploads, "nothing was sent before the count trigger"
+
+        sink.close()
+
+        assert len(server.uploads) > 1
+        assert max(len(upload) for upload in server.uploads) <= (4 << 20) + (1 << 10)
+        assert [body.idx for body in server.records()] == list(range(12))
+
+    def test_a_record_larger_than_a_batch_goes_alone(self) -> None:
+        client = _FakeClient()
+        sink = TrackinizerSink(cast(Client, client), "claude", batch_bytes=1_000)
+        sink.emit("claude", _event("small"))
+        sink.emit("claude", _event("x" * 2_000))
+        sink.emit("claude", _event("small"))
+        sink.close()
+
+        assert _sent_positions(client) == [[0], [1], [2]]
+
+
+def test_the_out_file_holds_the_bounded_record() -> None:
+    """Local capture and upload share one bound: the file is what the server gets."""
+    buf = io.StringIO()
+    sink = FileSink(buf)
+    shell = ShellCommandResult(call_id="c", stdout="x" * MAX_TOOL_RESULT_BYTES)
+
+    sink.emit("codex", Event(record=shell, path=_PART))
+
+    (line,) = buf.getvalue().splitlines()
+    assert "Trackinizer capture truncated" in from_plain(
+        json_loads(line, dict[str, object])["text"],
+        str,
+    )
+    assert len(line) < 2 * MAX_TOOL_RESULT_BYTES
+
 
 def _carrying_the_secret() -> str:
     return f"raw {_VALUE} escaped {_VALUE_ESCAPED}"
@@ -2069,11 +2461,159 @@ def _stored_by(client: _FakeClient) -> str:
     )
 
 
-def _row(line: str) -> dict[str, object]:
-    return from_plain(loads(line), dict[str, object])
+class _Server:
+    """Answers as Trackinizer does, behind a proxy that refuses a body over 8 MB."""
+
+    def __init__(self) -> None:
+        self.session_id = uuid4()
+        self.uploads: list[bytes] = []
+
+    def client(self) -> Client:
+        """Return a real client whose requests reach this server and nothing else."""
+        client = Client("http://server")
+        client._http.close()
+        client._http = httpx2.Client(
+            base_url=client.base_url,
+            transport=httpx2.MockTransport(self._answer),
+        )
+        return client
+
+    def records(self) -> list[RecordBody]:
+        """Return every record body uploaded, in order."""
+        return [
+            body
+            for upload in self.uploads
+            for body in AppendRecordsRequest.model_validate_json(upload).records
+        ]
+
+    def read_back(self) -> list[TraxRecord]:
+        """Return every uploaded record as a server reader decodes it."""
+        return [body.row(self.session_id, 0).record() for body in self.records()]
+
+    def _answer(self, request: httpx2.Request) -> httpx2.Response:
+        if len(request.content) > _PROXY_LIMIT:
+            return httpx2.Response(413, text="Request Entity Too Large")
+        path = request.url.path
+        if path.endswith("/records"):
+            self.uploads.append(request.content)
+            return httpx2.Response(200, json={"written": 0, "skipped": 0})
+        if path.endswith("/start"):
+            return httpx2.Response(200, json={"id": str(self.session_id), "seq": 0})
+        return httpx2.Response(200, json={"id": str(self.session_id)})
+
+
+# Codex states the output three times -- ``stdout``, ``aggregated_output`` and
+# ``formatted_output`` -- and capture adds a fourth copy for search.
+def _codex_shell_line(output: str) -> bytes:
+    """Return one codex rollout line for a shell command that printed ``output``."""
+    item = {
+        "type": "CommandExecution",
+        "id": "exec-1",
+        "command": [
+            "/bin/bash",
+            "-lc",
+            "find runs -name '*.log' -exec sed -n '1,180p' {} \\;",
+        ],
+        "status": "completed",
+        "stdout": output,
+        "stderr": "",
+        "aggregated_output": output,
+        "exit_code": 0,
+        "duration": {"secs": 3, "nanos": 0},
+        "formatted_output": output,
+    }
+    event = {
+        "timestamp": "2026-09-17T22:45:02.000Z",
+        "type": "event_msg",
+        "payload": {"type": "item_completed", "item": item},
+    }
+    return (json.dumps(event) + "\n").encode()
+
+
+def _uncut(record: TraxRecord) -> RecordBody:
+    """Return the wire body ``record`` had before capture bounded records."""
+    return RecordBody.of(
+        SessionRecordRow.of(session_id=uuid4(), part=0, idx=0, record=record),
+    )
+
+
+class _RefusingClient(_FakeClient):
+    """Refuses, as the server does a value it cannot store, any batch with a NUL."""
+
+    @override
+    def append_records(
+        self,
+        session_id: UUID,
+        *,
+        name: str = "",
+        manifest: ManifestBody | None = None,
+        records: object = (),
+        restart: bool = False,
+        slash_commands: object = (),
+    ) -> AppendRecordsResponse:
+        if any("\x00" in body.text for body in cast(list[RecordBody], records)):
+            raise ClientError("cannot store", status_code=422)
+        return super().append_records(
+            session_id,
+            name=name,
+            manifest=manifest,
+            records=records,
+            restart=restart,
+            slash_commands=slash_commands,
+        )
+
+
+def _stored_kinds(client: _FakeClient) -> dict[int, str]:
+    return {
+        body.idx: body.kind for _, _, bodies, _ in client.appended for body in bodies
+    }
+
+
+class TestARefusedRecord:
+    """A record the server can never store must not hold back the rest of a run."""
+
+    def test_it_is_stood_in_and_every_other_record_and_command_is_sent(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        client = _RefusingClient()
+        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=50)
+        for text in ("one", "binary \x00 output", "three", "four"):
+            sink.emit("claude", _event(text))
+        sink.emit_slash_command(SlashCommand(command="model", args="opus"), _AT)
+
+        sink.close()
+
+        assert _stored_kinds(client) == {
+            0: "UserMessage",
+            1: "UncategorizedRecord",
+            2: "UserMessage",
+            3: "UserMessage",
+        }
+        assert [command.command for command in client.slash] == ["model"]
+        assert client.ended == [client._id]
+        assert "refused record 1 of a.jsonl (UserMessage)" in capsys.readouterr().err
+
+    def test_a_run_whose_record_is_refused_never_falls_back_to_local_capture(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        client = _RefusingClient()
+        fallback = tmp_path / "run.jsonl"
+        sink = ResilientSink(
+            TrackinizerSink(cast(Client, client), "claude", batch_size=2),
+            fallback_path=fallback,
+        )
+        for text in ("one", "binary \x00 output", "three", "four"):
+            sink.emit("claude", _event(text))
+
+        sink.close()
+
+        assert not fallback.exists()
+        assert sorted(_stored_kinds(client)) == [0, 1, 2, 3]
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

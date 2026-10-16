@@ -110,6 +110,13 @@ Two artifact boundaries are easy to get wrong:
 - An `agentsession` row is the captured session envelope; its transcript lives
   in `session_records`, outside normal inquiry edges and change logs.
 
+Every kind also has `app`: one JSON object where an app layered on trackinizer
+keeps its own fields about the row, under one key named for the app
+(`trax issue 7 app to '{"<app>": {...}}'`). Trackinizer never reads it, and it
+is not a filter field: an app finds its rows by labels and edges, and `app`
+holds only what the app knows about each one. Write the whole object; a write
+that must keep another writer's key compares and sets through the API.
+
 ## Editing Trackinizer/trax
 
 When changing Trackinizer, keep the skill aligned with the owning contracts:
@@ -335,6 +342,12 @@ Inspection: `trax graph --open-only`, `trax search <terms> --kind issue`,
 
 ## Agent-controlled canvas
 
+Two levers, kept apart. `trax workspace` moves attention: which visual shows,
+on which record, where. What a visual draws is rows: its record is the app's
+anchor row, and each row's `app.<app>` holds what the app knows about it
+(`trax experiment 12 app to '{"myapp": {...}}'`). To change what an app's visual
+shows inside, write its rows; the visual redraws on its next read.
+
 When a paired chat message includes a `workspace_id`, use that ID to inspect or
 change the user's canvas. The agent's trax profile must point at the same server
 as the browser workspace, and the session using its API key must be paired to
@@ -342,26 +355,42 @@ that workspace. Read the state before choosing an instance ID:
 
 ```bash
 trax workspace WORKSPACE_UUID
-trax workspace WORKSPACE_UUID show trax.chat --record RECORD_UUID --placement side
 trax workspace WORKSPACE_UUID show trax.subgraph --record RECORD_UUID \
   --param hops=2 --param highlight=UUID,UUID
 trax workspace WORKSPACE_UUID show trax.timeline --record RECORD_UUID --placement side
+trax workspace WORKSPACE_UUID show trax.files --record RECORD_UUID \
+  --param path='src/**/*.py' --param changed=true --param file=train.py
 trax workspace WORKSPACE_UUID focus INSTANCE_UUID
 trax workspace WORKSPACE_UUID place INSTANCE_UUID floating
 trax workspace WORKSPACE_UUID hide INSTANCE_UUID
 trax workspace WORKSPACE_UUID highlight RECORD_UUID,RECORD_UUID
-trax workspace WORKSPACE_UUID highlight ""
+trax workspace WORKSPACE_UUID hide chat
+trax workspace WORKSPACE_UUID show chat
+trax workspace WORKSPACE_UUID theme to light
+trax workspace WORKSPACE_UUID chat_style to null
 ```
 
-The catalog registers `trax.browse`, `trax.chat`, `trax.subgraph`, and
-`trax.timeline`. `trax.timeline` (Lineage and timeline) takes a record of any
-kind and shows its lead issues, bounded dated directions, results, and signed
-evidence; it is off in a new canvas. The context graph
-shows the record in the graph: what lies within `hops` of it (1 to 3, default
-2) lit, the ring past that dimmed, and the record and the inquiries `highlight`
-lists (comma-separated ids) haloed. Showing it again with only a new
-`--record` moves it there and keeps its hops and highlight; any `--param`
-sets them anew, each one it leaves out back to its default. Each write reads
+The catalog registers `trax.browse`, `trax.subgraph`, `trax.timeline`,
+`trax.artifact`, `trax.summary` and `trax.files`. `trax.timeline` (Lineage and
+timeline) takes a record of any kind and shows its lead issues, bounded dated
+directions, results, and signed evidence; it is off in a new canvas. The context
+graph shows the record in the graph: what lies within `hops` of it (1 to 3,
+default 2) lit, the ring past that dimmed, and the record and the inquiries
+`highlight` lists (comma-separated ids) haloed. `trax.files` (Files) takes a
+record of any kind and shows the newest files document filed for it: an Artifact
+labelled `files` and `files:of:<record uuid>` by a staff service account or by the
+account the record is filed under, such as the one the campaign summary service
+files for a campaign's lead and brief. A `files:of:` label is a link, never the
+key a producer refreshes its row by. It lists the tree's paths and each changed
+file with its diff. `path` narrows both lists, as a prefix (`src/foo/`) or,
+holding `*` or `?`, a glob (`**/*.py`; `**` crosses directories, `*` does not),
+case ignored; `changed=true` hides the tree; `file` opens the diff of the changed
+file at that path, or of every one with that name, among only those `path`
+leaves. `path` and `file` are at most 512 characters. A reader who narrows the
+pane writes these params too. Showing a visual again with
+only a new `--record` moves it there and keeps its params (the graph's hops and
+highlight, the files view's narrowing); any `--param` sets them anew, each one it
+leaves out back to its default. Each write reads
 the current revision and prints the resulting state. If another change wins the
 race and the server returns 409, read the workspace again before retrying.
 `highlight` points at what you are talking about: it marks up to 50 records, by
@@ -369,6 +398,17 @@ UUID, wherever the user's page draws them (graph nodes, list rows, a record's
 relations), and an empty list clears the marks. Like `navigate` it is an event:
 it changes no visual and no revision, a newer highlight replaces the last, and
 it is not replayed to a tab that was not listening.
+`hide chat` and `show chat` close and reopen the Chat window of the user's browser tab
+so they can look at what you showed; hide it when they should look at the page
+and show it when you want them to read your answer. It is an event too: no revision
+is read or changed, only an agent key may send it, and a reloaded tab shows Chat.
+`KEY to VALUE` changes one of the user's preferences (`theme`, `chat_style`,
+`chat_side`, `highlight_mentions`, `terminal_font_size`, `home`): theirs, not your
+account's, and every tab of theirs shows it at once. VALUE reads as JSON when it
+parses (`false`, `null`), else as text; `null` puts the key back to its default.
+`trax workspace WORKSPACE_UUID` prints the preferences as they stand. Only the
+station's assistant may do it, and only for these UI keys; the user's own data
+is not yours to read or set.
 Pairing and disconnecting remain browser actions.
 
 ## Decomposing a large task
@@ -419,10 +459,11 @@ value. Never echo a secret into a command, a row or your own output.
 ## Machines
 
 `trax machine` lists the machines campaigns may run on and `trax machine NAME`
-shows one, with its role, labels and `how` line (writer role). `trax machine
-NAME role to ROLE` and `how to TEXT` set a field and create the machine;
-`label add|del LABEL` and `del` change or unregister it (admin role). The
-registry only records machines; read `how` before using one.
+shows one, with its role, labels, `how` line and status (writer role). `trax
+machine NAME role to ROLE` and `how to TEXT` set a field and create the machine;
+`label add|del LABEL` and `del` change or unregister it (admin role). Read
+`how` before using one. The registry only records machines; it never reaches
+one.
 
 ## Recovery
 

@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 
 import json
 
+from treekle import from_plain, json_loads
+
 import pytest
 
 from trackinizer.lib.agent.sessions import claude, codex
@@ -34,7 +36,6 @@ from trackinizer.lib.agent.types.sessions import (
     SessionRecord,
     ToolCall,
 )
-from trackinizer.lib.codec import from_plain, loads
 
 
 if TYPE_CHECKING:
@@ -280,7 +281,7 @@ def test_editing_a_lifted_path_rewrites_the_replayed_command(
 def _replayed_command(native: str) -> str:
     """Return the Bash command a rewritten claude transcript carries."""
     for line in native.splitlines():
-        record = from_plain(loads(line), dict[str, object])
+        record = json_loads(line, dict[str, object])
         message = from_plain(record.get("message"), dict[str, object], default={})
         for block in from_plain(
             message.get("content"),
@@ -337,6 +338,6 @@ def test_a_session_with_no_shell_call_lifts_nothing() -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)
