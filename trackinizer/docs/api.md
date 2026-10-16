@@ -731,6 +731,7 @@ other annotation on it answers 422.
 
 ```
 GET /api/export
+GET /api/export?filter=<json>
 ```
 
 The whole graph as JSON lines (`application/x-ndjson`), for backup or a
@@ -742,6 +743,13 @@ reads another person's chat, and in `domain` or `individual` mode a person who i
 staff and no admin reads only their organisation's sessions, so an export is a whole
 backup only when nothing is withheld; its header counts what
 it left out. Read-only; nothing imports it yet. Line shape: section 3.24.
+
+A repeated `filter` narrows the export to the subgraph its clauses match,
+in the spelling section 3.3 already uses for a list query, and ANDed. Only
+`labels` may be filtered on. The inquiries decide the subgraph: an edge is
+exported when both of its ends were selected, and a change-log, metric or
+session row when the inquiry it hangs off was. The header then carries the
+selector, so a reader can tell one slice from a whole-graph backup.
 
 ### 1.24 Visual catalog and workspace
 
@@ -1834,6 +1842,17 @@ data: {"id": "<change_uuid>"}
 {"table": "edges", "row": {"from_id": "<uuid>", "edge_kind": "narrows", ...}}
 ...
 ```
+
+A filtered export carries the selector in its header and is otherwise the
+same shape:
+
+```
+{"format": "trackinizer-export", "version": 1, "migrations": [...],
+ "selector": [{"field": "labels", "op": "is", "value": "org:rekursiv"}]}
+```
+
+The key is absent, not empty, when nothing was selected, so a whole-graph
+export is byte-identical to one written before selectors existed.
 
 The first line is the header: `migrations` names the applied schema files,
 so a reader knows which columns the rows carry, and `audiences` names, sorted,

@@ -6,6 +6,20 @@ plain Python values; the route owns turning them into JSON lines. A pure leaf
 like :class:`_ReadMixin`: it reads through ``self.engine`` and calls no other
 mixin.
 
+A selector narrows the export to a subgraph. It picks the inquiries, and
+:data:`_SCOPE_COLUMNS` carries that choice to every other table: a row rides
+along when the inquiry it hangs off was selected. ``edges`` needs BOTH ends,
+since an edge to a row outside the selection would arrive dangling.
+Other IDs, including audit causes and embedded inquiry references, remain
+unchanged and may name rows outside the slice. They do not expand selection.
+
+Filters reuse :mod:`trackinizer.wire.filters` rather than a selector language
+of this module's own. The example in the request, ``org:rekursiv AND NOT
+machine:*``, is already two clauses the list queries can say: ``labels is
+org:rekursiv`` and ``labels nre ^machine:``. They AND, which is what a
+partition asks for and all the request asks for; OR would need a grammar, and
+no caller has needed one yet.
+
 Three choices worth knowing before changing this:
 
 * **One snapshot for every table.** Under ``--engine pg`` a write landing
@@ -42,13 +56,17 @@ from trackinizer.server.audience import (
     visible_sql,
 )
 from trackinizer.server.notify import tx
+from trackinizer.server.regex_timeout import apply_regex_statement_timeout
+from trackinizer.server.store.read import _lower_filter
 from trackinizer.server.store.shared import _StoreShared
 from trackinizer.server.values import vetted_sql
+from trackinizer.wire.filters import Filter
+from trackinizer.wire.row_filter import reject_inadmissible
 from trackinizer.wire.wire_export import EXPORT_TABLES
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from trackinizer.lib.postgres import Conn
 
@@ -77,6 +95,25 @@ _SKIPPED_COLUMNS: Final[Mapping[str, frozenset[str]]] = {
     "session_records": frozenset({"search"}),
 }
 
+_SCOPE_COLUMNS: Final[Mapping[str, tuple[str, ...]]] = {
+    "inquiries": ("id",),
+    # Both ends: an edge whose peer was not selected
+    # would name a row the reader never receives.
+    "edges": ("from_id", "to_id"),
+    # FK-free by design (it outlives its subject), so this is the one scope
+    # the schema does not enforce for us.
+    "change_log": ("subject_id",),
+    "experiment_metrics": ("experiment_id",),
+    "session_manifests": ("session_id",),
+    "session_records": ("session_id",),
+    "session_slash_commands": ("session_id",),
+}
+"""Per table, the columns that must name a selected inquiry.
+
+Every exported table hangs off ``inquiries`` by a single id, so a selector on
+the inquiries carries to all of them. A new table in :data:`EXPORT_TABLES`
+needs its entry here; ``export_pglite_test`` fails until it has one."""
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GraphExport:
@@ -93,6 +130,9 @@ class GraphExport:
         whole backup.
       tables: ``(table, rows)`` in :data:`EXPORT_TABLES` order; each row maps
         column name to value in the table's column order.
+      selector: The filters that narrowed this export, empty for a whole
+        graph. Carried so the header can say which subgraph this is: the rows
+        alone cannot tell a reader whether a row is absent or excluded.
 
     """
 
@@ -100,6 +140,7 @@ class GraphExport:
     audiences: tuple[str, ...]
     withheld_sessions: int
     tables: tuple[tuple[str, tuple[dict[str, object], ...]], ...]
+    selector: tuple[Filter, ...] = ()
 
 
 class _ExportMixin(_StoreShared):
@@ -109,8 +150,9 @@ class _ExportMixin(_StoreShared):
         self,
         *,
         reader: SessionReader = NOBODY,
+        selector: Sequence[Filter] = (),
     ) -> GraphExport:
-        """Read the whole graph in one read-only snapshot.
+        """Read the graph, or one selector's subgraph, in one read-only snapshot.
 
         Every table keyed by a session leaves out the rows of a session whose
         transcript ``reader`` may not read. The session's own row stays, as it does in
@@ -118,16 +160,20 @@ class _ExportMixin(_StoreShared):
 
         Args:
           reader: Who reads.
+          selector: Filters on ``inquiries``, ANDed. Empty exports everything.
 
         Returns:
           graph: The applied migrations, every exported table's rows, and how many
             sessions' transcripts it left out.
 
         """
+        scope, scope_params = _scope(selector)
         async with self.engine.acquire() as conn, tx(conn):
             await conn.execute(
                 "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
             )
+            if selector:
+                await apply_regex_statement_timeout(conn)
             # A fresh database applies the baseline and every numbered file in
             # one bootstrap, so they share ``applied_at``; the baseline still
             # came first, and a plain name tie-break would sort it after
@@ -140,16 +186,26 @@ class _ExportMixin(_StoreShared):
             tables = [
                 (
                     table,
-                    await _read_table(conn, table, columns[table], reader=reader),
+                    await _read_table(
+                        conn,
+                        table,
+                        columns[table],
+                        reader=reader,
+                        scope=scope,
+                        scope_params=scope_params,
+                    ),
                 )
                 for table in EXPORT_TABLES
             ]
-            params: list[object] = []
+            # Counted inside the selection: a session the selector left out is
+            # not missing from this file, it was never asked for.
+            params: list[object] = list(scope_params)
             withheld = await conn.fetchval(
                 vetted_sql(
                     "SELECT count(*) FROM inquiries AS withheld "
                     "WHERE withheld.kind = 'AgentSession' AND NOT ",
                     visible_sql("withheld", params=params, reader=reader),
+                    vetted_sql(" AND withheld.id IN (", scope, ")") if scope else "",
                 ),
                 *params,
             )
@@ -158,6 +214,7 @@ class _ExportMixin(_StoreShared):
             audiences=tuple(sorted(reader.audiences)),
             withheld_sessions=cast(int, withheld),
             tables=tuple(tables),
+            selector=tuple(selector),
         )
 
 
@@ -180,31 +237,64 @@ async def _exported_columns(conn: Conn) -> dict[str, tuple[tuple[str, bool], ...
     return {table: tuple(cols) for table, cols in columns.items()}
 
 
+# The selected ids are a SUBQUERY reused per table rather than a list read back and
+# bound per statement: the ids never leave the database, one plan serves every table,
+# and the repeated ``$n`` placeholders bind the same operands each time.
+def _scope(selector: Sequence[Filter]) -> tuple[str, list[object]]:
+    """Render ``selector`` as the subquery selecting its inquiry ids, or ``""``."""
+    if not selector:
+        return "", []
+    params: list[object] = []
+    clauses: list[str] = []
+    for filt in selector:
+        reject_inadmissible(filt)
+        clause = _lower_filter(filt, params)
+        if clause is None:
+            # Every filter the route admits lowers, so this is a programming
+            # error rather than bad input: a Python-evaluated clause would
+            # silently widen the subgraph to the whole graph.
+            raise ValueError(f"export selector does not lower to SQL: {filt}")
+        clauses.append(clause)
+    return vetted_sql("SELECT id FROM inquiries WHERE ", " AND ".join(clauses)), params
+
+
+def _scope_tests(table: str, scope: str) -> str:
+    """Render the test keeping only ``table``'s rows inside ``scope``."""
+    return " AND ".join(
+        vetted_sql('"', column, '" IN (', scope, ")")
+        for column in _SCOPE_COLUMNS[table]
+    )
+
+
 async def _read_table(
     conn: Conn,
     table: str,
     columns: tuple[tuple[str, bool], ...],
     *,
     reader: SessionReader,
+    scope: str = "",
+    scope_params: Sequence[object] = (),
 ) -> tuple[dict[str, object], ...]:
-    """Every row of ``table`` the caller may read, in its export order, as plain values."""
+    """Every in-scope row of ``table`` the caller may read, in export order, as plain values."""
     select = ", ".join(f'"{name}"' for name, _ in columns)
-    params: list[object] = []
+    # The scope's operands go first: its placeholders were numbered from ``$1``, and
+    # the audience test numbers its own after whatever is already here.
+    params: list[object] = list(scope_params)
+    conditions: list[str] = []
+    if scope:
+        conditions.append(_scope_tests(table, scope))
     # Audience: gated -- a table keyed by session leaves out the rows of a session
     # ``reader`` may not read. Found from the columns, so a session table the export
     # gains is gated without an edit here.
-    where = (
-        vetted_sql(
-            " WHERE ",
+    if any(name == "session_id" for name, _ in columns):
+        conditions.append(
             hidden_exists_sql(
                 f"{table}.session_id",
                 params=params,
                 reader=reader,
             ),
         )
-        if any(name == "session_id" for name, _ in columns)
-        else ""
-    )
+    where = vetted_sql(" WHERE ", " AND ".join(conditions)) if conditions else ""
     records = await conn.fetch(
         vetted_sql(
             "SELECT ",

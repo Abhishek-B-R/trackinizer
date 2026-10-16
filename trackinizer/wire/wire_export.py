@@ -20,6 +20,25 @@ Every later line is one row::
 
     {"table": "<name>", "row": {"<column>": <value>, ...}}
 
+A ``?filter=`` selector narrows the export to the subgraph whose inquiries
+match, and the header then carries what was asked for::
+
+    {"format": ..., "migrations": [...],
+     "selector": [{"field": "labels", "op": "is", "value": "org:rekursiv"}]}
+
+The key is ABSENT from a whole-graph export rather than empty, so those stay
+byte-identical to the ones written before selectors existed. A reader must
+not treat a subgraph as a graph: a row it does not find may be excluded
+rather than missing, so ``selector`` is the difference between a backup and
+one collaborator's slice.
+
+Only edge rows require both endpoints inside the slice. Other references,
+including ``change_log.caused_by`` and ``experiment_codechanges``, retain
+their original IDs and may point outside it. Following those IDs would
+include rows the selector excluded. A slice preserves those external
+references without including their targets; it is not a standalone restore
+package.
+
 Tables arrive in :data:`EXPORT_TABLES` order (a row's parent before the row)
 and each table in a fixed order, so an unchanged database exports
 byte-for-byte identically. Values are plain JSON: UUIDs and timestamps as
@@ -38,8 +57,10 @@ from typing import Final
 __all__ = [
     "EXPORT_API_PATH",
     "EXPORT_API_PATHS",
+    "EXPORT_FILTER_PARAM",
     "EXPORT_FORMAT",
     "EXPORT_MEDIA_TYPE",
+    "EXPORT_SELECTOR_FIELDS",
     "EXPORT_TABLES",
     "EXPORT_VERSION",
 ]
@@ -50,6 +71,19 @@ EXPORT_API_PATH: Final = "/api/export"
 
 EXPORT_API_PATHS: tuple[str, ...] = (EXPORT_API_PATH,)
 """Registry the route drift test checks against the live app and the docs."""
+
+EXPORT_FILTER_PARAM: Final = "filter"
+"""Repeated ``?filter=<json>`` selector clauses, ANDed. Same spelling as the
+list routes' own ``filter``, so one filter vocabulary serves both."""
+
+EXPORT_SELECTOR_FIELDS: Final = frozenset({"labels"})
+"""What a selector may filter on.
+
+Labels alone, because a label is what the deployments in the request
+partition by (``org:<x>``, ``machine:<host>``). Every other column selects
+rows that share a value rather than a partition, and a subgraph carved on
+``priority`` or ``title`` is a question nobody has asked. Widening this is
+one line when someone does."""
 
 EXPORT_MEDIA_TYPE: Final = "application/x-ndjson"
 

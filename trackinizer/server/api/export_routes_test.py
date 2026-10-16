@@ -7,8 +7,11 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from treekle import from_plain, json_loads
+import json
 
+from treekle import from_plain, json_loads, to_plain
+
+import asyncpg
 import pytest
 
 from trackinizer.server.api.conftest import (
@@ -19,6 +22,7 @@ from trackinizer.server.api.conftest import (
 from trackinizer.server.store.export import GraphExport
 from trackinizer.wire.wire_export import (
     EXPORT_API_PATH,
+    EXPORT_FILTER_PARAM,
     EXPORT_FORMAT,
     EXPORT_MEDIA_TYPE,
     EXPORT_VERSION,
@@ -26,11 +30,14 @@ from trackinizer.wire.wire_export import (
 
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from fastapi.testclient import TestClient
 
     from trackinizer.conftest import FakeEngine
     from trackinizer.server.audience import SessionReader
     from trackinizer.server.store.core import Store
+    from trackinizer.wire.filters import Filter, FilterOp
 
 
 _ISSUE: UUID = UUID("33333333-3333-3333-3333-333333333333")
@@ -75,12 +82,24 @@ def export_client(
     """Return a route client whose store exports :func:`_graph`."""
     client, store, _engine = route_client
 
-    async def export_graph(*, reader: SessionReader) -> GraphExport:
+    async def export_graph(
+        *,
+        reader: SessionReader,
+        selector: Sequence[Filter] = (),
+    ) -> GraphExport:
+        # Echoed back rather than applied: what the route owns is parsing the
+        # selector and putting it in the header, and the store's own tests
+        # cover the scoping it does with it.
         del reader
-        return _graph()
+        return replace(_graph(), selector=tuple(selector))
 
     monkeypatch.setattr(store, "export_graph", export_graph)
     return client
+
+
+def _selector_of(raw: str) -> dict[str, str]:
+    """One ``filter=`` param value as the route's query string spells it."""
+    return {EXPORT_FILTER_PARAM: raw}
 
 
 def test_the_header_comes_first_then_one_line_per_row(
@@ -139,6 +158,125 @@ def test_export_without_auth_is_401(export_client: TestClient) -> None:
     assert export_client.get(EXPORT_API_PATH).status_code == 401
 
 
+def test_a_selector_reaches_the_store_and_the_header(
+    export_client: TestClient,
+) -> None:
+    """The clause the caller sent is what the store is asked for, and what is said."""
+    r = export_client.get(
+        EXPORT_API_PATH,
+        params=_selector_of('{"field":"labels","op":"is","value":"org:rekursiv"}'),
+    )
+
+    assert r.status_code == 200
+    header = json_loads(r.text.splitlines()[0], dict[str, object])
+    assert header["selector"] == [
+        {"field": "labels", "op": "is", "value": "org:rekursiv"},
+    ]
+
+
+def test_clauses_arrive_in_the_order_they_were_sent(
+    export_client: TestClient,
+) -> None:
+    """Repeated params AND together, which is how the request spells a partition."""
+    r = export_client.get(
+        EXPORT_API_PATH,
+        params=[
+            (
+                EXPORT_FILTER_PARAM,
+                '{"field":"labels","op":"is","value":"org:rekursiv"}',
+            ),
+            (EXPORT_FILTER_PARAM, '{"field":"labels","op":"nre","value":"^machine:"}'),
+        ],
+    )
+
+    header = json_loads(r.text.splitlines()[0], dict[str, object])
+    assert header["selector"] == [
+        {"field": "labels", "op": "is", "value": "org:rekursiv"},
+        {"field": "labels", "op": "nre", "value": "^machine:"},
+    ]
+
+
+def test_an_unselectable_field_is_400_and_names_what_is_allowed(
+    export_client: TestClient,
+) -> None:
+    """A subgraph is carved on labels; ``title`` would be a different feature."""
+    r = export_client.get(
+        EXPORT_API_PATH,
+        params=_selector_of('{"field":"title","op":"is","value":"anything"}'),
+    )
+
+    assert r.status_code == 400
+    assert "labels" in str(from_plain(r.json(), dict[str, object])["detail"])
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param("not json at all", id="not-json"),
+        pytest.param('["labels","is","x"]', id="not-an-object"),
+        pytest.param('{"field":"labels","op":"is"}', id="no-value"),
+        pytest.param('{"field":"labels","op":"wat","value":"x"}', id="unknown-op"),
+        pytest.param('{"field":"labels","op":"re","value":"("}', id="bad-regex"),
+    ],
+)
+def test_a_malformed_clause_is_400_not_a_whole_graph(
+    export_client: TestClient,
+    raw: str,
+) -> None:
+    """The dangerous failure is a refused selector quietly exporting everything."""
+    r = export_client.get(EXPORT_API_PATH, params=_selector_of(raw))
+
+    assert r.status_code == 400
+
+
+def test_no_selector_leaves_the_key_out(export_client: TestClient) -> None:
+    """A whole-graph export is unchanged by this feature, header included."""
+    header = json_loads(
+        export_client.get(EXPORT_API_PATH).text.splitlines()[0],
+        dict[str, object],
+    )
+
+    assert "selector" not in header
+
+
+@pytest.mark.parametrize("op", ["lt", "le", "gt", "ge"])
+def test_label_ordering_is_a_client_error(
+    route_client: tuple[TestClient, Store, FakeEngine],
+    op: FilterOp,
+) -> None:
+    """The real store rejects unsupported operators before opening a connection."""
+    client, _store, engine = route_client
+    raw = json.dumps(to_plain({"field": "labels", "op": op, "value": "x"}))
+
+    response = client.get(EXPORT_API_PATH, params=_selector_of(raw))
+
+    assert response.status_code == 422
+    body = from_plain(response.json(), dict[str, object])
+    assert body["code"] == "validation"
+    assert "labels" in from_plain(body["detail"], str)
+    engine.conn.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [asyncpg.QueryCanceledError, asyncpg.InvalidRegularExpressionError],
+)
+def test_database_selector_failures_are_client_errors(
+    route_client: tuple[TestClient, Store, FakeEngine],
+    error_type: type[asyncpg.PostgresError],
+) -> None:
+    """Database rejection and cancellation cross the real store and HTTP guard."""
+    client, _store, engine = route_client
+    engine.conn.fetch.side_effect = [error_type("query refused"), []]
+
+    response = client.get(
+        EXPORT_API_PATH,
+        params=_selector_of('{"field":"labels","op":"re","value":"x"}'),
+    )
+
+    assert response.status_code == 400
+
+
 def test_the_export_is_read_for_the_audiences_of_its_caller(
     route_client: tuple[TestClient, Store, FakeEngine],
     monkeypatch: pytest.MonkeyPatch,
@@ -146,7 +284,12 @@ def test_the_export_is_read_for_the_audiences_of_its_caller(
     client, store, _engine = route_client
     asked: list[frozenset[str]] = []
 
-    async def export_graph(*, reader: SessionReader) -> GraphExport:
+    async def export_graph(
+        *,
+        reader: SessionReader,
+        selector: Sequence[Filter] = (),
+    ) -> GraphExport:
+        del selector
         asked.append(reader.audiences)
         return _graph()
 
