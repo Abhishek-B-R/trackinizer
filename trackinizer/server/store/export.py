@@ -10,6 +10,8 @@ A selector narrows the export to a subgraph. It picks the inquiries, and
 :data:`_SCOPE_COLUMNS` carries that choice to every other table: a row rides
 along when the inquiry it hangs off was selected. ``edges`` needs BOTH ends,
 since an edge to a row outside the selection would arrive dangling.
+Other IDs, including audit causes and embedded inquiry references, remain
+unchanged and may name rows outside the slice. They do not expand selection.
 
 Filters reuse :mod:`trackinizer.wire.filters` rather than a selector language
 of this module's own. The example in the request, ``org:rekursiv AND NOT
@@ -54,10 +56,12 @@ from trackinizer.server.audience import (
     visible_sql,
 )
 from trackinizer.server.notify import tx
+from trackinizer.server.regex_timeout import apply_regex_statement_timeout
 from trackinizer.server.store.read import _lower_filter
 from trackinizer.server.store.shared import _StoreShared
 from trackinizer.server.values import vetted_sql
 from trackinizer.wire.filters import Filter
+from trackinizer.wire.row_filter import reject_inadmissible
 from trackinizer.wire.wire_export import EXPORT_TABLES
 
 
@@ -93,7 +97,7 @@ _SKIPPED_COLUMNS: Final[Mapping[str, frozenset[str]]] = {
 
 _SCOPE_COLUMNS: Final[Mapping[str, tuple[str, ...]]] = {
     "inquiries": ("id",),
-    # Both ends, so the subgraph closes: an edge whose peer was not selected
+    # Both ends: an edge whose peer was not selected
     # would name a row the reader never receives.
     "edges": ("from_id", "to_id"),
     # FK-free by design (it outlives its subject), so this is the one scope
@@ -168,6 +172,8 @@ class _ExportMixin(_StoreShared):
             await conn.execute(
                 "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
             )
+            if selector:
+                await apply_regex_statement_timeout(conn)
             # A fresh database applies the baseline and every numbered file in
             # one bootstrap, so they share ``applied_at``; the baseline still
             # came first, and a plain name tie-break would sort it after
@@ -241,6 +247,7 @@ def _scope(selector: Sequence[Filter]) -> tuple[str, list[object]]:
     params: list[object] = []
     clauses: list[str] = []
     for filt in selector:
+        reject_inadmissible(filt)
         clause = _lower_filter(filt, params)
         if clause is None:
             # Every filter the route admits lowers, so this is a programming

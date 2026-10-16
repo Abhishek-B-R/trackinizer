@@ -7,8 +7,11 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from treekle import from_plain, json_loads
+import json
 
+from treekle import from_plain, json_loads, to_plain
+
+import asyncpg
 import pytest
 
 from trackinizer.server.api.conftest import (
@@ -34,7 +37,7 @@ if TYPE_CHECKING:
     from trackinizer.conftest import FakeEngine
     from trackinizer.server.audience import SessionReader
     from trackinizer.server.store.core import Store
-    from trackinizer.wire.filters import Filter
+    from trackinizer.wire.filters import Filter, FilterOp
 
 
 _ISSUE: UUID = UUID("33333333-3333-3333-3333-333333333333")
@@ -234,6 +237,44 @@ def test_no_selector_leaves_the_key_out(export_client: TestClient) -> None:
     )
 
     assert "selector" not in header
+
+
+@pytest.mark.parametrize("op", ["lt", "le", "gt", "ge"])
+def test_label_ordering_is_a_client_error(
+    route_client: tuple[TestClient, Store, FakeEngine],
+    op: FilterOp,
+) -> None:
+    """The real store rejects unsupported operators before opening a connection."""
+    client, _store, engine = route_client
+    raw = json.dumps(to_plain({"field": "labels", "op": op, "value": "x"}))
+
+    response = client.get(EXPORT_API_PATH, params=_selector_of(raw))
+
+    assert response.status_code == 422
+    body = from_plain(response.json(), dict[str, object])
+    assert body["code"] == "validation"
+    assert "labels" in from_plain(body["detail"], str)
+    engine.conn.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [asyncpg.QueryCanceledError, asyncpg.InvalidRegularExpressionError],
+)
+def test_database_selector_failures_are_client_errors(
+    route_client: tuple[TestClient, Store, FakeEngine],
+    error_type: type[asyncpg.PostgresError],
+) -> None:
+    """Database rejection and cancellation cross the real store and HTTP guard."""
+    client, _store, engine = route_client
+    engine.conn.fetch.side_effect = [error_type("query refused"), []]
+
+    response = client.get(
+        EXPORT_API_PATH,
+        params=_selector_of('{"field":"labels","op":"re","value":"x"}'),
+    )
+
+    assert response.status_code == 400
 
 
 def test_the_export_is_read_for_the_audiences_of_its_caller(

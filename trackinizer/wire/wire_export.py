@@ -32,6 +32,13 @@ not treat a subgraph as a graph: a row it does not find may be excluded
 rather than missing, so ``selector`` is the difference between a backup and
 one collaborator's slice.
 
+Only edge rows require both endpoints inside the slice. Other references,
+including ``change_log.caused_by`` and ``experiment_codechanges``, retain
+their original IDs and may point outside it. Following those IDs would
+include rows the selector excluded. A slice preserves those external
+references without including their targets; it is not a standalone restore
+package.
+
 Tables arrive in :data:`EXPORT_TABLES` order (a row's parent before the row)
 and each table in a fixed order, so an unchanged database exports
 byte-for-byte identically. Values are plain JSON: UUIDs and timestamps as
