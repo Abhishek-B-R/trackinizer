@@ -30,9 +30,11 @@ into the TUI and never written to the log -- so it travels its own way
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
+from pathlib import Path
 from typing import IO, TYPE_CHECKING, Protocol, cast, override
 from uuid import UUID, uuid4
 
@@ -41,10 +43,15 @@ import sys
 import threading
 import time
 
-from trackinizer.lib.codec import PlainTree, immutable
+from treekle import PlainTree, immutable
+
 from trackinizer.trax.run.custom_types import Event
 from trackinizer.trax.run.redact import redact_body
+from trackinizer.trax.run.refusal import send_isolating
+from trackinizer.trax.run.truncate import bounded, encoded_size
+from trackinizer.trax.run.worktree_diff import WORKTREE_DIFF_PART
 from trackinizer.types.session_records import SessionRecordRow
+from trackinizer.wire.audience import PRIVATE
 from trackinizer.wire.wire_session_ir import (
     MAX_RECORD_BATCH,
     ManifestBody,
@@ -55,14 +62,18 @@ from trackinizer.wire.wire_sessions import SessionEnd, SessionStart
 
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from trackinizer.client.client import Client
     from trackinizer.lib.agent.sessions.tail import Tail
+    from trackinizer.lib.agent.types.sessions import FileEditResult
     from trackinizer.trax.run.adapters.custom_types import Adapter
     from trackinizer.trax.run.redact import Redactor
     from trackinizer.trax.run.slash import SlashCommand
     from trackinizer.types.streams import TraxRecord
+
+
+# The source "file" the synthetic diff part is keyed by; its records carry no
+# position in any real log, so any path with this basename serves.
+_DIFF_PATH = Path(WORKTREE_DIFF_PART)
 
 
 class Sink(Protocol):
@@ -152,6 +163,22 @@ class Sink(Protocol):
         """
         ...
 
+    def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+        """Store the session's net worktree diff, overwriting the last one.
+
+        NOT transcript records: these are a derived view, held on a synthetic
+        part (:data:`~trackinizer.trax.run.worktree_diff.WORKTREE_DIFF_PART`)
+        whose format is empty, so a resume never replays it. The batch is a
+        RESTART, so it overwrites the previous refresh's records in place -- the
+        part is the current net diff, not an append log. Same audience as the
+        transcript, same redactor as every record.
+
+        Args:
+          records: One :class:`FileEditResult` per changed file, in order.
+
+        """
+        ...
+
     def feed(
         self,
         adapter: Adapter,
@@ -159,6 +186,7 @@ class Sink(Protocol):
         raw: bytes,
         *,
         restart: bool = False,
+        on_record: Callable[[TraxRecord], None] | None = None,
     ) -> list[str]:
         """Normalize one captured chunk into records and record each.
 
@@ -179,6 +207,10 @@ class Sink(Protocol):
           restart: Whether the file was REPLACED immediately before this
             chunk, which discards the reader's position -- the records that
             follow re-derive the part from its start.
+          on_record: Called with each normalized record before it is emitted,
+            for an observer that needs the records the chunk produced (the
+            worktree-diff capture reads edited paths this way). Runs on the
+            caller's thread, inside any ``feed`` lock.
 
         Returns:
           kinds: The record kind names this chunk produced, for the run's
@@ -197,6 +229,8 @@ class Sink(Protocol):
             self.readers[path] = reader
         kinds: list[str] = []
         for record in reader.feed(raw.decode(errors="replace")):
+            if on_record is not None:
+                on_record(record)
             self.emit(adapter.name, Event(record=record, path=path, restart=restart))
             kinds.append(type(record).__name__)
         return kinds
@@ -337,6 +371,22 @@ class FileSink(Sink):
         )
 
     @override
+    def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+        # Written as ordinary record lines under the diff part. A local file is
+        # an append log with no overwrite, so each refresh adds its lines afresh;
+        # the dedup upstream keeps that to one set per actual change.
+        for idx, record in enumerate(records):
+            self._write_record(
+                "",
+                _DIFF_PATH,
+                _record_body(
+                    idx,
+                    Event(record=record, path=_DIFF_PATH),
+                    redactor=self._redactor,
+                ),
+            )
+
+    @override
     def pending(self) -> list[tuple[Path, RecordBody]]:
         # Every emit writes through immediately; nothing is ever buffered.
         return []
@@ -400,6 +450,18 @@ class FileSink(Sink):
             self._closed = True
 
 
+class PrivateNotHeldError(RuntimeError):
+    """The server did not open a session asked to be ``private`` as ``private``.
+
+    A server that predates hiding a session ignores the request and opens it ``open``
+    instead, where every member of the organisation would read it. The session is
+    ended before a record is sent, and the run stops.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"{reason}; nothing was sent")
+
+
 class TrackinizerSink(Sink):
     """Open a Session, batch events to the ingest API, close on exit.
 
@@ -410,11 +472,16 @@ class TrackinizerSink(Sink):
     rather than the first event means taking an event never needs the server,
     so a run that could not open its session buffers until it can. A caller
     that captures no events still leaves no empty Session row. Events
-    flush on two triggers: the
-    buffer reaching ``batch_size`` (a busy burst), or :meth:`flush` finding
+    flush on three triggers: the
+    buffer reaching ``batch_size`` records or ``batch_bytes`` of wire bytes (a
+    busy burst), or :meth:`flush` finding
     the buffer older than ``flush_interval_sec`` (a quiet session the drain
     loop ticks). ``close`` flushes the remainder and ends the session. Retry
     and idempotency live in the :class:`Client`.
+
+    ``batch_bytes`` also caps each request a flush sends: the proxy refuses a
+    body over 8 MB, so a batch of records each well within its own bound could
+    still fail as a whole. 4 MiB leaves the rest for the request's own fields.
 
     Without the time trigger a short session would withhold every event until
     ``close`` (Ctrl-D), so the live viewer saw nothing stream; the interval
@@ -423,6 +490,11 @@ class TrackinizerSink(Sink):
     ``redactor`` masks secret values in every record and command before it is
     buffered, so neither a send, a retry nor the degrade seam's :meth:`pending`
     can carry one; ``None`` keeps them.
+
+    ``private`` asks the server to open the session hidden, and to hide the one it
+    resumes. One the server opens into any other audience is ended at once and
+    refused with :class:`PrivateNotHeldError`, and so is every later attempt, so not
+    a record reaches it.
     """
 
     def __init__(
@@ -432,8 +504,10 @@ class TrackinizerSink(Sink):
         *,
         actor: str | None = None,
         rooms: tuple[str, ...] = (),
+        private: bool = False,
         redactor: Redactor | None = None,
         batch_size: int = 50,
+        batch_bytes: int = 4 << 20,
         flush_interval_sec: float = 1.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -442,7 +516,12 @@ class TrackinizerSink(Sink):
         self._redactor = redactor
         self._actor = actor
         self._rooms = rooms
+        self._private = private
+        # Why the server would not hold a session asked to be private as private;
+        # set, no session is opened again.
+        self._refusal = ""
         self._batch_size = batch_size
+        self._batch_bytes = batch_bytes
         self._flush_interval_sec = flush_interval_sec
         self._clock = clock
         # When the run began. A session that could not open then (the server was
@@ -453,7 +532,8 @@ class TrackinizerSink(Sink):
         # The CLI's own session id, discovered mid-run and backfilled at close
         # so a fresh run becomes resumable on its next ``--resume``.
         self._cli_session_id: str | None = None
-        self._buffer: list[tuple[Path, RecordBody]] = []
+        # Each body with its wire size, measured once: both batch bounds read it.
+        self._buffer: list[tuple[Path, RecordBody, int]] = []
         # Typed commands awaiting the next flush. Not in ``_buffer``: they
         # belong to the session rather than to any file, so they cannot be
         # grouped by path.
@@ -467,6 +547,9 @@ class TrackinizerSink(Sink):
         # One IR id per file, minted on first send: the manifest records what
         # the file declared, and a fresh id per BATCH would rewrite it.
         self._ir_ids: dict[Path, UUID] = {}
+        # The synthetic diff part's IR id, minted once and reused so each
+        # refresh redeclares the same part rather than minting a new one.
+        self._diff_ir_id: UUID | None = None
         # Set whenever the buffer fills from empty, so this value is never read.
         self._oldest_buffered_at: float | None = None  # pragma: no mutate
         self._closed = False  # pragma: no mutate -- read only for truthiness.
@@ -494,10 +577,13 @@ class TrackinizerSink(Sink):
         self._next_idx[event.path] = idx + 1
         if not self._buffer:
             self._oldest_buffered_at = self._clock()
-        self._buffer.append(
-            (event.path, _record_body(idx, event, redactor=self._redactor)),
-        )
-        if len(self._buffer) >= self._batch_size:
+        body = _record_body(idx, event, redactor=self._redactor)
+        # Buffered before any send, so a send that fails leaves it in ``pending``.
+        self._buffer.append((event.path, body, encoded_size(body)))
+        if (
+            len(self._buffer) >= self._batch_size
+            or sum(size for _, _, size in self._buffer) >= self._batch_bytes
+        ):
             self._flush()
 
     @override
@@ -521,6 +607,37 @@ class TrackinizerSink(Sink):
                 command=_redacted(command.command, redactor=self._redactor),
                 args=_redacted(command.args, redactor=self._redactor),
             ),
+        )
+
+    @override
+    def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+        self._ensure_session()
+        session_id = cast("UUID", self._session_id)
+        if self._diff_ir_id is None:
+            self._diff_ir_id = uuid4()
+        bodies = [
+            _record_body(
+                idx,
+                Event(record=record, path=_DIFF_PATH),
+                redactor=self._redactor,
+            )
+            for idx, record in enumerate(records)
+        ]
+        # A RESTART with an empty format: it overwrites the previous refresh in
+        # place (the part is the CURRENT diff), and a formatless part is searchable
+        # but never resumable, so the diff is never replayed into a CLI.
+        self._client.append_records(
+            session_id,
+            name=WORKTREE_DIFF_PART,
+            manifest=ManifestBody(
+                name=WORKTREE_DIFF_PART,
+                metadata={},
+                ir_id=self._diff_ir_id,
+                format="",
+                records=len(bodies),
+            ),
+            records=bodies,
+            restart=True,
         )
 
     @override
@@ -560,6 +677,8 @@ class TrackinizerSink(Sink):
     def _ensure_session(self) -> None:
         if self._session_id is not None:
             return
+        if self._refusal:
+            raise PrivateNotHeldError(self._refusal)
         resp = self._client.session_start(
             SessionStart(
                 cli=self._cli,
@@ -572,8 +691,20 @@ class TrackinizerSink(Sink):
                 # (the CLI has not written its file), so this is null there
                 # and the id is backfilled at close instead.
                 cli_session_id=self._cli_session_id,
+                private=self._private,
             ),
         )
+        # A server that hides sessions opens a private run's session private, and
+        # hides the open one it resumes, or refuses; only one that predates hiding
+        # opens it into another audience. Ended before anything is sent, so none of
+        # the run reaches it.
+        if self._private and resp.audience != PRIVATE:
+            self._refusal = (
+                "the server predates hiding a session, so the session it opened for "
+                "this run was ended"
+            )
+            self._client.session_end(resp.id, SessionEnd(ended=datetime.now(UTC)))
+            raise PrivateNotHeldError(self._refusal)
         self._session_id = resp.id
         # ``resp.seq`` is deliberately unread. It continued the legacy event
         # log, which a resumed run had to seed from; a record's key is derived
@@ -598,7 +729,7 @@ class TrackinizerSink(Sink):
         buffered here, to be sent once it does. Each carries its own position, so
         the file stores them verbatim.
         """
-        return list(self._buffer)
+        return [(path, body) for path, body, _ in self._buffer]
 
     @override
     def positions(self) -> dict[Path, int]:
@@ -610,8 +741,9 @@ class TrackinizerSink(Sink):
 
     # One part per request: the server resolves a part from the file's basename, so
     # records from two files cannot share a request without one of them landing under
-    # the wrong part. A part holding more than one request may carry -- a backlog a
-    # server outage built up -- goes in several, each a restart if the batch is.
+    # the wrong part. A part holding more than one request may carry -- by count, or
+    # by bytes the proxy would refuse; a backlog a server outage built up -- goes in
+    # several, each a restart if the batch is.
     #
     # Buffered slash commands ride the FIRST request, so they commit in the same
     # transaction as the turns around them. A batch with no records at all still sends
@@ -623,30 +755,26 @@ class TrackinizerSink(Sink):
             return
         self._ensure_session()
         session_id = cast("UUID", self._session_id)
-        by_path: dict[Path, list[RecordBody]] = {}
-        for path, body in self._buffer:
-            by_path.setdefault(path, []).append(body)
+        by_path: dict[Path, list[tuple[RecordBody, int]]] = {}
+        for path, body, size in self._buffer:
+            by_path.setdefault(path, []).append((body, size))
         for path, bodies in by_path.items():
-            for start in range(0, len(bodies), MAX_RECORD_BATCH):
-                self._client.append_records(
-                    session_id,
-                    name=path.name,
-                    manifest=ManifestBody(
-                        name=path.name,
-                        metadata=self._metadata_for(path),
-                        ir_id=self._ir_ids.setdefault(path, uuid4()),
-                        format=self._cli,
-                        records=self._next_idx.get(path, 0),
-                    ),
-                    records=bodies[start : start + MAX_RECORD_BATCH],
-                    restart=path in self._restarted,
-                    slash_commands=self._slash,
-                )
-                # Cleared only once the request RETURNED. A command's ``seq`` is
-                # server-assigned, so a resend after a failure partway through
-                # would store a second copy rather than collide -- unlike a
-                # record, whose derived key makes a retry a no-op.
-                self._slash = []
+            for records in _batches(
+                bodies,
+                max_records=MAX_RECORD_BATCH,
+                max_bytes=self._batch_bytes,
+            ):
+                # A record the server refuses goes up as a stand-in rather than
+                # failing the batch: resent, it would be refused again, and the
+                # records after it would wait behind it for good.
+                for refused in send_isolating(
+                    partial(self._send, session_id, path),
+                    records=records,
+                ):
+                    sys.stderr.write(
+                        f"[trax run] the server refused record {refused.idx} of "
+                        f"{path.name} ({refused.kind}); a stand-in holds its place\n",
+                    )
             self._restarted.discard(path)
             # Sent with the first part only; the rest carry records alone.
             self._buffer = [entry for entry in self._buffer if entry[0] != path]
@@ -655,6 +783,28 @@ class TrackinizerSink(Sink):
             self._slash = []
         self._buffer = []
         self._oldest_buffered_at = None
+
+    def _send(self, session_id: UUID, path: Path, records: list[RecordBody]) -> None:
+        """Append one batch of ``path``'s records, with the commands typed since."""
+        self._client.append_records(
+            session_id,
+            name=path.name,
+            manifest=ManifestBody(
+                name=path.name,
+                metadata=self._metadata_for(path),
+                ir_id=self._ir_ids.setdefault(path, uuid4()),
+                format=self._cli,
+                records=self._next_idx.get(path, 0),
+            ),
+            records=records,
+            restart=path in self._restarted,
+            slash_commands=self._slash,
+        )
+        # Cleared only once the request RETURNED. A command's ``seq`` is
+        # server-assigned, so a resend after a failure partway through would store
+        # a second copy rather than collide -- unlike a record, whose derived key
+        # makes a retry a no-op.
+        self._slash = []
 
     # Not decoration, and not derivable server-side: claude's ascii-escaping convention
     # (a majority flag plus its exception bitmap) rides on the ``TurnContext`` in force,
@@ -706,6 +856,11 @@ class TrackinizerSink(Sink):
 # Built through :class:`SessionRecordRow` rather than field by field, so the ciphertext
 # split and the search projection are computed in ONE place and the stored row cannot
 # disagree with what the wire carried.
+#
+# The one place local and server capture share, so the bound applies to both and a
+# local file holds what the server would. Bounded AFTER redaction: a cut can split a
+# secret, and the redactor recognizes a value's beginning but never its end -- the
+# end left at the start of the kept tail would go out unmasked.
 def _record_body(idx: int, event: Event, *, redactor: Redactor | None) -> RecordBody:
     """Return the wire body for one captured record at position ``idx``."""
     # ``session_id`` is the server's to assign; the row type needs one, and
@@ -716,7 +871,7 @@ def _record_body(idx: int, event: Event, *, redactor: Redactor | None) -> Record
         idx=idx,
         record=event.record,
     )
-    return redact_body(RecordBody.of(row), redactor=redactor)
+    return bounded(redact_body(RecordBody.of(row), redactor=redactor))
 
 
 def _redacted(text: str, *, redactor: Redactor | None) -> str:
@@ -788,11 +943,15 @@ class ResilientSink(Sink):
 
     # The runner opens the sink before spawning the child CLI, so an open failure
     # (server unreachable) must degrade like any other rather than abort the run. The
-    # session then opens when the server is back, on the first send.
+    # session then opens when the server is back, on the first send. A run asked to be
+    # private that the server would not hide is the exception: it stops before the CLI
+    # starts, rather than capture what its owner meant no one else to read.
     @override
     def open(self) -> str | None:
         try:
             return self._primary.open()
+        except PrivateNotHeldError:
+            raise
         except Exception as err:  # noqa: BLE001 -- an open failure degrades like an emit failure.
             _ = self._degrade(err)
             return None
@@ -815,6 +974,18 @@ class ResilientSink(Sink):
                 taken_before_sending=True,
             ),
             mirror=lambda fallback: fallback.emit_slash_command(command, at),
+        )
+
+    @override
+    def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+        # Sent, not buffered, so a send that fails is held and mirrored to the
+        # local file; a restart append makes a replay on recovery idempotent.
+        self._forward(
+            _Held(
+                apply=lambda sink: sink.emit_worktree_diff(records),
+                taken_before_sending=False,
+            ),
+            mirror=lambda fallback: fallback.emit_worktree_diff(records),
         )
 
     @override
@@ -1020,6 +1191,11 @@ class LockedSink(Sink):
             self._inner.emit_slash_command(command, at)
 
     @override
+    def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+        with self._lock:
+            self._inner.emit_worktree_diff(records)
+
+    @override
     def feed(
         self,
         adapter: Adapter,
@@ -1027,12 +1203,19 @@ class LockedSink(Sink):
         raw: bytes,
         *,
         restart: bool = False,
+        on_record: Callable[[TraxRecord], None] | None = None,
     ) -> list[str]:
         # Held across the WHOLE chunk, not per record: the inner sink's
         # per-file position advances once per record, so another thread
         # emitting between two of them would interleave positions.
         with self._lock:
-            return self._inner.feed(adapter, path, raw, restart=restart)
+            return self._inner.feed(
+                adapter,
+                path,
+                raw,
+                restart=restart,
+                on_record=on_record,
+            )
 
     @override
     def flush(self) -> None:
@@ -1089,3 +1272,24 @@ class _Held:
     taken_before_sending: bool
     """Whether the primary keeps the call even if it then fails to send: true for
     anything it only buffers, false for a restart, which sends first."""
+
+
+# A body larger than ``max_bytes`` by itself goes in a request of its own.
+def _batches(
+    bodies: Sequence[tuple[RecordBody, int]],
+    *,
+    max_records: int,
+    max_bytes: int,
+) -> Iterator[list[RecordBody]]:
+    """Split one file's ``(body, wire size)`` pairs into requests under both bounds."""
+    batch: list[RecordBody] = []
+    size = 0
+    for body, body_size in bodies:
+        if batch and (len(batch) == max_records or size + body_size > max_bytes):
+            yield batch
+            batch = []
+            size = 0
+        batch.append(body)
+        size += body_size
+    if batch:
+        yield batch

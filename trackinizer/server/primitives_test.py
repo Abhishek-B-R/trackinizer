@@ -66,6 +66,25 @@ class TestInsertInquiryGuards:
             )
         conn.execute.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_a_column_required_of_one_kind_is_asked_of_that_kind_only(
+        self,
+    ) -> None:
+        conn = make_conn()
+        values = {"title": "x", "account": "a@b.c"}
+
+        with pytest.raises(ValueError, match="agentsession_audience"):
+            await insert_inquiry(
+                cast(Conn, conn),
+                new_uuid(),
+                "AgentSession",
+                values=values,
+            )
+        conn.execute.assert_not_called()
+
+        await insert_inquiry(cast(Conn, conn), new_uuid(), "Issue", values=values)
+        conn.execute.assert_called_once()
+
 
 class TestPureFunctions:
     @pytest.mark.asyncio
@@ -271,6 +290,6 @@ class TestCoverageStoreReadsAndEdits:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

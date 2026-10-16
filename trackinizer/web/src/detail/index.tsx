@@ -6,7 +6,7 @@ import { ApiError } from "../api/client";
 import type { Detail, DetailRow } from "../api/detail";
 import { LockedContext, useMeta, useProfile, useWriteMode } from "../app/boot";
 import { useIsHighlighted } from "../app/highlights";
-import { PurgeDialog } from "../bulk/Purge";
+import { mayPurge, PurgeDialog } from "../bulk/Purge";
 import { useCommands } from "../commands/registry";
 import { CopyDetails } from "../debug/CopyDetails";
 import { TextEditor, TitleEditor } from "../editors/TextEditor";
@@ -41,6 +41,7 @@ import "../writes/writes.css";
 import "./detail.css";
 
 const ArtifactContent = lazy(() => import("../visuals/Artifact").then((module) => ({ default: module.ArtifactPage })));
+const ArtifactFrame = lazy(() => import("../visuals/Artifact").then((module) => ({ default: module.ArtifactFrame })));
 
 /** Which inquiry a detail shows: by kind and seq, or by id. */
 export type DetailTarget = { kind: string; seq: number } | { id: string };
@@ -162,6 +163,10 @@ function Page({ detail, stale, retry }: { detail: Detail; stale: Error | null; r
             </Bar>
           ) : null}
           <div className="d-scroll">
+            {/* An HTML Artifact opens as its own page, across the pane; the record follows below it. */}
+            {row.kind === "Artifact" && <Suspense fallback={null}>
+              <ArtifactFrame id={row.id} />
+            </Suspense>}
             <div className="d-grid">
               <div className="d-top">
                 <div className="d-main-inner">
@@ -186,7 +191,7 @@ function Page({ detail, stale, retry }: { detail: Detail; stale: Error | null; r
                     </TextEditor>
                   ))}
                   {row.kind === "Artifact" && <Suspense fallback={<p className="d-loading">Loading Artifact…</p>}>
-                    <ArtifactContent id={row.id} optional />
+                    <ArtifactContent id={row.id} optional framed={false} />
                   </Suspense>}
                   <Metrics row={row} />
                   <Transcript row={row} />
@@ -250,7 +255,8 @@ function MoreMenu({ detail }: { detail: Detail }) {
   const offline = useWriteMode() === "disabled";
   const trigger = useRef<HTMLButtonElement>(null);
   const [purging, setPurging] = useState(false);
-  const admin = useProfile().role === "admin";
+  const profile = useProfile();
+  const admin = profile.role === "admin";
   const lock = useLockToggle(detail);
   if (!actions.length) return null;
   const name = `${detail.self.kind}#${detail.self.seq}`;
@@ -273,7 +279,9 @@ function MoreMenu({ detail }: { detail: Detail }) {
           ...(admin
             ? [{ value: LOCK, label: detail.locked ? "Unlock" : "Lock", icon: <Icon name="lock" size={14} /> }]
             : []),
-          { value: PURGE, label: "Purge…", icon: <Icon name="trash" size={14} />, danger: true },
+          ...(mayPurge(detail.self, profile)
+            ? [{ value: PURGE, label: "Purge…", icon: <Icon name="trash" size={14} />, danger: true }]
+            : []),
         ]}
         onPick={(id) => {
           if (id === PURGE) setPurging(true);

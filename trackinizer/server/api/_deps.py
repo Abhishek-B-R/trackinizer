@@ -9,8 +9,9 @@ import datetime
 import uuid
 
 from trackinizer.server.chat_hub import ChatHub
+from trackinizer.server.chat_partials import ChatPartials
 from trackinizer.server.config import Config
-from trackinizer.wire.json_types import MutableJSON
+from trackinizer.wire.json_types import MutableJSON, MutableJSONValue
 
 
 if TYPE_CHECKING:
@@ -77,6 +78,37 @@ def get_hub(request: Request) -> ChatHub:
     return hub
 
 
+def get_partials(request: Request) -> ChatPartials:
+    """Return the chats' answers in writing, held on the app state, made on first use.
+
+    Args:
+      request: Request.
+
+    Returns:
+      result: The ChatPartials.
+
+    """
+    app = cast("FastAPI", request.app)
+    partials: object = getattr(app.state, "partials", None)
+    if not isinstance(partials, ChatPartials):
+        partials = app.state.partials = ChatPartials()
+    return partials
+
+
+def get_chat_streaming(request: Request) -> bool:
+    """Return whether chats' answers are held as they are written; on without a Config.
+
+    Args:
+      request: Request.
+
+    Returns:
+      result: The configured ``chat_streaming``.
+
+    """
+    config: object = getattr(cast("FastAPI", request.app).state, "config", None)
+    return config.chat_streaming if isinstance(config, Config) else True
+
+
 def get_assistant(request: Request) -> Assistant | None:
     """Return the configured assistant; none without a Config.
 
@@ -91,18 +123,32 @@ def get_assistant(request: Request) -> Assistant | None:
     return config.assistant if isinstance(config, Config) else None
 
 
-def get_chat_orgs(request: Request) -> ChatOrgs:
-    """Return how science chats group their users; ``domain`` without a Config.
+def get_staff(request: Request) -> tuple[str, ...]:
+    """Return the configured staff patterns; none without a Config.
 
     Args:
       request: Request.
 
     Returns:
-      result: ``single`` or ``domain``.
+      result: The staff patterns, empty when nobody is staff.
 
     """
     config: object = getattr(cast("FastAPI", request.app).state, "config", None)
-    return config.chat_orgs if isinstance(config, Config) else "domain"
+    return config.staff if isinstance(config, Config) else ()
+
+
+def get_chat_orgs(request: Request) -> ChatOrgs:
+    """Return how science chats group their users; ``individual`` without a Config.
+
+    Args:
+      request: Request.
+
+    Returns:
+      result: ``single``, ``domain`` or ``individual``.
+
+    """
+    config: object = getattr(cast("FastAPI", request.app).state, "config", None)
+    return config.chat_orgs if isinstance(config, Config) else "individual"
 
 
 def get_secrets(request: Request) -> SecretBackend | None:
@@ -119,23 +165,37 @@ def get_secrets(request: Request) -> SecretBackend | None:
     return app.state.secrets
 
 
-def tag_row(inquiry: Inquiry) -> MutableJSON:
-    """Serialize one Inquiry that is known to exist.
+def tag_row(inquiry: Inquiry, names: frozenset[str] | None = None) -> MutableJSON:
+    """Serialize one Inquiry that is known to exist, whole or only the ``names`` keys.
 
     The total variant. Callers holding a ``list[Inquiry]`` used to route
     through :func:`tag_kind` and then filter its ``None`` back out -- a guard
     for a case the type already excluded, kept alive only because the
     signature was wider than any caller needed.
 
+    A key not in ``names`` is never converted, so a list naming a few keys
+    skips the walk of the large ones (an Experiment's ``config`` and
+    ``outcome``). The keys keep the whole row's order.
+
     Args:
       inquiry: Inquiry to serialize; raises TypeError if None.
+      names: The keys to keep, ``kind`` among them; None keeps every key.
 
     Returns:
       payload: JSON with "kind" field set to the Inquiry subclass name.
 
     """
-    payload = cast(MutableJSON, _jsonable(inquiry))
-    payload["kind"] = type(inquiry).__name__
+    payload: MutableJSON = {
+        # Dataclass reflection returns Any; this cast establishes the recursive boundary.
+        field.name: cast(
+            MutableJSONValue,
+            _jsonable(cast(object, getattr(inquiry, field.name))),
+        )
+        for field in dataclasses.fields(inquiry)
+        if names is None or field.name in names
+    }
+    if names is None or "kind" in names:
+        payload["kind"] = type(inquiry).__name__
     return payload
 
 

@@ -19,14 +19,14 @@ from typing import Final, TypeGuard, cast
 
 import math
 
-from trackinizer.lib.absent import ABSENT, Absent
-from trackinizer.lib.codec import (
+from treekle import (
     Invalid,
     PlainTree,
     ReadError,
     from_plain,
     immutable,
 )
+from treekle.absent import ABSENT, Absent
 
 
 __all__ = [

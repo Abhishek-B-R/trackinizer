@@ -18,7 +18,7 @@ org:rekursiv`` and ``labels nre ^machine:``. They AND, which is what a
 partition asks for and all the request asks for; OR would need a grammar, and
 no caller has needed one yet.
 
-Two choices worth knowing before changing this:
+Three choices worth knowing before changing this:
 
 * **One snapshot for every table.** Under ``--engine pg`` a write landing
   between two tables' reads would leave, say, an edge whose inquiry the export
@@ -27,6 +27,12 @@ Two choices worth knowing before changing this:
   single connection, so streaming the response straight off a cursor would
   hold it for as long as the slowest client takes to read the body, and every
   other request would wait behind it.
+* **A session's transcript is exported to a caller who reads it.** The header
+  names the audiences the export was read for and counts the sessions whose
+  transcripts it left out, so a file that is not whole says so. A science chat's
+  transcript goes only to the chat's members, whatever their role, so on a server
+  with chats of more than one person no export holds them all: only a database
+  dump does.
 
 Columns come from the catalog rather than a list kept here, so a column added
 by a migration is exported without touching this file. A new TABLE is a
@@ -41,6 +47,12 @@ from typing import TYPE_CHECKING, Final, cast
 
 import json
 
+from trackinizer.server.audience import (
+    NOBODY,
+    SessionReader,
+    hidden_exists_sql,
+    visible_sql,
+)
 from trackinizer.server.notify import tx
 from trackinizer.server.store.read import _lower_filter
 from trackinizer.server.store.shared import _StoreShared
@@ -105,6 +117,13 @@ class GraphExport:
 
     Attributes:
       migrations: Applied schema files, oldest first.
+      audiences: The audiences the export was read for, sorted. A session outside
+        them has no transcript in ``tables``, so a file that names fewer audiences
+        than the deployment has is not a whole backup.
+      withheld_sessions: How many sessions have no transcript in ``tables`` because
+        the reader may not read it, as the transcript test of
+        :mod:`~trackinizer.server.audience` says. A file that counts any is not a
+        whole backup.
       tables: ``(table, rows)`` in :data:`EXPORT_TABLES` order; each row maps
         column name to value in the table's column order.
       selector: The filters that narrowed this export, empty for a whole
@@ -114,6 +133,8 @@ class GraphExport:
     """
 
     migrations: tuple[str, ...]
+    audiences: tuple[str, ...]
+    withheld_sessions: int
     tables: tuple[tuple[str, tuple[dict[str, object], ...]], ...]
     selector: tuple[Filter, ...] = ()
 
@@ -124,18 +145,25 @@ class _ExportMixin(_StoreShared):
     async def export_graph(
         self,
         *,
+        reader: SessionReader = NOBODY,
         selector: Sequence[Filter] = (),
     ) -> GraphExport:
         """Read the graph, or one selector's subgraph, in one read-only snapshot.
 
+        Every table keyed by a session leaves out the rows of a session whose
+        transcript ``reader`` may not read. The session's own row stays, as it does in
+        the graph a caller reads: only the transcript is gated.
+
         Args:
+          reader: Who reads.
           selector: Filters on ``inquiries``, ANDed. Empty exports everything.
 
         Returns:
-          graph: The applied migrations and every exported table's rows.
+          graph: The applied migrations, every exported table's rows, and how many
+            sessions' transcripts it left out.
 
         """
-        scope, params = _scope(selector)
+        scope, scope_params = _scope(selector)
         async with self.engine.acquire() as conn, tx(conn):
             await conn.execute(
                 "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY",
@@ -150,11 +178,35 @@ class _ExportMixin(_StoreShared):
             )
             columns = await _exported_columns(conn)
             tables = [
-                (table, await _read_table(conn, table, columns[table], scope, params))
+                (
+                    table,
+                    await _read_table(
+                        conn,
+                        table,
+                        columns[table],
+                        reader=reader,
+                        scope=scope,
+                        scope_params=scope_params,
+                    ),
+                )
                 for table in EXPORT_TABLES
             ]
+            # Counted inside the selection: a session the selector left out is
+            # not missing from this file, it was never asked for.
+            params: list[object] = list(scope_params)
+            withheld = await conn.fetchval(
+                vetted_sql(
+                    "SELECT count(*) FROM inquiries AS withheld "
+                    "WHERE withheld.kind = 'AgentSession' AND NOT ",
+                    visible_sql("withheld", params=params, reader=reader),
+                    vetted_sql(" AND withheld.id IN (", scope, ")") if scope else "",
+                ),
+                *params,
+            )
         return GraphExport(
             migrations=tuple(cast(str, row["name"]) for row in migrations),
+            audiences=tuple(sorted(reader.audiences)),
+            withheld_sessions=cast(int, withheld),
             tables=tuple(tables),
             selector=tuple(selector),
         )
@@ -199,33 +251,50 @@ def _scope(selector: Sequence[Filter]) -> tuple[str, list[object]]:
     return vetted_sql("SELECT id FROM inquiries WHERE ", " AND ".join(clauses)), params
 
 
-def _where(table: str, scope: str) -> str:
-    """Render the ``WHERE`` keeping only ``table``'s rows inside ``scope``."""
-    if not scope:
-        return ""
-    tests = " AND ".join(
+def _scope_tests(table: str, scope: str) -> str:
+    """Render the test keeping only ``table``'s rows inside ``scope``."""
+    return " AND ".join(
         vetted_sql('"', column, '" IN (', scope, ")")
         for column in _SCOPE_COLUMNS[table]
     )
-    return vetted_sql(" WHERE ", tests)
 
 
 async def _read_table(
     conn: Conn,
     table: str,
     columns: tuple[tuple[str, bool], ...],
+    *,
+    reader: SessionReader,
     scope: str = "",
-    params: Sequence[object] = (),
+    scope_params: Sequence[object] = (),
 ) -> tuple[dict[str, object], ...]:
-    """Every in-scope row of ``table``, in its export order, as plain Python values."""
+    """Every in-scope row of ``table`` the caller may read, in export order, as plain values."""
     select = ", ".join(f'"{name}"' for name, _ in columns)
+    # The scope's operands go first: its placeholders were numbered from ``$1``, and
+    # the audience test numbers its own after whatever is already here.
+    params: list[object] = list(scope_params)
+    conditions: list[str] = []
+    if scope:
+        conditions.append(_scope_tests(table, scope))
+    # Audience: gated -- a table keyed by session leaves out the rows of a session
+    # ``reader`` may not read. Found from the columns, so a session table the export
+    # gains is gated without an edit here.
+    if any(name == "session_id" for name, _ in columns):
+        conditions.append(
+            hidden_exists_sql(
+                f"{table}.session_id",
+                params=params,
+                reader=reader,
+            ),
+        )
+    where = vetted_sql(" WHERE ", " AND ".join(conditions)) if conditions else ""
     records = await conn.fetch(
         vetted_sql(
             "SELECT ",
             select,
             " FROM ",
             table,
-            _where(table, scope),
+            where,
             " ORDER BY ",
             _ORDER_BY[table],
         ),

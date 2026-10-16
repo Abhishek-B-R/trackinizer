@@ -7,9 +7,10 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from treekle import from_plain, json_loads
+
 import pytest
 
-from trackinizer.lib.codec import from_plain, loads
 from trackinizer.server.api.conftest import (
     clear_identity_override,
     install_identity,
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from fastapi.testclient import TestClient
 
     from trackinizer.conftest import FakeEngine
+    from trackinizer.server.audience import SessionReader
     from trackinizer.server.store.core import Store
     from trackinizer.wire.filters import Filter
 
@@ -44,6 +46,8 @@ def _graph() -> GraphExport:
     created = datetime(2026, 9, 19, 12, 30, tzinfo=UTC)
     return GraphExport(
         migrations=("schema.sql", "schema.019.sql"),
+        audiences=("open",),
+        withheld_sessions=2,
         tables=(
             (
                 "inquiries",
@@ -75,10 +79,15 @@ def export_client(
     """Return a route client whose store exports :func:`_graph`."""
     client, store, _engine = route_client
 
-    async def export_graph(*, selector: Sequence[Filter] = ()) -> GraphExport:
+    async def export_graph(
+        *,
+        reader: SessionReader,
+        selector: Sequence[Filter] = (),
+    ) -> GraphExport:
         # Echoed back rather than applied: what the route owns is parsing the
         # selector and putting it in the header, and the store's own tests
         # cover the scoping it does with it.
+        del reader
         return replace(_graph(), selector=tuple(selector))
 
     monkeypatch.setattr(store, "export_graph", export_graph)
@@ -98,12 +107,14 @@ def test_the_header_comes_first_then_one_line_per_row(
     assert r.status_code == 200
     assert r.headers["content-type"].startswith(EXPORT_MEDIA_TYPE)
     header, *rows = [
-        from_plain(loads(line), dict[str, object]) for line in r.text.splitlines()
+        json_loads(line, dict[str, object]) for line in r.text.splitlines()
     ]
     assert header == {
         "format": EXPORT_FORMAT,
         "version": EXPORT_VERSION,
         "migrations": ["schema.sql", "schema.019.sql"],
+        "audiences": ["open"],
+        "withheld_sessions": 2,
     }
     assert [row["table"] for row in rows] == ["inquiries", "change_log"]
 
@@ -112,7 +123,7 @@ def test_uuids_and_timestamps_become_strings(export_client: TestClient) -> None:
     r = export_client.get(EXPORT_API_PATH)
 
     inquiry = from_plain(
-        from_plain(loads(r.text.splitlines()[1]), dict[str, object])["row"],
+        json_loads(r.text.splitlines()[1], dict[str, object])["row"],
         dict[str, object],
     )
     assert inquiry == {
@@ -154,7 +165,7 @@ def test_a_selector_reaches_the_store_and_the_header(
     )
 
     assert r.status_code == 200
-    header = from_plain(loads(r.text.splitlines()[0]), dict[str, object])
+    header = json_loads(r.text.splitlines()[0], dict[str, object])
     assert header["selector"] == [
         {"field": "labels", "op": "is", "value": "org:rekursiv"},
     ]
@@ -175,7 +186,7 @@ def test_clauses_arrive_in_the_order_they_were_sent(
         ],
     )
 
-    header = from_plain(loads(r.text.splitlines()[0]), dict[str, object])
+    header = json_loads(r.text.splitlines()[0], dict[str, object])
     assert header["selector"] == [
         {"field": "labels", "op": "is", "value": "org:rekursiv"},
         {"field": "labels", "op": "nre", "value": "^machine:"},
@@ -217,15 +228,42 @@ def test_a_malformed_clause_is_400_not_a_whole_graph(
 
 def test_no_selector_leaves_the_key_out(export_client: TestClient) -> None:
     """A whole-graph export is unchanged by this feature, header included."""
-    header = from_plain(
-        loads(export_client.get(EXPORT_API_PATH).text.splitlines()[0]),
-        dict[str, object],
+    header = json_loads(
+        export_client.get(EXPORT_API_PATH).text.splitlines()[0], dict[str, object]
     )
 
     assert "selector" not in header
 
 
+def test_the_export_is_read_for_the_audiences_of_its_caller(
+    route_client: tuple[TestClient, Store, FakeEngine],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, store, _engine = route_client
+    asked: list[frozenset[str]] = []
+
+    async def export_graph(
+        *,
+        reader: SessionReader,
+        selector: Sequence[Filter] = (),
+    ) -> GraphExport:
+        del selector
+        asked.append(reader.audiences)
+        return _graph()
+
+    monkeypatch.setattr(store, "export_graph", export_graph)
+
+    install_identity(make_test_identity())
+    assert client.get(EXPORT_API_PATH).status_code == 200
+    install_identity(
+        replace(make_test_identity(), read_audiences=frozenset({"open", "staff"})),
+    )
+    assert client.get(EXPORT_API_PATH).status_code == 200
+
+    assert asked == [frozenset({"open", "private"}), frozenset({"open", "staff"})]
+
+
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

@@ -11,6 +11,8 @@ from unittest.mock import patch
 import base64
 import json
 
+from treekle import ReadError, from_plain, json_loads
+
 import pytest
 
 from trackinizer.lib.agent.sessions import claude
@@ -44,7 +46,6 @@ from trackinizer.lib.agent.types.sessions import (
     WebSearchResult,
     WebSearchResults,
 )
-from trackinizer.lib.codec import ReadError, from_plain, loads
 
 
 if TYPE_CHECKING:
@@ -674,7 +675,7 @@ def test_deleting_one_call_does_not_move_another_across_prose() -> None:
 
 def _content_blocks(native: str) -> list[dict[str, object]]:
     """Return the message content blocks of a written line."""
-    record = from_plain(loads(native.splitlines()[0]), dict[str, object])
+    record = json_loads(native.splitlines()[0], dict[str, object])
     message = from_plain(record.get("message"), dict[str, object], default={})
     return list(from_plain(message.get("content"), list[dict[str, object]], default=[]))
 
@@ -896,7 +897,7 @@ def test_a_mistyped_field_aborts_neither_the_read_nor_the_write(
         for at, line in enumerate(lines)
         if at == index or any(f'"{id_}"' in line for id_ in ids)
     ]
-    record = from_plain(loads(lines[index]), dict[str, object])
+    record = json_loads(lines[index], dict[str, object])
     failed: list[str] = []
     for path, changed in mistyped(record):
         session = _swapped(lines, window, index, changed)
@@ -2088,6 +2089,6 @@ def test_claude_user_reader_preserves_unknown_blocks() -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

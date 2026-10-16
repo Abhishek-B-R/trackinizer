@@ -1,18 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { setVisualWorkspacePreference, signOut } from "../api/me";
+import { setVisualWorkspacePreference } from "../api/me";
 import { bootQueries, useProfile } from "../app/boot";
-import { LOGIN_URL } from "../app/session";
+import { NO_AUTH_EMAIL, useSignOut } from "../app/signOut";
 import { CopyDetails } from "../debug/CopyDetails";
 import { dateTime, relativeTime, useMinuteClock } from "../detail/time";
 import { useOnline } from "../ui/bars";
 import { Icon } from "../ui/icons";
 import { ViewHeader } from "../ui/view";
+import { type ChatStyle, chooseChatStyle, useChatStyle } from "../chatStyle";
 import { chooseTheme, type ThemePreference, useTheme } from "../theme";
 import { KeyValue, ReadError, Section } from "./account";
 import { AliasesSection } from "./Aliases";
-import { BrowserDataSection } from "./BrowserData";
+import { CloseSheet } from "./CloseSheet";
 import { ChatPartnerSection } from "./ChatPartner";
+import { PreferencesDocument } from "./PreferencesDocument";
 import { useHighlightMentions } from "./highlightMentions";
 import { TokensSection } from "./Tokens";
 import "../editors/editors.css";
@@ -34,7 +35,9 @@ export function SettingsView({ assign = (url: string) => location.assign(url) }:
   const now = useMinuteClock();
   return (
     <div className="view">
-      <ViewHeader icon={<Icon name="gear" />} title="Your settings" />
+      <ViewHeader icon={<Icon name="gear" />} title="Your settings">
+        <CloseSheet label="Close settings" />
+      </ViewHeader>
       <div className="scroll">
         <div className="st">
           <Section title="Profile">
@@ -48,10 +51,10 @@ export function SettingsView({ assign = (url: string) => location.assign(url) }:
           </Section>
           <AliasesSection />
           <ThemeSection />
+          <PreferencesDocument />
           <VisualWorkspaceSection />
           <ChatPartnerSection />
           <TokensSection />
-          <BrowserDataSection />
           {profile.email === NO_AUTH_EMAIL ? null : <SessionSection assign={assign} />}
         </div>
       </div>
@@ -77,7 +80,7 @@ function VisualWorkspaceSection() {
         <label className="st-workspace-choice">
           <input type="checkbox" checked={enabled} disabled={!online || change.isPending}
             onChange={(event) => change.mutate(event.target.checked)} />
-          Enable agent-guided canvas
+          Enable agent-guided workbench
         </label>
         {change.isPending && <span className="w-status" role="status">Saving…</span>}
         {change.isError && <span className="form-err" role="alert">Could not save workspace preference.</span>}
@@ -95,6 +98,7 @@ function VisualWorkspaceSection() {
 
 function ThemeSection() {
   const { choice: theme } = useTheme();
+  const chatStyle = useChatStyle();
   return (
     <Section title="Appearance">
       <div className="st-row">
@@ -107,57 +111,42 @@ function ThemeSection() {
           <option value="system">System</option>
         </select>
       </div>
+      {/* One of the user's preferences, like the theme: how the Chat panel looks, not what it holds. */}
+      <div className="st-row">
+        <label htmlFor="appearance-chat-style">Chat style</label>
+        <select id="appearance-chat-style" className="st-theme" value={chatStyle} onChange={(event) => {
+          chooseChatStyle(event.target.value as ChatStyle);
+        }}>
+          <option value="default">Default</option>
+          <option value="terminal">Terminal</option>
+        </select>
+      </div>
     </Section>
   );
 }
 
-/**
- * Sign out: the server clears the session cookie, then the login page loads.
- *
- * Not a write through the write layer: it changes no data, a second request
- * does no harm, and its failures are about signing out, not saving.
- */
+/** Sign out, here or from the sidebar's foot (`useSignOut`), with its progress and failure in the row. */
 function SessionSection({ assign }: { assign: (url: string) => void }) {
   const online = useOnline();
-  const [state, setState] = useState<{ readonly pending: boolean; readonly failure: { readonly message: string; readonly error: unknown } | null }>(IDLE);
-  const leave = async () => {
-    if (state.pending) return;
-    setState({ pending: true, failure: null });
-    try {
-      await signOut();
-    } catch (error) {
-      setState({ pending: false, failure: { message: error instanceof Error ? error.message : String(error), error } });
-      return;
-    }
-    assign(LOGIN_URL);
-  };
+  const { pending, failure, leave } = useSignOut({ assign });
   return (
     <Section title="Session">
       <div className="st-row">
-        <button type="button" className="btn ghost" disabled={!online} aria-disabled={state.pending || undefined} onClick={() => void leave()}>
+        <button type="button" className="btn ghost" disabled={!online} aria-disabled={pending || undefined} onClick={() => void leave()}>
           Sign out
         </button>
-        {state.pending ? (
+        {pending ? (
           <span className="w-status" role="status">
             Signing out…
           </span>
         ) : null}
-        {state.failure ? (
+        {failure ? (
           <span className="form-err" role="alert">
-            Could not sign out. {state.failure.message}
-            <CopyDetails message={`Could not sign out. ${state.failure.message}`} error={state.failure.error} />
+            Could not sign out. {failure.message}
+            <CopyDetails message={`Could not sign out. ${failure.message}`} error={failure.error} />
           </span>
         ) : null}
       </div>
     </Section>
   );
 }
-
-const IDLE = { pending: false, failure: null };
-
-/**
- * The account a server run with `--no-auth` answers every request as
- * (`server/auth.py`). Nobody signs in there, so signing out would only land on
- * a login page with nothing to sign in with.
- */
-const NO_AUTH_EMAIL = "no-auth@localhost";

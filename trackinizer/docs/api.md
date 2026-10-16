@@ -64,6 +64,17 @@ POST /api/inquiries/batch
 DELETE /api/inquiries/<uuid>
 ```
 
+A purge deletes the row and its edges, auditing each. One rule holds for every row:
+you delete what you made, admins delete anything, so a row is purged by its `account`
+or an admin, and any other writer is 403. For the same reason only a row's account
+or an admin moves it to another account (`PUT .../account`), anyone else is 403, so
+no writer takes a row and then purges it. A claimed row first releases its owner
+(`DELETE .../owner`), a locked row or a
+row linked to one needs an admin (section 1.24), and a session needs its audience
+(section 1.21). A science chat's session is purged by the key that opened it or an
+admin, and is never unowned while it holds its routing name; `DELETE /api/chats/<uuid>`
+deletes a whole chat (section 1.25).
+
 ### 1.5 Inquiry set fields
 
 ```
@@ -75,11 +86,13 @@ PUT /api/inquiries/<uuid>/labels
 PUT /api/inquiries/<uuid>/marginal_cost_agent_usd
 PUT /api/inquiries/<uuid>/marginal_cost_resource_usd
 PUT /api/inquiries/<uuid>/subscribers
+PUT /api/inquiries/<uuid>/app
 PUT /api/issue/<uuid>/issue_kind
 PUT /api/issue/<uuid>/validation
 PUT /api/issue/<uuid>/priority
 PUT /api/experiment/<uuid>/outcome
 PUT /api/experiment/<uuid>/codechanges
+PUT /api/experiment/<uuid>/config
 PUT /api/paper/<uuid>/source
 PUT /api/belief/<uuid>/judgement
 PUT /api/belief/<uuid>/confidence
@@ -113,11 +126,13 @@ DELETE /api/inquiries/<uuid>/labels
 DELETE /api/inquiries/<uuid>/marginal_cost_agent_usd
 DELETE /api/inquiries/<uuid>/marginal_cost_resource_usd
 DELETE /api/inquiries/<uuid>/subscribers
+DELETE /api/inquiries/<uuid>/app
 DELETE /api/issue/<uuid>/issue_kind
 DELETE /api/issue/<uuid>/validation
 DELETE /api/issue/<uuid>/priority
 DELETE /api/experiment/<uuid>/outcome
 DELETE /api/experiment/<uuid>/codechanges
+DELETE /api/experiment/<uuid>/config
 DELETE /api/paper/<uuid>/source
 DELETE /api/belief/<uuid>/judgement
 DELETE /api/belief/<uuid>/confidence
@@ -237,6 +252,7 @@ and the page puts it back on `next`, so signing in returns to the same view.
 
 ```
 GET  /api/me/profile
+PATCH /api/me/preferences
 PUT  /api/me/visual-workspace
 PUT  /api/me/acknowledge
 GET  /api/me/tokens
@@ -244,6 +260,49 @@ POST /api/me/tokens
 POST /api/me/tokens/<uuid>/revoke
 PUT  /api/me/tokens/<uuid>/role
 ```
+
+`GET /api/me/profile` also reports the audiences the credential holds:
+`read_audiences` (whose session transcripts it may read), `open_audiences` (what
+it may open a session into) and `pinned_audience` (the one a key is pinned to, or
+null), and `org_mode`, the server's organisation mode (section 1.21). They are
+`open` and `private` for everyone; `staff` is added for a person the server
+names as staff. The server's `--staff PATTERNS` (or `$TRACKINIZER_STAFF`) is a
+comma-separated list of `user@host` and `*@domain` patterns. A literal address
+matches the verified email alone. A domain pattern also needs the person's Google
+Workspace domain (Google's `hd` claim at their last login) to be that domain, so a
+consumer account with an address on the domain is not staff. Empty, the default,
+means nobody is staff. It is not stored per user and no route sets it.
+
+A domain pattern takes effect at each person's next browser login: the claim is
+stored only by the Google callback, so until then a person's `users` row has no
+Workspace domain and neither they nor their keys are staff (fail closed). Before
+setting a `*@domain` pattern on a deployment, sign in once with a Workspace account
+and once with a consumer account on the same domain, and check that only the first
+gets `staff` in `GET /api/me/profile`.
+
+The callback also binds the `users` row to the Google account (`sub`) that first
+signed in as that email. A login with another `sub` on the same address gets 403
+and changes nothing, so a second Google account holding the address cannot take over
+the row's sessions and keys or rewrite its Workspace domain. A row from before the
+binding takes the next login's `sub`. To rebind an address to a different Google
+account, an administrator deletes the user (`DELETE /api/admin/users/<uuid>`); the
+next login creates the row again.
+
+`POST /api/me/tokens` takes an optional `open_into` beside `name` and `role`: it pins
+the one audience the key opens sessions into. It is at most what the caller opens
+into (403 otherwise), a name that is no audience is 422, and a key minting a key hands
+its own pin on when the request names none; an unpinned key mints an unpinned key. The
+pin is recomputed against the owner at every request, so a key never holds more than
+its owner does. A key reads what its owner reads. The response and
+`GET /api/me/tokens` carry `open_into`, null for no pin.
+
+A pinned key can revoke (`POST .../revoke`) or re-tier (`PUT .../role`) only its own
+key and keys pinned to an audience it opens into. Any other key answers 404, as an
+absent one does. A browser session or an unpinned key manages every key of its owner.
+
+A service account's key (section 1.18) answers 403 on `POST /api/me/tokens`,
+`PUT .../role` and `POST .../revoke`, before the body is read; an admin manages
+its keys.
 
 ### 1.18 Admin users
 
@@ -254,7 +313,74 @@ PUT    /api/admin/users/<uuid>/role
 POST   /api/admin/users/<uuid>/disable
 POST   /api/admin/users/<uuid>/enable
 DELETE /api/admin/users/<uuid>
+DELETE /api/admin/users/<uuid>/preferences
+POST   /api/admin/service-accounts
+POST   /api/admin/service-accounts/<uuid>/tokens
+GET    /api/admin/service-accounts/<uuid>/tokens
+POST   /api/admin/service-accounts/<uuid>/tokens/<uuid>/revoke
 ```
+
+`GET /api/admin/users` marks each user with `staff`, true when the server's staff
+setting makes them staff. It is derived and read-only.
+
+#### Service accounts
+
+A service account is a user whose address is `NAME@service.invalid`; no column
+marks it. An admin creates one for a program, without a sign-in:
+a chat assistant, a job runner, the shell an agent runs in. It has its own
+identity and its own keys, and nobody has to create a fake person for it. All four
+routes are admin role. Bodies: section 3.27.
+
+`NAME` matches `^[a-z][a-z0-9-]{1,30}$`. `.invalid` is reserved by RFC 2606, so no identity
+provider issues it. `POST /api/admin/service-accounts` takes a `name` and a `role`,
+`viewer` or `writer`, and answers 201 with the user, as `GET /api/admin/users`
+lists one. A name is taken while any row holds it, a disabled one included, and
+answers 409: creating a name again never revives a disabled account. Deleting the
+account (`DELETE /api/admin/users/<uuid>`) frees the name and removes its keys, so a
+new account of the same name starts with none and no old key opens it.
+
+`POST /api/admin/service-accounts/<uuid>/tokens` mints one API key for the account
+and answers 201 with the secret, once, marked `Cache-Control: no-store`. The body
+is a `name` and, optionally, `role` and `open_into`, which mean what they mean in
+section 1.17. The key's role is at most the account's and
+defaults to it; a stronger role answers 403. Its pin is at most what the
+account holds under the server's staff setting: `open`, and `staff` only for an
+exact address entry such as `campaign@service.invalid`. A `*@domain` pattern never
+matches a service account, which has no Workspace domain. A pin beyond that
+answers 403, and a name that is no audience answers 422. The key is also held to what
+the minting admin's own credential reads and opens into, because a key never
+grants more than it holds: an admin who does not hold `staff` cannot hand it on
+(403), and a pinned key hands its pin to the keys it mints.
+Creating an account whose address the staff setting names is held to the same
+rule. An id that is not a service account, a person's included, answers 404, and a
+disabled account answers 409.
+
+`GET /api/admin/service-accounts/<uuid>/tokens` lists the account's keys, live
+and revoked, newest first, with no secret or hash.
+`POST /api/admin/service-accounts/<uuid>/tokens/<uuid>/revoke` revokes one and
+answers 404 for a key that is not the account's or is already revoked. Disabling
+the account revokes all its keys at once and enabling it restores none; mint
+fresh ones.
+
+A service account can never:
+
+- sign in. The allowlist refuses an entry at the service domain (422), whether an
+  address or `*@service.invalid`, and no sign-in admits such an address. No
+  session cookie opens one.
+- be an admin. Creating one as `admin` and `PUT /api/admin/users/<uuid>/role` to
+  `admin` answer 422, and a key's role is at most its account's, so no key of
+  the account ever holds it.
+- hold a Google account or a Workspace domain: no sign-in writes either to its
+  row.
+- manage keys. Its own key answers 403 on `POST /api/me/tokens`,
+  `PUT /api/me/tokens/<uuid>/role` and `POST /api/me/tokens/<uuid>/revoke`, its
+  own key included, so a leaked key cannot make more. `GET /api/me/profile` and
+  `GET /api/me/tokens` still answer.
+
+Creating an account and minting or revoking a key are logged at WARNING with the admin
+who acted (user id, address and key id) and the account acted on (user id and
+address), and a key's id and label, never a secret. Admin actions on users keep no
+other record.
 
 ### 1.19 Admin allowlist
 
@@ -286,6 +412,7 @@ GET /api/web/feed?after_created=<iso>&after_session=<uuid>&after_seq=N
 GET /api/web/feed?since=<iso>&until=<iso>&room=<room>&actor=<actor>&limit=N&tail=<bool>
 GET /api/web/feed?actor=<actor>&actor=<actor>&room=<room>&cli=<cli>&kind=<kind>
 GET /api/web/feed?conversation=true&tail=true&limit=N
+GET /api/web/feed?station=<workspace uuid>
 GET /api/web/feed/facets?since=<iso>&until=<iso>
 GET /api/web/feed/facets?since=<iso>&until=<iso>&actor=<actor>&kind=<kind>
 GET /api/web/feed/histogram?since=<iso>&until=<iso>&buckets=N
@@ -332,6 +459,13 @@ it wraps) and `kind` (the record's kind, such as `AssistantMessage` or
 `ToolCall`). A record passes a filter when it matches any of the filter's
 values, and must pass every filter given, so
 `actor=a&actor=b&kind=ToolCall` is the tool calls of `a` and `b`.
+
+`station=<workspace uuid>` (also on the facets and the histogram) keeps the agents of
+one of the caller's stations: the sessions reachable by `produced_by` edges
+from the session whose `cli_session_id` is `chat:<the station's conversation>`
+(a campaign launched from the chat makes its lead's session `produced_by` the
+chat's), to depth 4 and at most 500 sessions, never the chat's own. It is one
+query. A station that is not the caller's, or has no chat, keeps nothing.
 
 The feed alone also takes `conversation=true`, which keeps only the records
 the facets count as `conversation` (below), so a page of `limit` records holds
@@ -443,9 +577,11 @@ into a live session by routing name.
 ```
 POST   /api/sessions/start
 POST   /api/sessions/<uuid>/records
-GET    /api/sessions/<uuid>/records?part=N&after_idx=N&limit=N&plaintext_only=B
-GET    /api/sessions/<uuid>/parts
+GET    /api/sessions/<uuid>/records?part=N&after_idx=N&limit=N&plaintext_only=B&asker=EMAIL&chat=UUID
+GET    /api/sessions/<uuid>/parts?asker=EMAIL&chat=UUID
+GET    /api/sessions/<uuid>/turns?limit=N&asker=EMAIL&chat=UUID
 POST   /api/sessions/<uuid>/end
+POST   /api/sessions/<uuid>/audience
 POST   /api/sessions/<uuid>/inbound
 GET    /api/sessions/<uuid>/inbound
 POST   /api/messages
@@ -460,6 +596,109 @@ Inbound messages whose attested `source` is `trackinizer` are subscriber
 push envelopes -- JSON metadata for a committed change, generated
 server-side (no HTTP surface produces them). Shape and client-side
 handling: `design_subscriber.md`.
+
+An AgentSession carries an `audience` (`open`, `private` or `staff`) saying who may
+read its transcript. Only the transcript is gated: the session's title, actor, rooms,
+times, cost, edges and `audience`, and every row it files, stay readable by anyone
+who can read the graph. Who reads a transcript is one rule, set by the server's
+organisation mode, `TRACKINIZER_CHAT_ORGS`, as a chat workspace sets it:
+
+| mode | `open` session | `private` session | `staff` session |
+|---|---|---|---|
+| `single` (one organisation) | every caller | its owner, and a person who holds `staff` or is an admin | whoever holds `staff` |
+| `domain` (an email domain is an organisation, and a person its member when Google's `hd` claim names it) | its owner, its account's organisation, a person who holds `staff` or is an admin | the same less the organisation | whoever holds `staff` |
+| `individual` (the default, also when unset; each person alone) | its owner, a person who holds `staff` or is an admin | the same | whoever holds `staff` |
+
+A session's owner is its `account`. A service account and the assistant are in no
+organisation and oversee nothing. A science chat (section 1.25) is read by its
+members instead, no role excepted. The caller must hold the audience too, and the key
+that opened a session always reads it, so a key whose owner no longer holds `staff`
+can still run the `staff` session it opened. Otherwise the session answers 403 with
+`{"detail": {"code": "session_audience", "audience": "<value>"}}` on
+`GET .../records`, `.../parts`, `.../turns`, `POST .../records`, `POST .../end` and
+`GET .../inbound` (a drain); `DELETE /api/inquiries/<uuid>` and a field edit of the
+row need the audience. Sending input (`POST .../inbound`, `POST /api/messages`) needs
+the same read. The configured assistant (`--assistant`) relays a user's line to a
+session it cannot read only for an `asker`, an optional field of both bodies naming
+the user's account email. It passes on that user's rights, not its own, and the
+server reads them from its own tables: the asker must be an active user and a writer
+or admin, and be the session's account or read it as a person, whatever key they
+use. A send that names no asker, or one who does not qualify, is 403
+`session_audience`. A session the assistant reads itself needs no asker, and another
+sender's `asker` is ignored. `POST /api/messages` is refused whole when any session
+its actor names is hidden from the sender: nothing is queued to the others.
+
+A session opens into the audience its key is pinned to (`open_into`, see section
+1.17), else `open`; `"private": true` in the start body opens it `private` instead,
+which a key pinned to `staff` may not (403 `audience_not_held`). A session that opens
+under the `chat:<id>` of a chat that is not `open` takes the chat's audience. The
+start's answer names the session's `audience`, and `trax run --private` stops before
+its CLI starts when it is not `private`, as an older server, which ignores the field,
+answers. A resume asked to be `private` hides the `open` session it re-attaches, as
+the key that opened it may, and is 409, leaving it as it was, for a `staff` one. A
+session's owner moves it between `open` and `private` with
+`POST .../audience` (`{"audience": "open" | "private"}`): its account, the person
+whose key opened it, or for a chat its starter, which moves every session under the
+chat's id. It answers `{"session_id", "audience", "sessions"}`, the sessions that
+moved; anyone else is 403 `session_not_owner`, a `staff` session 409
+`session_staff`. No field route sets `audience`; each move is audited as an
+`agentsession_audience` change. A `private` session's `account` is moved by that
+account alone, an admin's move included being 403: its account is an owner, who may
+show it again.
+
+The assistant also reads a transcript for a user, into the chat it answers them in:
+`GET .../records`, `.../parts` and `.../turns` take `asker`, the user's account email,
+and `chat`, the conversation. The read is the user's alone, never the assistant's: an
+`asker` the server does not hold active, or a blank one, reads nothing (403
+`session_audience`), and so does one who could not read the session themselves, less
+any oversight. No chat and no `private` session is read for anyone (403
+`session_audience`), a read for an asker that names no chat is 422 `chat_required`,
+and one whose asker does not read the chat it names is 403 `chat_not_member`. What the
+assistant reads lands in the chat, so before it reads a `staff` session every
+session under the chat's id becomes `staff`, audited with the assistant as actor; a
+`private` chat is never made `staff` (409 `chat_private`), and only the chat's
+starter makes one so, as its members who hold no `staff` lose it then (403
+`chat_not_starter` for anyone else, unless the chat is `staff` already). Any other
+session is read into a chat only when everyone who reads the chat reads it too, as
+the assistant would read it for them: its starter, each person it is shared with, and
+while it is not `private` the starter's organisation or every member; else 409
+`chat_readers`. The assistant reads a chat by its id and audience alone only when a
+key of its own opened that chat's session. Another caller's `asker`
+and `chat` are ignored, and so is every bulk route's: the feed, its facets and
+histogram, session search, `GET /api/inquiries` and the export answer for the caller
+alone.
+
+The feed, its facets and histogram, session search, record filters on
+`GET /api/inquiries`, and the export leave out a session the caller does not read,
+another person's science chat included, and the export's header names the audiences
+it was read for and counts the sessions it left out (section 3.24). The feed, its
+facets and histogram, and session search also leave out a `private` session the
+caller reads unless asked with `hidden=true`, and take `whose`: `everyone` (the
+feed's default), `mine` (session search's default), the sessions held under the
+caller's account, or `campaigns`, the
+sessions labelled with, or in a room named for, a slug that a brief Issue labels
+`<slug>:asker:<the caller's email>`, as the assistant labels a campaign it launches
+for a person and a launch whose `--requested-by` is an account labels its brief.
+Neither reads more than the caller does. Each facet names its
+session's `account` and `audience`, and `hideable`, whether the caller may hide it.
+A
+record written to a session pings the live streams
+(`GET /api/change_log/stream`, `GET /api/web/subscribe`, the `changed` frames of
+`GET /api/workspaces/<uuid>/events`) with the session's id, and a stream relays
+that ping only to a caller who reads the session, by the one rule above: when a
+session receives a record is part of its transcript. A stream asks once per session
+and audience and keeps the answer for 30 s, so a hide is heard at once, and a share,
+an unshare or an account move within 30 s. Every other change reaches every viewer.
+
+A subscriber push into a session that is not `open` carries no `actor` and no
+`reason`, and its `agent_message` omits "(by ...)": those are free text a writer sets,
+and an inbound line becomes the session's next user turn. The row is still named by
+`subject_ref` and `row`, so the session reads the change from the graph.
+
+Existing sessions migrate to `open`; the migration cannot tell a campaign lead or other
+staff session a running deployment already captured from any other. After it opens, a
+session's audience moves only between `open` and `private` by its owner, and to
+`staff` for a chat a staff session was read into; nothing lowers `staff`.
 
 A session whose run dies without calling `end` (killed, host crashed) is
 closed by the server: once a session that polls its inbound queue has gone
@@ -498,7 +737,12 @@ GET /api/export?filter=<json>
 The whole graph as JSON lines (`application/x-ndjson`), for backup or a
 public mirror: every inquiry, edge, and change-log row, plus experiment
 metrics and agent-session records, read in one snapshot. Viewer role, like
-any read. Read-only; nothing imports it yet. Line shape: section 3.24.
+any read. A session's records are exported only to a caller that reads it
+(section 1.21), a `private` one included. No key holds every chat, since no role
+reads another person's chat, and in `domain` or `individual` mode a person who is no
+staff and no admin reads only their organisation's sessions, so an export is a whole
+backup only when nothing is withheld; its header counts what
+it left out. Read-only; nothing imports it yet. Line shape: section 3.24.
 
 A repeated `filter` narrows the export to the subgraph its clauses match,
 in the spelling section 3.3 already uses for a list query, and ANDed. Only
@@ -512,8 +756,15 @@ selector, so a reader can tell one slice from a whole-graph backup.
 ```
 GET  /api/visuals
 POST /api/workspaces
+GET  /api/workspaces
+POST /api/workspaces/new
+POST /api/workspaces/for-chat/<conversation uuid>
 GET  /api/workspaces/<uuid>
+PATCH /api/workspaces/<uuid>
+PUT  /api/workspaces/<uuid>/page
+PUT  /api/workspaces/<uuid>/layout
 POST /api/workspaces/<uuid>/operations
+POST /api/workspaces/<uuid>/relay
 ```
 
 `GET /api/visuals` returns safe descriptors and the default visual type. It
@@ -521,9 +772,16 @@ does not fetch graph data or start a session. Each descriptor has a stable
 `type`, `version`, title, description, requirements, default size, bounded
 parameter schema, and `record_kinds`: the kinds of record a show may name
 (`null` for any, an empty list for none). `trax.browse` is the page itself: it
-takes no record and no parameter, and it cannot be hidden. `trax.timeline`
-shows an Issue or an Experiment, `trax.artifact` an Artifact, `trax.subgraph`
-any record.
+takes no record and no parameter, and it hides like any visual: an agent's
+`navigate` on a canvas that has hidden it shows it again in the main strip, in
+the revision that carries the route. `trax.timeline`
+shows an Issue or an Experiment, `trax.artifact` an Artifact, `trax.summary` an
+Issue or an AgentSession, and `trax.subgraph` and `trax.files` any record.
+`trax.files` reads the record's files document, an Artifact labelled `files` and
+`files:of:<record uuid>`, through `GET /api/inquiries`; its params `path` and
+`file` (strings, at most 512) and `changed` (boolean) narrow it. A show's param
+outside its descriptor's bound returns 422 with the sentence that names it
+(`Parameter 'path' exceeds maximum length of 512.`).
 
 `GET /api/visuals/timeline/<record-uuid>` is the one bounded read behind the
 `trax.timeline` visual (Lineage and timeline). The record may be of any kind;
@@ -541,6 +799,41 @@ the catalog descriptor; an out-of-range value returns 422, a missing record
 an interactive browser session. API keys cannot change that choice.
 `GET /api/me/profile` includes `visual_workspace_enabled`; it defaults to true. It
 also names `api_key_id`, the key the request used, or null for a browser session.
+
+`PATCH /api/me/preferences` changes the caller's preferences, kept on their user
+row so every browser and machine finds them: a body such as `{"theme": "light",
+"chat_side": null}` sets `theme` and puts `chat_side` back to its default, and the
+keys it leaves out keep their values. It answers every key, defaults filled; a key no
+preference has, or a value its key does not take, is a 422 and nothing is written.
+`GET /api/me/profile` includes the same object as `preferences`. The keys, their
+types, defaults and meanings are the `Preferences` model in `server/preferences.py`.
+Besides the appearance keys it holds the user's own data, each key replaced whole
+by a write and bounded so the row cannot grow without limit: `stars` (inquiry ids,
+at most 2000), `views` (saved list queries, at most 200), `console_views`
+(the Console's views: name, pin, picks, level 1-4 and range, live or a window
+that does not end before it starts; at most 200), `aliases` (names that mean
+the user, at most 50), `people` (names for owners and subscribers added by hand,
+at most 1000), `read` (`{boundary, marks}`, at most 5000 marks), `collapsed`
+(folded sections, at most 500), `lens`, `drafts` (unsent edits of a field by
+`<inquiry id>:<field>`, at most 200, each text at most 100000 characters) and
+`create_draft` (the create form's unsent inquiry).
+A person's preferences are theirs: an admin may put them back to their defaults
+(`DELETE /api/admin/users/<uuid>/preferences`, 204 with no body) but no route lets
+anyone else read them, and no preference write makes a change row.
+The UI's settings are marked `x-setting` in the schema: Settings shows them as one
+document, each value under its description, and they are the keys a station's
+assistant may read and change (`ASSISTANT_KEYS`, which a test keeps equal to them).
+Every station of the user is sent a `preferences` frame with the result, so each of
+their tabs shows the change.
+
+A station's assistant changes its owner's preferences with the workspace operation
+`{"kind": "preferences", "change": {"theme": "light"}}` (same keys, `null` resets):
+the owner's, not the assistant account's, and only the UI's keys (`ASSISTANT_KEYS`
+in `server/preferences.py`); any other key is a 422. Only an agent key the station
+accepts may send it; like `navigate` it changes no visual and no revision, and every
+station of the owner gets a `preferences` frame (the station stream is the owner's
+browser alone). A station's state carries those UI keys of its owner's
+`preferences`, so the assistant can read what is set, and nothing more.
 
 `PUT /api/me/acknowledge` with `{"rules_version": "<version shown>"}` records that
 the signed-in user agreed to the alpha rules, from an interactive browser session;
@@ -570,12 +863,67 @@ edit them.
 `GET /api/web/get/<uuid>` carries `locked` beside
 `self`.
 
-`POST /api/workspaces` creates or reopens the signed-in user's default canvas,
-which starts with `trax.browse` in the main pane and `trax.chat` at the side.
-The response has `id`, `revision`, `visuals`, `focused_instance`, `assistant`,
-and `partner`.
+**Stations.** A canvas is a station: a user has many, each with a `name`
+(1 to 120 characters, unique among the user's; `unnamed-workstream#N`, the lowest
+free N of 1 or more, until renamed), at most one science chat
+(`conversation_id`), the `#/...` `page` it was last on, and its `layout`. The database keeps
+these in one optional JSON column, `station`, beside the canvas's own. The
+routes here other than `GET /api/workspaces/<uuid>` are the signed-in browser's
+own; an API key is 403.
+`POST /api/workspaces` returns the station the user changed last (an operation, a
+rename, a page or a chat bound), and makes the first, once however many requests
+race, when there is none. It starts
+with `trax.browse` in the main pane. Chat is not a visual: the browser draws it as a
+column beside the canvas, and `show trax.chat` is refused as an unknown type. A
+stored canvas that still holds a `trax.chat` visual reads without it. The response
+has `id`, `revision`, `name`, `conversation_id`, `page`, `layout`, `visuals`,
+`focused_instance`, `assistant`, and `partner`.
+`GET /api/workspaces` lists the stations, the one changed last first, as
+`{id, name, conversation_id, page, created_at}`.
+`POST /api/workspaces/new` makes a station.
+`PATCH /api/workspaces/<uuid>` with `{"name"}` renames it: the name is trimmed
+and must then be 1 to 120 characters (else 422); a name the user already has is
+409.
+`PUT /api/workspaces/<uuid>/page` with `{"route"}`, a `#/...` address valid as a
+navigation's, remembers the page; it is 204, changes no revision and publishes
+no frame, and the browser sends it at most every 500 ms.
+`PUT /api/workspaces/<uuid>/layout` remembers how the station's columns and windows
+were left, in `station.layout` beside the page. The body names any of `columns`
+(`left`, `side`: fractions of the stage's width), `chat_ch` (Chat's width in `ch`,
+10 to 400), `floating` (window `width`/`height` as fractions, by visual type),
+`tiles` (`collapsed` and `place` `left`/`top` as fractions, by visual type), `share`
+(a docked tile's share of its strip, by visual type) and `console` (the open
+Console view's id); each key named replaces the stored key and the others stay.
+Pixels are refused (422). It is 204, owner only (another's station is 404), changes
+no revision and publishes no frame. `GET /api/workspaces/<uuid>` returns it as
+`layout`, null until one is written. The browser fits it to each screen and
+sends it at most every 500 ms.
+`POST /api/workspaces/for-chat/<conversation uuid>` returns the user's station that
+holds that chat, or makes one bound to it. A station that is not the user's is 404;
+a deleted chat is 410 `chat_deleted`.
 `GET /api/workspaces/<uuid>` returns that state to its owner, and to an
 assistant's key (below).
+
+`POST /api/workspaces/<uuid>/relay` with `{"targets": [{"actor", "room"}], "text"}`
+and a required `Idempotency-Key` tells the station's chat what its owner sent
+agents directly from the Console, after the per-agent `POST /api/messages`
+sends; it is the browser's own and a station that is not the owner's is 404. One
+request is one Console line, however many targets. The partner it queues for is
+the one a Chat line of the station would go to: the chat's own session when the
+assistant has it open, else the assistant's service session. The message carries
+`context.relay` (`targets` and `text`) beside the usual `workspace_id` and
+`conversation_id`, and its `text` is the relay's text. The assistant records it in
+the chat as a line of the poster's that starts with `→ ` (an arrow and a
+space), then `actor` or `actor:room` for each target joined by `, `, then `: `
+and the text; it runs no turn, so there is no answer and no cost, and it reads
+the line with its next prompt. A `trax helper` reads it as a note. The response is
+`{"delivered": bool}`: false when the station has no chat, its chat was deleted,
+its owner may not post into its chat (a station may be bound to a chat to read it,
+section 1.25 says who posts), a Chat line of the station would be refused there
+(the 409s of a local helper in the assistant's chat and of the assistant in a
+helper's), its partner is not running or its queue is full, which is never an
+error.
+A retry under the same key queues nothing again.
 
 **The assistant and the partner.** The server's `--assistant ACTOR=EMAIL`, or
 `$TRACKINIZER_ASSISTANT`, names one assistant. A live AgentSession is the
@@ -597,7 +945,7 @@ key of the owner's own account opened and that is polling its inbound queue, and
 and the shared assistant never stands in. With none running the partner is `kind`
 `local`, `unavailable`, with a null `session_id`, `actor` and `cli`, and a Chat
 send is 409. The owner needs no `--assistant`: a server with none can still serve
-`local` canvases. Opening a preset keeps the canvas's choice.
+`local` canvases.
 
 Any session can be the assistant. `trax helper claude` (or `codex`) `--as
 ACTOR`, run with a key of the account `EMAIL`, opens one and answers each science
@@ -605,16 +953,17 @@ chat line by a turn of that CLI, resuming the chat's own CLI conversation. Its
 service session takes messages only from Chat: a direct or routed send to it is
 403.
 
-The partner's key may read and operate a canvas while that canvas's partner
-is the session the key opened, and a live science chat that key opened has the
-canvas's owner as its account or a poster (section 1.25). The check is per
-person, not per canvas. Any other canvas is 404, so a user who never talked to
-the partner gives it nothing; the owner's own key is 403 unless the partner is
+The partner's key may read and operate a station while that station's partner
+is the session the key opened, and the live science chat the station holds
+(`conversation_id`) is one that key opened with the station's owner as its
+account or a poster (section 1.25). The check is per station: a station without
+a chat takes no key. Any other station is 404, so a user who never talked to
+the partner in that station gives it nothing; the owner's own key is 403 unless the partner is
 the owner's local helper, which that key opened. Only the key that opened a
 partner or science-chat session may drain its inbound queue, whatever the role.
 
 An operation body has `revision` and one `operation`: `show`, `hide`, `focus`,
-`place`, `partner`, `navigate`, or `highlight`. The caller supplies a UUID `Idempotency-Key`
+`place`, `partner`, `navigate`, `highlight`, or `chat`. The caller supplies a UUID `Idempotency-Key`
 header. The
 server locks the workspace, checks the revision, validates the visual type,
 parameters and record kind, and returns the new state. Retrying a recent body
@@ -637,6 +986,12 @@ send it, it changes no visual and no revision, and the server pushes a
 `highlight` frame, which the browser marks the inquiries from. It is never
 stored and not replayed.
 
+`chat` is `{"kind": "chat", "hidden": true | false}`: it hides or shows the browser
+tab's Chat window. An event, as `navigate` is: only an agent key may send it (a
+browser is refused with 422), it changes no visual and no revision, and the server
+pushes a `chat` frame. It is the tab's own state: never stored, not replayed, and a
+reload shows Chat.
+
 Viewer access is enough to change one's own canvas. Workspace operations do
 not edit trax records or add entries to `change_log`.
 
@@ -644,8 +999,13 @@ not edit trax records or add entries to `change_log`.
 
 ```
 POST   /api/chats
-GET    /api/chats
 GET    /api/chats/<uuid>
+DELETE /api/chats/<uuid>
+PUT    /api/chats/<uuid>/shares/<email>
+DELETE /api/chats/<uuid>/shares/<email>
+GET    /api/sessions/<uuid>/partial
+PUT    /api/sessions/<uuid>/partial
+DELETE /api/sessions/<uuid>/partial/<turn>
 GET    /api/workspaces/<uuid>/events
 ```
 
@@ -654,40 +1014,60 @@ A canvas Chat conversation is one AgentSession the assistant opens: label
 `chat-<12 hex>`, account the person who started it. Its records are the
 conversation (a person's line is an agent message from its poster, then the
 assistant's tool calls, results and answers), read with the ordinary session
-routes. There is no separate chat store and no delete: chats are public to
-every user.
+routes. There is no separate chat store. A chat is private to its members: its
+starter, the people they share it with and whoever `TRACKINIZER_CHAT_ORGS` lets in
+(Forking below) read it and post into it, and every session read refuses anyone
+else, an admin included (section 1.21). Its starter hides it from all but the people
+it is shared with (`POST /api/sessions/<uuid>/audience`, `private`) and shows it
+again; once the assistant has read a `staff` session into it for a member, it is
+`staff`, and only its members who hold `staff` read it, post in it or are shared
+it. Its session's row stays readable by every key, so its title is `Science chat`,
+whatever the assistant asks. Its starter deletes it while every person's line in it
+is theirs (Deleting below).
 
 `POST /api/chats` (browser only, writer role, with an `Idempotency-Key`) posts a
-line. The body is `{kind: "science", workspace_id, text, chat_instance_id,
-expected_record_id, conversation_id, page, trail}`; `text` holds a non-space
+line. The body is `{kind: "science", workspace_id, text, conversation_id, page,
+trail}`; `text` holds a non-space
 character and at most 16,384 characters, and `workspace_id` is the poster's own
-canvas. `page` is the `#/...` address the sender is on and `trail` the addresses
+station. A station holds one chat: with none, the line's conversation becomes its
+chat in the transaction that queues the line; with one, a line that names another
+conversation is 409, as is one for a conversation another station of the poster
+holds, and a line that names none continues the station's chat. `page` is the `#/...` address the sender is on and `trail` the addresses
 they came through before it, oldest first, at most 8; a malformed address or a
 longer trail is 422. The server resolves them to records in the context. A
-`conversation_id` continues a chat, and any signed-in writer in the starter's
-organisation may post into it (see Forking below). None starts one, and the key
+`conversation_id` continues a chat, for a writer who may post into it (see Forking
+below). None starts one, and the key
 names it, so a retry names the same conversation. `fork: {session_id, part, idx}`
-instead starts a new conversation from that line of another chat; it and
+instead starts a new conversation from that line of another chat, in a new station
+copied from the one the line was sent from (the receipt's `workspace_id`); it and
 `conversation_id` together are 422. The line's poster is the attested account,
-never the body. The server builds the typed canvas context (checking the Chat instance and that the
-record still matches `expected_record_id`, else 409 before queueing) and queues
-the line for the conversation's own session when the canvas's partner has it open
+never the body. The server builds the typed canvas context (the canvas, its
+visible visuals, the page and the trail; it pins no record) and queues the line
+for the conversation's own session when the canvas's partner has it open
 and some poller drains it, and for the partner's service session otherwise (a
 `trax helper` does not poll its chats, so it hears every line there). The
-receipt is `{conversation_id, session_id}` at once; `session_id` is null until
+receipt is `{conversation_id, workspace_id, session_id}` at once;
+`workspace_id` is the station the line went to; `session_id` is null until
 the assistant has the session open. The same key again returns the original receipt and queues nothing; a key
 reused for another line is 409. The de-duplication is in memory, so a retry after
 a server restart queues the line again. No live assistant is 409; a full queue is
 409 `partner busy`, and nothing is queued.
 
-`GET /api/chats` lists the chats the caller started or posted in (account is the
-caller, or label `poster:<email>`), newest first, at most 50, as
-`{conversation_id, session_id, title, account, modified}`. `GET
-/api/chats/<uuid>` returns `{conversation_id, session_id, title, account, live,
-forks, forked_from, forks_on_typing}` and is 404 until the assistant has opened the session; any signed-in user may
-read it, which is how a chat opens by link. Both are browser only. A chat that
-the caller's own `trax helper` opened (the local choice) is listed and found for
-the caller only.
+`GET /api/chats/<uuid>` returns `{conversation_id, session_id, title, account, live,
+forks, forked_from, forks_on_typing, audience, may_hide, shared_with, may_share,
+may_delete}` and is 404
+until the assistant has opened the session, and 410 `chat_deleted` once it was
+deleted (Deleting below); any signed-in user may
+read it, which is how a chat opens by link, though only its members read its
+records. It is browser only. A chat that
+the caller's own `trax helper` opened (the local choice) is found for its starter
+only. Its `session_id` is the assistant's session under the id whenever one exists,
+and `account` is the chat's starter (Forking below). `shared_with` lists the emails
+the chat is shared with, oldest share first,
+and is empty for anyone but its starter and an admin; `audience` is the chat's,
+`may_hide` whether the caller may hide it or show it again (its starter, unless it
+is `staff`), and `may_share` and `may_delete` whether the caller may share it and
+delete it (Sharing and Deleting below).
 
 Forking. A fork is a new science chat that starts from a line of another: its
 `account` is the forker, it has its own conversation id (the key), and the
@@ -696,26 +1076,115 @@ copies of the original's lines up to and including that line, read from the
 original's session, and adds a `produced_by` edge from the fork's session to the
 original's, labelled `chat-fork` and `fork-at:<part>:<idx>`. The original is not
 written, and a fork point is dropped for a conversation that already has lines. Spend,
-campaigns and History belong to the forker. `forks` on the original's head counts
+campaigns and the new station belong to the forker. `forks` on the original's head counts
 the conversations with such an edge to it, counting only an edge that the key that
 opened the fork's session added with the fork label; `forked_from` on a fork's
 head is the original's conversation (the earliest such edge). A helper's forks
-count for the forker alone, since the head counts what the viewer may find. Who
-may join a chat or must fork it is the server's `TRACKINIZER_CHAT_ORGS`:
-`domain` (the default, also when unset) makes each verified email domain one
-organisation, except the consumer domains (`gmail.com`, `googlemail.com`, `outlook.com`, `hotmail.com`,
-`live.com`, `yahoo.com`, `icloud.com`, `me.com`, `proton.me`, `protonmail.com`),
-which are none; `single` makes every user one organisation, and only a server
-whose users are all one organisation sets it. A person always joins their own
-chat. Anyone else's post into a chat of another organisation is 403 and queues
+count for the forker alone, since the head counts what the viewer may find. A
+person is always a member of their own chat, and so is each person it is shared
+with. Who else is one is the server's `TRACKINIZER_CHAT_ORGS`:
+`individual` (the default, also when unset) lets nobody else in; `domain` makes
+each email domain one organisation, whose members are the people Google's `hd`
+claim names members of it (never a consumer account, whatever its address), and the
+starter's organisation is; `single` makes every user one organisation, and only a
+server whose users are all one organisation sets it. Anyone else reads none of the
+chat, and their post
+is 403
+`{"detail": {"code": "chat_not_shared", "message": ...}}` and queues
 nothing, whether the conversation is named by `conversation_id` or by the
-`Idempotency-Key` of a post that names none; the chat's starter is the account of
-its oldest session (the assistant's first), or, before any session carries the
-id, the sender of the post that began it. A `fork` whose key names a conversation
-someone else began is 409. The head's `forks_on_typing` says a post is refused,
-and the browser then forks at the latest line instead (or on the 403, if it
-posted before the head was read). A `fork` is allowed to anyone, in a chat of their
-organisation too.
+`Idempotency-Key` of a post that names none. The chat's starter is the account of
+its oldest session that the assistant opened or that its own account's key opened
+(as a person's `trax helper` does), or, before any session carries the id, the
+sender of the post that began it. That one rule names the starter for a post, the
+head's `account`, sharing and deleting: any writer's key may open a session under a
+`chat:` id, and the assistant opens one for a poster a helper's chat is shared
+with, and neither makes anyone else the starter. Only a session start names a
+session's `chat:` id: an edit of `cli_session_id` (by its opening key or an admin
+alone) never moves a session into or out of one, and is 403 if it would. A post the
+assistant would answer
+in a chat a person's own helper began is 409, since only that helper reads it. A
+`fork` whose key names a conversation someone else began is 409. The head's
+`forks_on_typing` says the caller does not read the chat: they are no member, or it
+is `private` or `staff` and they may not read it; their post is refused, they read
+none of it, and the browser says so. A `fork` copies lines its poster reads, so it
+names a line of a chat they read; a line of any other chat is 422, as a line past
+the end of one is. A `private` or `staff` chat is not forked at all, since a fork's
+copies would not keep its audience: 409 `{"detail": {"code": "chat_fork_closed"}}`.
+Nor is a chat whose readers a fork's would not be among: a fork is open to its
+forker's organisation, so under `domain` a person a chat is shared with from another
+organisation posts in it and does not fork it, 409 `chat_fork_wider`. A consumer mail
+domain is no one's organisation, so its people fork what they read.
+A fork of a chat that was since deleted keeps its lines, and its `forked_from` is
+null.
+
+Sharing. `PUT /api/chats/<uuid>/shares/<email>` (writer role, browser only) shares a
+chat with one person, who then reads it and posts into it as its starter does;
+`DELETE` of the same path stops sharing it, so they read none of it from then on and
+their next line, by Chat or by a Console relay, is refused while their earlier lines
+stay. The email is stored lowercase; a malformed one is 422. A share follows the
+conversation, whatever sessions it holds. Only the chat's starter (Forking above says
+who that is) shares it; the starter or an admin unshares it. An admin's share, to
+anyone, itself included, is 403 `{"detail": {"code": "chat_not_starter"}}`, since a
+share lets its person read the chat and an admin reads no one else's. A `staff` chat
+is shared only with a person who holds `staff` now, else 409
+`{"detail": {"code": "chat_staff_only"}}`. An API key is 403, and anyone else is 403
+`chat_not_starter`; a chat the caller cannot find is 404.
+Either again changes nothing. The answer is the chat's shares, a JSON array of
+emails, oldest share first.
+
+Deleting. `DELETE /api/chats/<uuid>` (writer role) deletes a whole chat: every
+session under its id, whoever's key opened it, with its records (each purged as
+`DELETE /api/inquiries/<uuid>` purges a row, audited), its shares, and its binding
+to any station, whose next line then starts a new chat; each such station moves to
+its next `revision`, and its open tabs get a `workspace` frame without the chat at
+that revision. A tombstone keeps the id, and nothing starts the chat again: its
+head, a later post naming it, a `fork` keyed by it or from one of its lines,
+`POST /api/workspaces/for-chat/<uuid>` and `POST /api/sessions/start` with its
+`chat:<uuid>` id are each 410 `{"detail": {"code": "chat_deleted", "message":
+...}}`, and an append to one of its sessions is 404, as the session is gone. Lines
+still queued for it go with it. It answers 204, or 404 for a chat the
+caller cannot find. An admin deletes any chat, and so does the key that opened
+every session under its id; any other API key is 403, so a person's browser deletes
+it otherwise. Its starter deletes it while every person's line in it is theirs,
+counting only the sessions the assistant or the starter's own key opened (a line a
+fork copied from its original counts as its original poster's, a line on its way
+in as posted, whether still queued or taken by the assistant in the last 10 minutes
+and not yet recorded in one of those sessions, and a session whose audience they do
+not read as someone else's); once someone else has posted, the starter is 403
+`{"detail": {"code": "chat_has_other_posters"}}`. Anyone else is 403
+`{"detail": {"code": "chat_not_starter"}}`. A session that is locked, or linked to a
+locked row, needs an admin, as a purge does. The chat's forks stay. Its sessions'
+`change_log` rows stay, but each title and description they held is blanked (a
+title to `""`, a description to null): the log is append-only by convention, not
+by any constraint, and a deleted chat's words do not outlive it there.
+
+The answer in writing. While a turn runs, the assistant puts the answer it is
+writing at `PUT /api/sessions/<uuid>/partial`, a few times a second, with
+`{turn, text, done}`: `turn` is 1-64 of `A-Z a-z 0-9 _ -`, new for each line it
+answers; `text` is the answer so far, vetted and clipped, at most 16,384
+characters; `done` is true for the whole answer as posted, put once while its
+record is on its way. A put is refused, in this order: 404
+`{"detail": {"code": "chat_partials_off"}}` when the server streams no answers
+(`TRACKINIZER_CHAT_STREAMING=off`; `on` is the default, anything else stops the
+boot), 403 `not_the_assistant` from anyone but the configured assistant, 404 for
+no session, 404 `not_a_chat` for a session that is no science chat, 403 from a key
+that did not open it, and 409 `session_ended` once it ended. It answers 204.
+`DELETE /api/sessions/<uuid>/partial/<turn>` drops the partial if it is of `<turn>`
+and leaves a later turn's, with the same refusals but the last, and answers 204.
+`GET /api/sessions/<uuid>/partial?after=<seq>&wait_sec=<s>` answers `{seq, partial}`
+to whoever reads the session's records (403 `session_audience` otherwise, asked
+again before a changed partial is answered, so a reader unshared while the read
+was held sees none of what was written since): at once when the held `seq` is not
+`after`, else when the partial changes or expires, else after `wait_sec` (default
+0, at most 25) unchanged. `seq` names the partial held: drawn at random below
+2^53 when the chat held none, then one more per put, so it tells nothing of other
+chats; compare it for equality only. 0 and a null `partial` mean none is held. The
+server holds one partial per chat, in memory, for 60 s after its last put and at
+most 256 at once; none reaches the database, the change log or the event stream,
+and the stored answer is the record. It runs one process. Several would each hold
+their own partials and seqs, and a reader whose reads alternate between them would
+be answered at once every time, in a loop; they would need each session pinned to
+one process, or a channel they share.
 
 When a session ends with Chat lines it never drained, the unread lines of a
 science chat are queued again for the assistant's service session, which
@@ -728,25 +1197,27 @@ Only the key that opened a science chat writes or drains it, whoever that is and
 whether or not an assistant is configured (a session under a `chat:` id is one, a
 user's own `trax helper` chats included; a `trax-helper` session is drained by its
 key alone): appending records, ending it,
-editing any of its fields (its labels and account decide who sees it in History
-and which canvases the assistant may use) and purging it are 403 from any other
-key, a writer's included, and `POST /api/sessions/<uuid>/inbound` and
+editing any of its fields (its labels and account decide who may use it from a station
+and which stations the assistant may use) and purging it by id are 403 from any
+other key, a writer's included (an admin may purge it), and
+`POST /api/sessions/<uuid>/inbound` and
 `/api/messages` refuse it with 409 because a line sent that way names no
-conversation. A conversation has one session per assistant key that has spoken in
-it, since a session resumes only for the key that opened it; `GET /api/chats/<uuid>`
-and History name the live one, else the newest.
+conversation. A browser's `/api/messages` send to a science chat, live or idle, is
+refused with the same 409 and the detail "Open its station to talk to this
+chat". A conversation has one session per assistant key that has spoken in it,
+since a session resumes only for the key that opened it; `GET /api/chats/<uuid>`
+names the live one, else the newest.
 
 `GET /api/workspaces/<uuid>/events` streams the owner's canvas as server-sent
 events (browser only), and is the tab's one stream. Each frame is `data: <json>`
-with `t`, the server's epoch milliseconds: `{type: "workspace", state, shown}`
+with `t`, the server's epoch milliseconds: `{type: "workspace", state}`
 on open, after every applied operation, and when the partner changes (a
-session starts or ends, or its poller lease lapses), where `shown` is the
-instance an agent's `show` brought up and null for any other change;
-`{type: "navigate", route}`; `{type: "highlight", ids}`; and
+session starts or ends, or its poller lease lapses);
+`{type: "navigate", route}`; `{type: "highlight", ids}`; `{type: "chat", hidden}`; and
 `{type: "changed", id}` for each inquiry
 id `/api/web/subscribe` relays. A record appended to a science chat's session
-changes that session, so every viewer of it gets a `changed` frame and reads
-what the session gained. A comment goes out on open and after 25 s without a
+changes that session, so every viewer who reads its audience gets a `changed`
+frame and reads what the session gained. A comment goes out on open and after 25 s without a
 frame, and on each the server checks the user is still active and ends
 the stream if not. A subscriber more than 256 frames behind is dropped and
 reconnects from the `workspace` frame.
@@ -838,6 +1309,53 @@ revoke. Revoking a revoked machine, or one that never joined, is a no-op.
 `DELETE` answers 409 `machine_in_service` while the machine holds a live
 credential; revoke it first.
 
+### 1.27 Code store
+
+```
+POST   /api/code/blobs/missing
+POST   /api/code/blobs
+PUT    /api/code/records/<uuid>/snapshot
+GET    /api/code/records/<uuid>/snapshot
+GET    /api/code/records/<uuid>/file?path=<path>
+GET    /api/code/diff?from=<uuid>&to=<uuid>&context=<n>
+```
+
+Each record's code (a campaign iteration's Experiment), so any two records'
+diff shows with full context. A blob is one text file, named by the sha256 hex
+of its UTF-8 bytes and stored once per owner, zstd-compressed; dedupe never
+crosses owners. A snapshot maps a record's paths to blob hashes and names the
+record whose snapshot it builds on. The two `POST`s and the `PUT` are writer
+role; the `GET`s are viewer role. Bodies: section 3.28.
+
+An uploader asks which blobs are `missing`, sends those, then `PUT`s the
+snapshot. Each names an `owner`, which must be the caller's own email, compared
+lowercase, unless the caller holds `staff`; anything else answers 403. A
+non-staff caller replaces only a snapshot filed under its own email (403
+otherwise). The server checks each blob's hash against the UTF-8 of its text:
+a mismatch answers 422, as do a blob over 1 MiB, a request over 1000 blobs or
+8 MiB of text, and a `missing` request over 5000 hashes. A blob already stored
+is a no-op. The `PUT` answers 404 for an unknown record; 422 for a snapshot of
+over 20000 files, for a path that is not relative POSIX (an empty, `.` or `..`
+segment, a leading `/`, a NUL, over 1024 characters) and for a parent that is
+the record itself; 409 `code_blobs_missing`, naming how many, while a listed
+blob is not stored for the owner; and 409 `code_parent_missing` while the
+parent record holds no snapshot of the same owner. It replaces the record's
+snapshot, so filing the same one again changes only `updated_at`.
+
+A snapshot that is not `private` is read by any viewer who reads its record (a
+session's by those who read its transcript); a `private` one by its owner
+alone, with no staff or admin override. An unreadable or missing snapshot, a
+path the snapshot does not map, and a diff whose either side is unreadable or
+missing all answer 404, never 403. No answer carries the owner's email.
+
+`diff` lists the paths whose blob differs between the `from` and `to`
+snapshots, sorted by path, each with a unified diff of `context` lines
+(0..50, default 3). Both headers are always `--- a/<path>` and
+`+++ b/<path>`, for an added or deleted file too, and a last line with no
+newline is followed by `\ No newline at end of file`. The diffs total at most
+2,000,000 characters: the file that would pass that is cut after its last
+whole line within it, no later file is listed, and `more` is `true`.
+
 ## 2. Glossary
 
 ### 2.1 Route tokens
@@ -887,6 +1405,8 @@ issue_kind                  yes  yes    yes
 validation                  yes  no     yes
 priority                    yes  no     yes
 outcome                     yes  no     yes
+config                      yes  no     yes     one JSON object
+app                         yes  no     yes     one JSON object, at most 64 KiB
 abstract                    yes  no     yes
 authors                     yes  yes    yes
 publication_type            yes  no     yes
@@ -903,7 +1423,7 @@ url                         yes  no     yes
 query                       yes  no     yes
 provider                    yes  no     yes
 cli                         yes  no     yes
-cli_session_id              yes  no     yes
+cli_session_id              yes  no     yes     opening key or admin; never chat:
 started                     yes  no     yes
 rooms                       yes  yes    yes
 codechanges                 yes  yes    yes
@@ -1019,7 +1539,8 @@ reason  optional; default is empty string
 ```
 
 ```
-expected only valid for PUT owner, status, and judgement.
+expected only valid for PUT owner, status, judgement, and app.
+expected for app is the whole object read before; null when unset.
 expected omitted means blind overwrite.
 expected mismatch returns 409.
 expected on any other field returns 400.
@@ -1258,7 +1779,8 @@ action          -> {"ok": true}
       "role": "<role>",
       "status": "active" | "disabled",
       "created_at": "<ts>",
-      "last_login": "<ts>" | null
+      "last_login": "<ts>" | null,
+      "staff": <bool>
     }
   ]
 }
@@ -1312,7 +1834,7 @@ data: {"id": "<change_uuid>"}
 ### 3.24 Export lines
 
 ```
-{"format": "trackinizer-export", "version": 1, "migrations": ["schema.sql", ...]}
+{"format": "trackinizer-export", "version": 1, "migrations": ["schema.sql", ...], "audiences": ["open", "private", "staff"], "withheld_sessions": 0}
 {"table": "inquiries", "row": {"id": "<uuid>", "kind": "Issue", ...}}
 {"table": "edges", "row": {"from_id": "<uuid>", "edge_kind": "narrows", ...}}
 ...
@@ -1330,7 +1852,14 @@ The key is absent, not empty, when nothing was selected, so a whole-graph
 export is byte-identical to one written before selectors existed.
 
 The first line is the header: `migrations` names the applied schema files,
-so a reader knows which columns the rows carry. Every later line is one row
+so a reader knows which columns the rows carry, and `audiences` names, sorted,
+the audiences the caller reads. A session outside them has no row in
+`session_manifests`, `session_records` or `session_slash_commands`, though its
+`inquiries` row is there, so a file whose `audiences` lacks one the deployment
+holds is not a whole backup. `withheld_sessions` counts every session whose
+records the file left out, the ones the caller does not read (section 1.21); a file
+that counts any is not a whole backup either. Every later line
+is one row
 of one table, keyed by column name. Tables come in the order `inquiries`,
 `edges`, `change_log`, `experiment_metrics`, `session_manifests`,
 `session_records`, `session_slash_commands`, and rows in a fixed order within
@@ -1389,6 +1918,65 @@ NUL, an integer within 64 bits, a boolean, or a list of such strings; at most 64
 keys and 4096 bytes as compact JSON. `host_version` is at most 64 characters
 with no NUL. Anything else answers 422.
 
+### 3.27 Service accounts
+
+```
+POST /api/admin/service-accounts
+     {"name": "<name>", "role": "viewer" | "writer"}
+     -> 201 {"id": "<uuid>", "email": "<name>@service.invalid", "name": "<name>",
+             "role": "viewer" | "writer", "status": "active",
+             "created_at": "<ts>", "last_login": null, "staff": <bool>}
+POST /api/admin/service-accounts/<uuid>/tokens
+     {"name": "<label>", "role": "viewer" | "writer" | "admin" | null,
+      "open_into": "<audience>" | null}
+     -> 201 {"id": "<uuid>", "name": "<label>", "prefix": "<prefix>",
+             "role": "<role>", "open_into": "<audience>" | null,
+             "secret": "trax_..."}
+GET  /api/admin/service-accounts/<uuid>/tokens
+     -> 200 {"tokens": [{"id": "<uuid>", "name": "<label>", "prefix": "<prefix>",
+                         "role": "<role>", "open_into": "<audience>" | null,
+                         "created_at": "<ts>",
+                         "last_used_at": "<ts>" | null, "revoked_at": "<ts>" | null}]}
+POST /api/admin/service-accounts/<uuid>/tokens/<uuid>/revoke
+     -> 200 {"ok": true}
+```
+
+`name` matches `^[a-z][a-z0-9-]{1,30}$`; any other field, `email` among them,
+answers 422, as does `role: "admin"` on the account. A key's `role` and
+`open_into` are optional and default to the account's role and to no pin. `secret` is in the one answer that mints the key and in no
+later one.
+
+### 3.28 Code store
+
+```
+POST /api/code/blobs/missing   {"owner": "<email>", "sha256": ["<hex64>", ...]}
+                               -> 200 {"missing": ["<hex64>", ...]}
+POST /api/code/blobs           {"owner": "<email>", "blobs": [{"sha256": "<hex64>", "text": "<text>"}, ...]}
+                               -> 200 {"stored": <int>}
+PUT  /api/code/records/<uuid>/snapshot
+     {"owner": "<email>", "private": <bool>, "parent_record_id": "<uuid>" | null,
+      "files": {"<path>": "<hex64>", ...}, "partial": "<text>"}
+     -> 200 <head>
+GET  /api/code/records/<uuid>/snapshot
+     -> 200 <head> + {"files": [{"path": "<path>", "sha256": "<hex64>", "size": <int>}, ...]}
+GET  /api/code/records/<uuid>/file?path=<path>
+     -> 200 {"path": "<path>", "sha256": "<hex64>", "text": "<text>"}
+GET  /api/code/diff?from=<uuid>&to=<uuid>&context=<n>
+     -> 200 {"files": [{"path": "<path>", "change": "added" | "modified" | "deleted",
+                        "old_sha256": "<hex64>" | null, "new_sha256": "<hex64>" | null,
+                        "diff": "<unified diff>"}, ...], "more": <bool>}
+
+<head> = {"record_id": "<uuid>", "parent_record_id": "<uuid>" | null, "private": <bool>,
+          "file_count": <int>, "total_bytes": <int>, "partial": "<text>",
+          "updated_at": "<ts>"}
+```
+
+`<hex64>` is a lowercase sha256 hex. `missing` lists each missing hash once, in
+the order asked. `stored` counts the blobs new to the store. `partial` defaults
+to `""`; an uploader that stopped short says so there in one line.
+`total_bytes` sums the UTF-8 bytes of every file, a blob mapped at two paths
+counted twice, and `size` is one blob's. `files` is sorted by path.
+
 ## 4. Other details
 
 ### 4.1 HTTP status codes
@@ -1399,10 +1987,10 @@ with no NUL. Anything else answers 422.
 302  auth redirect
 400  invalid body, invalid field for kind, invalid projected edge mutation
 401  missing or invalid auth; an unusable enrollment token or machine credential
-403  role too low
+403  role too low; a service account's key on a route that manages keys; a grant beyond the caller's role or audiences; a chat's share or delete the caller may not make; a session's transcript the caller does not read (`session_audience`), or may not hide (`session_not_owner`), or a chat it may not read into (`chat_not_member`); code filed under another's email by a caller who does not hold `staff`
 404  row not found
-409  idempotency conflict, expected mismatch, immutable field, edge cycle, citation kind mismatch, plain value for a secret variable, machine in service, another host connected
-410  machine credential revoked
+409  idempotency conflict, expected mismatch, immutable field, edge cycle, citation kind mismatch, plain value for a secret variable, machine in service, another host connected, service account name taken or account disabled; a `staff` session hidden (`session_staff`), a private or staff chat forked (`chat_fork_closed`), a staff chat shared outside staff (`chat_staff_only`), a staff read into a private chat (`chat_private`); a code snapshot whose blob is not stored (`code_blobs_missing`) or whose parent holds none of its owner (`code_parent_missing`)
+410  machine credential revoked; a deleted science chat (`chat_deleted`)
 422  well-formed body rejected by domain validation (e.g. self-loop edge, priority on a non-priority edge kind)
 500  server fault
 503  secret variable requested and no secret backend is configured
@@ -1413,7 +2001,8 @@ with no body.
 
 Inquiry and edge mutations -- including `DELETE` (field unset, inquiry
 purge, edge remove) -- return `200` with a body carrying the `change_id`
-they produced (section 3.13). Admin user-DELETE returns `204` with no body.
+they produced (section 3.13). Admin user-DELETE and chat `DELETE` return `204` with
+no body.
 Workspace mutations return canvas state; they do not produce a graph change.
 
 ### 4.2 Roles
@@ -1423,7 +2012,8 @@ viewer  GET /api/** except GET /api/variables and GET /api/machines/**, GET /api
         PUT /api/me/visual-workspace,
         POST /api/workspaces, POST /api/workspaces/<uuid>/operations
 writer  viewer + inquiry/edge create/mutate/delete, GET /api/variables,
-        GET /api/machines/**
+        GET /api/machines/**, POST /api/code/blobs/**,
+        PUT /api/code/records/<uuid>/snapshot
 admin   writer + /api/admin/**, PUT/DELETE /api/variables/<name>,
         PUT/PATCH/DELETE /api/machines/**, POST /api/machines/enroll,
         POST /api/machines/<name>/revoke

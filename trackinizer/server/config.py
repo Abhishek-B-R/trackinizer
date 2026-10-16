@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, Self
 
 import os
+import re
 import shutil
 import time
 import uuid
@@ -32,7 +33,9 @@ __all__ = [
     "build_engine",
     "parse_assistant",
     "parse_chat_orgs",
+    "parse_chat_streaming",
     "parse_engine",
+    "parse_staff",
 ]
 
 
@@ -52,9 +55,11 @@ _DEFAULT_SESSION_MAX_AGE_SECONDS: int = (
 )  # house-ignore[globals] -- Shared default; threading would duplicate across the Config field default and the env-parse fallback.
 
 
-type ChatOrgs = Literal["single", "domain"]
-"""Who a science chat's starter shares an organisation with: everyone (``single``), or
-only those whose verified email has the starter's domain (``domain``)."""
+type ChatOrgs = Literal["single", "domain", "individual"]
+"""What an organisation is on this server, as a chat workspace has it: everyone
+(``single``), the people whose verified email has one domain (``domain``), or each
+person alone (``individual``). A person reads the open sessions and science chats of
+their organisation besides their own and the chats shared with them."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -85,6 +90,7 @@ class ConfigFlags(Protocol):
     session_max_age_seconds: int
     auth: bool
     assistant: str
+    staff: str
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -116,11 +122,25 @@ class Config:
       auth_disabled: Bypass auth -- every request becomes a synthetic
         admin. Local demos only; never in production.
       assistant: The Chat partner of every canvas; none when unset.
-      chat_orgs: ``domain`` (the default) gives each verified email domain its own
-        organisation, consumer domains none: a user outside the starter's forks the
-        chat instead. ``single`` makes every user one organisation, so a science chat
-        is always continued by typing in it; only a server whose users are all one
-        organisation sets it. Environment only (``TRACKINIZER_CHAT_ORGS``).
+      staff: Who holds the ``staff`` audience: patterns, each ``user@host`` or
+        ``*@domain``, lowercase. A domain pattern also needs Google's ``hd`` claim
+        to name the domain. Empty means nobody is staff and no staff session can
+        be opened. Deployment property: ``--staff`` or ``TRACKINIZER_STAFF``.
+      chat_orgs: The organisation mode: who reads an ``open`` session and an open
+        science chat besides its owner, a chat's starter and the people they shared
+        it with, and, for a session that is not a chat, the people who hold
+        ``staff`` or are admins. ``individual`` (the default) makes each person an
+        organisation of one, so nobody else reads what they do not share.
+        ``domain`` gives each email domain Google names a person a member of its
+        own organisation, and service accounts none, so a session or chat is read
+        by its organisation. ``single`` makes every user one organisation, so
+        every caller reads every open session and every person every open chat;
+        only a server whose users are all one organisation sets it. Environment
+        only (``TRACKINIZER_CHAT_ORGS``).
+      chat_streaming: Hold the answer a chat's assistant is writing, in memory, for
+        the chat's readers to read as it grows. Off refuses its routes with 404
+        ``chat_partials_off``, and the assistant stops sending it. Environment
+        only (``TRACKINIZER_CHAT_STREAMING``, ``on`` or ``off``).
 
     """
 
@@ -158,7 +178,9 @@ class Config:
     session_max_age_seconds: int = _DEFAULT_SESSION_MAX_AGE_SECONDS
     auth_disabled: bool = False
     assistant: Assistant | None = None
-    chat_orgs: ChatOrgs = "domain"
+    staff: tuple[str, ...] = ()
+    chat_orgs: ChatOrgs = "individual"
+    chat_streaming: bool = True
 
     @classmethod
     def from_env(cls) -> Self:
@@ -190,7 +212,11 @@ class Config:
             session_max_age_seconds=session_max_age_from_env(),
             auth_disabled=auth_disabled_from_env(),
             assistant=parse_assistant(os.environ.get("TRACKINIZER_ASSISTANT", "")),
+            staff=parse_staff(os.environ.get("TRACKINIZER_STAFF", "")),
             chat_orgs=parse_chat_orgs(os.environ.get("TRACKINIZER_CHAT_ORGS", "")),
+            chat_streaming=parse_chat_streaming(
+                os.environ.get("TRACKINIZER_CHAT_STREAMING", ""),
+            ),
         )
 
     @classmethod
@@ -222,8 +248,12 @@ class Config:
             session_max_age_seconds=flags.session_max_age_seconds,
             auth_disabled=not flags.auth,
             assistant=parse_assistant(flags.assistant),
-            # Like the secrets, a deployment property that no flag overrides.
+            staff=parse_staff(flags.staff),
+            # Like the secrets, deployment properties that no flag overrides.
             chat_orgs=parse_chat_orgs(os.environ.get("TRACKINIZER_CHAT_ORGS", "")),
+            chat_streaming=parse_chat_streaming(
+                os.environ.get("TRACKINIZER_CHAT_STREAMING", ""),
+            ),
         )
 
     def maintained_embedders(self) -> tuple[str, ...]:
@@ -306,11 +336,41 @@ def parse_assistant(value: str) -> Assistant | None:
     return Assistant(actor=actor.strip(), email=email.strip().lower())
 
 
-def parse_chat_orgs(value: str) -> ChatOrgs:
-    """Parse ``$TRACKINIZER_CHAT_ORGS``: ``single`` or ``domain``; blank is ``domain``.
+def parse_staff(value: str) -> tuple[str, ...]:
+    """Parse ``--staff`` / ``$TRACKINIZER_STAFF``: comma-separated staff patterns.
 
-    Blank is the safe value: a server that never set the variable must not let a
-    person from another organisation type into a chat that is not theirs.
+    Each pattern is ``user@host`` or ``*@domain``, the allowlist's grammar, so a bare
+    word or a lone ``*`` is a typo that would make everyone staff or no one.
+
+    Args:
+      value: The flag or variable; blank means nobody is staff.
+
+    Returns:
+      patterns: The patterns, lowercase and without repeats, in the order given.
+
+    Raises:
+      ConfigError: A pattern is not ``user@host`` or ``*@domain``.
+
+    """
+    patterns: dict[str, None] = {}
+    for raw in value.split(","):
+        pattern = raw.strip().lower()
+        if not pattern:
+            continue
+        if re.fullmatch(r"(?:[^@\s*]+|\*)@[^@\s*]+", pattern) is None:
+            raise ConfigError(
+                f"--staff takes user@host or *@domain patterns, got {raw.strip()!r}",
+            )
+        patterns[pattern] = None
+    return tuple(patterns)
+
+
+def parse_chat_orgs(value: str) -> ChatOrgs:
+    """Parse ``$TRACKINIZER_CHAT_ORGS``: ``single``, ``domain`` or ``individual``.
+
+    Blank is ``individual``, the mode that reads least: a server that never set the
+    variable lets no one read a session or a chat that is neither theirs nor shared
+    with them.
 
     Args:
       value: The variable.
@@ -323,13 +383,40 @@ def parse_chat_orgs(value: str) -> ChatOrgs:
 
     """
     match value.strip():
-        case "" | "domain":
+        case "domain":
             return "domain"
         case "single":
             return "single"
+        case "" | "individual":
+            return "individual"
         case other:
             raise ConfigError(
-                f"TRACKINIZER_CHAT_ORGS must be single or domain, got {other!r}",
+                "TRACKINIZER_CHAT_ORGS must be single, domain or individual, "
+                f"got {other!r}",
+            )
+
+
+def parse_chat_streaming(value: str) -> bool:
+    """Parse ``$TRACKINIZER_CHAT_STREAMING``: ``on`` or ``off``; blank is ``on``.
+
+    Args:
+      value: The variable.
+
+    Returns:
+      streaming: Whether a chat's answer in writing is held for its readers.
+
+    Raises:
+      ConfigError: The value is neither.
+
+    """
+    match value.strip():
+        case "" | "on":
+            return True
+        case "off":
+            return False
+        case other:
+            raise ConfigError(
+                f"TRACKINIZER_CHAT_STREAMING must be on or off, got {other!r}",
             )
 
 

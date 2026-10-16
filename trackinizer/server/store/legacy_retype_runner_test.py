@@ -18,10 +18,11 @@ import asyncio
 import json
 import re
 
+from treekle import ReadError, from_plain, mutable
+
 import pytest
 import pytest_asyncio
 
-from trackinizer.lib.codec import from_plain, mutable
 from trackinizer.server.embedders.stub import StubEmbedder
 from trackinizer.server.store import legacy_retype_runner
 from trackinizer.server.store.core import Store
@@ -70,9 +71,10 @@ async def _legacy_session(store: Store) -> UUID:
     async with store.engine.acquire() as conn:
         await conn.execute(_LEGACY_TABLE)
         await conn.execute(
-            "INSERT INTO inquiries (id, kind, seq, status, account, title) "
+            "INSERT INTO inquiries (id, kind, seq, status, account, title, "
+            "agentsession_audience) "
             "VALUES ($1, 'AgentSession', nextval('seq_agentsession'), 'active', "
-            "'tester@example.com', 'legacy')",
+            "'tester@example.com', 'legacy', 'open')",
             session_id,
         )
         await conn.execute(
@@ -365,6 +367,14 @@ def test_each_row_reads_as_a_source_naming_its_legacy_kind() -> None:
     ]
 
 
+def test_a_payload_that_is_not_an_object_is_refused_by_type() -> None:
+    """Only an object carries ``kind``; a list is a typed read error, not a crash."""
+    rows = _Rows([_row("UncategorizedRecord", '["kind"]')])
+
+    with pytest.raises(ReadError):
+        _read(rows, uuid4())
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -392,6 +402,13 @@ def test_a_malformed_row_names_the_field(
         _read(rows, uuid4())
 
 
+def test_a_payload_that_is_not_an_object_is_a_read_error() -> None:
+    """The payload parses as an object, so a list fails at the read, not later."""
+    rows = _Rows([_row("UserMessage", "[1]")])
+    with pytest.raises(ReadError):
+        _read(rows, uuid4())
+
+
 @pytest.mark.db_pglite
 @pytest.mark.asyncio(loop_scope="session")
 async def test_slash_command_without_timestamp_uses_capture_time(store: Store) -> None:
@@ -416,6 +433,6 @@ async def test_slash_command_without_timestamp_uses_capture_time(store: Store) -
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

@@ -6,10 +6,11 @@ from typing import TYPE_CHECKING
 
 import asyncio
 
+from treekle import from_plain
+
 import pytest
 import pytest_asyncio
 
-from trackinizer.lib.codec import from_plain
 from trackinizer.lib.postgres.testing import reset_schema
 from trackinizer.server.authority_sweep import (
     authority_sweep_loop,
@@ -90,6 +91,6 @@ async def test_loop_recomputes_on_startup_then_can_be_cancelled(store: Store) ->
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

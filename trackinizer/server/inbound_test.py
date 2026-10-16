@@ -13,6 +13,7 @@ import uuid
 import pytest
 
 from trackinizer.server.inbound import Inbound, InboundQueue
+from trackinizer.wire.wire_sessions import WorkspaceMessageContext
 
 
 class TestInboundQueue:
@@ -377,7 +378,183 @@ class TestSendIdempotency:
         assert q.pending(sid) == 1
 
 
+class TestAChatsLinesOnTheirWay:
+    """What a delete counts as posted: lines queued for a chat, or taken and unrecorded."""
+
+    _CHAT = uuid.UUID(int=1)
+    _OTHER = uuid.UUID(int=2)
+
+    def _line(self, sender: str, *, chat: uuid.UUID = _CHAT) -> Inbound:
+        return Inbound(
+            text="q",
+            source=sender,
+            context=WorkspaceMessageContext(
+                workspace_id=uuid.UUID(int=9),
+                visible_visuals=[],
+                conversation_id=chat,
+            ),
+        )
+
+    def test_a_line_is_counted_queued_then_taken_until_its_chat_records_it(
+        self,
+    ) -> None:
+        queue = InboundQueue()
+        session = uuid.uuid4()
+        queue.enqueue(session, self._line("Bob@example.com"))
+        queue.enqueue(session, self._line("ada@example.com", chat=self._OTHER))
+        queue.enqueue(session, Inbound(text="no chat", source="kim@example.com"))
+
+        queued = queue.conversation_senders(self._CHAT)
+        queue.hand_out(queue.drain(session), taker=None)
+        taken = queue.conversation_senders(self._CHAT)
+        queue.recorded(self._CHAT, senders=["bob@example.com", "zed@example.com"])
+
+        assert queued == taken == ["Bob@example.com"]
+        assert queue.conversation_senders(self._CHAT) == []
+        assert queue.conversation_senders(self._OTHER) == ["ada@example.com"]
+
+    def test_recording_forgets_one_taken_line_per_sender(self) -> None:
+        queue = InboundQueue()
+        queue.hand_out([self._line("bob@example.com")] * 2, taker=None)
+
+        queue.recorded(self._CHAT, senders=["bob@example.com"])
+
+        assert queue.conversation_senders(self._CHAT) == ["bob@example.com"]
+
+    def test_a_chats_delete_drops_its_queued_lines_and_forgets_its_taken_ones(
+        self,
+    ) -> None:
+        queue = InboundQueue(max_per_session=2)
+        session = uuid.uuid4()
+        queue.hand_out([self._line(f"p{n}@example.com") for n in range(3)], taker=None)
+        queue.enqueue(session, self._line("bob@example.com"))
+        queue.enqueue(session, self._line("ada@example.com", chat=self._OTHER))
+
+        capped = queue.conversation_senders(self._CHAT)
+        dropped = queue.drop_conversation(self._CHAT)
+
+        assert capped == ["bob@example.com", "p1@example.com", "p2@example.com"]
+        assert dropped == 1
+        assert queue.conversation_senders(self._CHAT) == []
+        assert [line.source for line in queue.drain(session)] == ["ada@example.com"]
+
+    def test_a_taken_line_never_recorded_stops_counting_after_its_ttl(self) -> None:
+        now = [0.0]
+        queue = InboundQueue(handed_ttl_sec=600.0, _clock=lambda: now[0])
+        queue.hand_out([self._line("bob@example.com")], taker=None)
+
+        now[0] = 599.0
+        within = queue.conversation_senders(self._CHAT)
+        now[0] = 600.0
+
+        assert (within, queue.conversation_senders(self._CHAT)) == (
+            ["bob@example.com"],
+            [],
+        )
+
+    def test_over_the_cap_the_chat_handed_a_line_longest_ago_is_forgotten(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        queue = InboundQueue(max_handed_chats=2)
+        third = uuid.UUID(int=3)
+        queue.hand_out([self._line("ada@example.com")], taker=None)
+        queue.hand_out([self._line("bob@example.com", chat=self._OTHER)], taker=None)
+        queue.hand_out([self._line("kim@example.com")], taker=None)
+
+        with caplog.at_level("WARNING"):
+            queue.hand_out([self._line("zed@example.com", chat=third)], taker=None)
+
+        assert [
+            queue.conversation_senders(chat)
+            for chat in (self._CHAT, self._OTHER, third)
+        ] == [["ada@example.com", "kim@example.com"], [], ["zed@example.com"]]
+        assert f"forgot those of chat {self._OTHER}" in caplog.text
+
+
+class TestTheKeyThatTookALine:
+    """Whose chat line each key took, which lets that key act for the line's poster."""
+
+    _TAKER = uuid.UUID(int=7)
+    _CHAT = uuid.UUID(int=1)
+    _BOB = "bob@example.com"
+
+    def _line(self, sender: str, *, chat: uuid.UUID | None = _CHAT) -> Inbound:
+        context = WorkspaceMessageContext(
+            workspace_id=uuid.UUID(int=9),
+            visible_visuals=[],
+            conversation_id=chat,
+        )
+        return Inbound(text="q", source=sender, context=context)
+
+    def test_only_the_taker_holds_the_posters_turn(self) -> None:
+        queue = InboundQueue()
+
+        queue.hand_out([self._line("Bob@example.com")], taker=self._TAKER)
+
+        assert queue.took_line(self._TAKER, poster="BOB@example.com")
+        assert not queue.took_line(uuid.UUID(int=8), poster=self._BOB)
+        assert not queue.took_line(self._TAKER, poster="ada@example.com")
+
+    def test_a_line_outside_a_chat_or_from_no_one_holds_no_turn(self) -> None:
+        queue = InboundQueue()
+        anonymous = self._line(self._BOB)
+
+        queue.hand_out([self._line(self._BOB, chat=None)], taker=self._TAKER)
+        queue.hand_out([Inbound(text="q", source="kim@example.com")], taker=self._TAKER)
+        queue.hand_out(
+            [Inbound(text="q", context=anonymous.context)],
+            taker=self._TAKER,
+        )
+
+        assert not queue.took_line(self._TAKER, poster=self._BOB)
+        assert not queue.took_line(self._TAKER, poster="kim@example.com")
+
+    def test_a_browser_drain_holds_no_turn_and_evicts_none(self) -> None:
+        queue = InboundQueue(max_turns=1)
+        queue.hand_out([self._line(self._BOB)], taker=self._TAKER)
+
+        queue.hand_out([self._line("ada@example.com")], taker=None)
+
+        assert queue.took_line(self._TAKER, poster=self._BOB)
+
+    def test_a_turn_outlives_the_lines_record_and_ends_at_its_ttl(self) -> None:
+        now = [0.0]
+        queue = InboundQueue(turn_ttl_sec=3_600.0, _clock=lambda: now[0])
+        queue.hand_out([self._line(self._BOB)], taker=self._TAKER)
+        queue.recorded(self._CHAT, senders=[self._BOB])
+
+        now[0] = 3_599.0
+        within = queue.took_line(self._TAKER, poster=self._BOB)
+        now[0] = 3_600.0
+
+        assert (within, queue.took_line(self._TAKER, poster=self._BOB)) == (True, False)
+
+    def test_a_later_line_renews_the_turn(self) -> None:
+        now = [0.0]
+        queue = InboundQueue(turn_ttl_sec=10.0, _clock=lambda: now[0])
+        queue.hand_out([self._line(self._BOB)], taker=self._TAKER)
+        now[0] = 8.0
+        queue.hand_out([self._line(self._BOB)], taker=self._TAKER)
+
+        now[0] = 15.0
+
+        assert queue.took_line(self._TAKER, poster=self._BOB)
+
+    def test_over_the_cap_the_turn_taken_longest_ago_is_forgotten(self) -> None:
+        queue = InboundQueue(max_turns=2)
+        for sender in ("ada@example.com", self._BOB, "ada@example.com"):
+            queue.hand_out([self._line(sender)], taker=self._TAKER)
+
+        queue.hand_out([self._line("kim@example.com")], taker=self._TAKER)
+
+        assert [
+            queue.took_line(self._TAKER, poster=each)
+            for each in ("ada@example.com", self._BOB, "kim@example.com")
+        ] == [True, False, True]
+
+
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

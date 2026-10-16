@@ -11,11 +11,12 @@ import argparse
 import gzip
 import json
 
+from treekle import from_plain, json_loads
+
 import httpx2
 import pytest
 
 from trackinizer.lib import zstd_compat
-from trackinizer.lib.codec import from_plain, loads
 from trackinizer.trax.profile import Profile
 from trackinizer.web.scripts import measure as measurement
 from trackinizer.web.scripts.measure import (
@@ -290,20 +291,18 @@ def test_moved_flags_a_median_time_or_size_over_2x_either_way() -> None:
         )
         return Row(name=name, samples=(sample,))
 
-    baseline = from_plain(
-        loads(
-            json.dumps(
-                report(
-                    [
-                        row("steady", 1.0, 1000),
-                        row("slower", 1.0, 1000),
-                        row("smaller", 1.0, 3000),
-                        row("gone", 1.0, 1000),
-                    ],
-                    stream=Stream(seconds=20.0, frames=0, distinct_ids=0, status=200),
-                    url="http://server",
-                    sha="abc",
-                ),
+    baseline = json_loads(
+        json.dumps(
+            report(
+                [
+                    row("steady", 1.0, 1000),
+                    row("slower", 1.0, 1000),
+                    row("smaller", 1.0, 3000),
+                    row("gone", 1.0, 1000),
+                ],
+                stream=Stream(seconds=20.0, frames=0, distinct_ids=0, status=200),
+                url="http://server",
+                sha="abc",
             ),
         ),
         dict[str, object],
@@ -346,15 +345,13 @@ def test_an_error_answer_is_reported_but_never_timed_as_a_read() -> None:
         (None, None),
     ]
     assert summaries[1]["statuses"] == [502]
-    baseline = from_plain(
-        loads(
-            json.dumps(
-                report(
-                    [Row(name="mixed", samples=(ok,))],
-                    stream=stream,
-                    url="u",
-                    sha="s",
-                ),
+    baseline = json_loads(
+        json.dumps(
+            report(
+                [Row(name="mixed", samples=(ok,))],
+                stream=stream,
+                url="u",
+                sha="s",
             ),
         ),
         dict[str, object],
@@ -367,15 +364,13 @@ def test_a_baseline_row_with_no_successful_answer_is_not_compared() -> None:
     refused = Sample(seconds=0.01, status=502, json_bytes=2, wire_bytes=2)
     ok = Sample(seconds=1.0, status=200, json_bytes=1000, wire_bytes=100)
     stream = Stream(seconds=1.0, frames=0, distinct_ids=0, status=200)
-    baseline = from_plain(
-        loads(
-            json.dumps(
-                report(
-                    [Row(name="r", samples=(refused,))],
-                    stream=stream,
-                    url="u",
-                    sha="s",
-                ),
+    baseline = json_loads(
+        json.dumps(
+            report(
+                [Row(name="r", samples=(refused,))],
+                stream=stream,
+                url="u",
+                sha="s",
             ),
         ),
         dict[str, object],
@@ -451,8 +446,7 @@ def test_two_reports_in_one_second_never_overwrite_each_other(tmp_path: Path) ->
 
     assert first != second
     assert [
-        from_plain(loads(p.read_text()), dict[str, object])["run"]
-        for p in (first, second)
+        json_loads(p.read_text(), dict[str, object])["run"] for p in (first, second)
     ] == [
         1,
         2,
@@ -540,6 +534,6 @@ def _body(path: str) -> object:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

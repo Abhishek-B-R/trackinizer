@@ -28,11 +28,14 @@ import pytest
 from trackinizer.server.api._deps import (
     get_assistant,
     get_chat_orgs,
+    get_chat_streaming,
     get_hub,
+    get_partials,
     tag_kind,
     tag_row,
 )
 from trackinizer.server.chat_hub import ChatHub
+from trackinizer.server.chat_partials import ChatPartials
 from trackinizer.server.config import Assistant, Config
 from trackinizer.types import inquiries
 from trackinizer.types.cost import Cost
@@ -212,6 +215,37 @@ class TestGetHub:
         assert get_hub(_request(app)) is replaced
 
 
+class TestGetPartials:
+    def test_an_app_gets_one_store_of_partials_on_first_use(self) -> None:
+        app = FastAPI()
+        first = get_partials(_request(app))
+        assert get_partials(_request(app)) is first
+        assert get_partials(_request(FastAPI())) is not first
+
+    def test_an_app_keeps_the_partials_it_was_given_and_replaces_anything_else(
+        self,
+    ) -> None:
+        app = FastAPI()
+        given = ChatPartials()
+        app.state.partials = given
+        kept = get_partials(_request(app))
+        app.state.partials = "not partials"
+        assert kept is given
+        assert isinstance(get_partials(_request(app)), ChatPartials)
+
+
+class TestGetChatStreaming:
+    def test_a_server_streams_unless_its_config_turns_it_off(self) -> None:
+        app = FastAPI()
+        assert get_chat_streaming(_request(app)) is True
+        app.state.config = "not a config"
+        assert get_chat_streaming(_request(app)) is True
+        app.state.config = Config()
+        assert get_chat_streaming(_request(app)) is True
+        app.state.config = Config(chat_streaming=False)
+        assert get_chat_streaming(_request(app)) is False
+
+
 class TestGetAssistant:
     def test_the_assistant_is_the_configs(self) -> None:
         app = FastAPI()
@@ -229,15 +263,15 @@ class TestGetAssistant:
 
 
 class TestGetChatOrgs:
-    def test_a_server_groups_users_by_domain_unless_its_config_says_single(
+    def test_a_server_is_individual_unless_its_config_says_otherwise(
         self,
     ) -> None:
         app = FastAPI()
-        assert get_chat_orgs(_request(app)) == "domain"
+        assert get_chat_orgs(_request(app)) == "individual"
         app.state.config = "not a config"
-        assert get_chat_orgs(_request(app)) == "domain"
+        assert get_chat_orgs(_request(app)) == "individual"
         app.state.config = Config()
-        assert get_chat_orgs(_request(app)) == "domain"
+        assert get_chat_orgs(_request(app)) == "individual"
         app.state.config = Config(chat_orgs="single")
         assert get_chat_orgs(_request(app)) == "single"
 
@@ -248,6 +282,36 @@ class TestTagRow:
         expected = cast(dict[str, object], jsonable_encoder(issue))
         expected["kind"] = "Issue"
         assert tag_row(issue) == expected
+
+    @pytest.mark.parametrize("subclass", _KINDS)
+    def test_named_fields_are_the_whole_rows_keys_in_order(
+        self,
+        subclass: type[Inquiry],
+    ) -> None:
+        instance = _populated(subclass)
+        whole = tag_row(instance)
+        for names in (
+            frozenset({"id", "title", "kind"}),
+            frozenset({"labels", "created", "judgement"}),
+            frozenset(whole),
+        ):
+            named = tag_row(instance, names)
+            assert named == {key: value for key, value in whole.items() if key in names}
+            assert list(named) == [key for key in whole if key in names]
+
+    def test_a_field_not_named_is_never_serialized(self) -> None:
+        # A list sends 50-1,000 rows; walking an Experiment's config and outcome
+        # only to drop them was most of a slim list's time.
+        experiment = dataclasses.replace(
+            _populated(Experiment),
+            config={"unserializable": {"a set"}},
+        )
+        assert tag_row(experiment, frozenset({"id", "kind"})) == {
+            "id": str(experiment.id),
+            "kind": "Experiment",
+        }
+        with pytest.raises(TypeError, match="set"):
+            tag_row(experiment, frozenset({"config"}))
 
 
 class TestTagKind:
@@ -349,6 +413,6 @@ class TestTagKind:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

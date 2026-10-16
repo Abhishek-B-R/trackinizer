@@ -7,7 +7,8 @@ from typing import Final
 
 import json
 
-from trackinizer.lib.codec import from_plain, loads
+from treekle import from_plain, json_loads
+
 from trackinizer.server.visuals.catalog import default_catalog
 
 
@@ -27,10 +28,7 @@ def test_every_catalog_visual_has_matching_frontend_renderer() -> None:
     manifest = _CWD / "src/visuals/renderer-versions.json"
     versions = {
         key: from_plain(value, int)
-        for key, value in from_plain(
-            loads(manifest.read_bytes()),
-            dict[str, object],
-        ).items()
+        for key, value in json_loads(manifest.read_bytes(), dict[str, object]).items()
     }
     assert versions == {
         visual.type: visual.version for visual in default_catalog().visuals
@@ -63,6 +61,6 @@ def test_timeline_is_bounded_and_record_scoped() -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

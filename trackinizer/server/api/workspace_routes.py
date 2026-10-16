@@ -7,16 +7,20 @@ from typing import Annotated
 
 import uuid
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from trackinizer.server.api._deps import get_assistant, get_hub, get_inbound
 from trackinizer.server.api._routes_shared import engine_of, require_browser
+from trackinizer.server.api.session_access import resolve_asker, session_reader
 from trackinizer.server.api.visuals_routes import visual_catalog
+from trackinizer.server.audience import TranscriptPings
 from trackinizer.server.auth import AuthIdentity, require_role
 from trackinizer.server.chat_hub import (
+    ChatFrame,
     HighlightFrame,
     NavigateFrame,
+    PreferencesFrame,
     WorkspaceFrame,
     iter_workspace_events,
 )
@@ -24,18 +28,33 @@ from trackinizer.server.notify import iter_changed_ids
 from trackinizer.server.visuals.workspace_store import (
     ReplayConflictError,
     RevisionConflictError,
+    StationNameTakenError,
     WorkspaceKeyRefusedError,
     apply_workspace_operation,
-    create_default_workspace,
+    campaign_for_chat,
+    list_workspaces,
+    new_workspace,
+    open_latest_workspace,
     read_workspace,
+    rename_workspace,
+    set_workspace_campaign,
+    set_workspace_layout,
+    set_workspace_page,
+    workspace_for_chat,
 )
 from trackinizer.server.visuals.workspaces import (
     ApplyWorkspaceOperation,
+    ChatWindow,
     Highlight,
     Navigate,
-    ShowVisual,
+    RenameWorkspace,
+    SetPage,
+    SetPreferences,
+    StationLayout,
+    WorkspaceCampaign,
     WorkspaceConflict,
     WorkspaceState,
+    WorkspaceSummary,
 )
 
 
@@ -52,14 +71,15 @@ async def workspace_events_route(
 
     Each frame is ``data: <json>`` with ``t``, the server's epoch milliseconds:
     ``workspace`` carries the whole canvas on open, after every change by a
-    browser or an agent, and when its partner changes, with ``shown`` naming the
-    instance an agent's show brought up; ``navigate`` an agent's
-    move of the page; ``highlight`` the inquiries it points at; and ``changed`` an
+    browser or an agent, and when its partner changes; ``navigate`` an agent's
+    move of the page; ``highlight`` the inquiries it points at; ``chat`` whether it
+    hid (``hidden``) the tab's Chat window; and ``changed`` an
     inquiry id, as ``/api/web/subscribe`` relays it, so a tab needs this one stream.
     A Chat conversation is an AgentSession, so a line added to it reaches every
-    viewer of the session as the session's ``changed`` id; no frame is Chat's own.
-    The stream opens with a comment and sends another after 25 s without a frame. A subscriber more than 256 frames
-    behind is dropped; it reconnects from the ``workspace`` frame.
+    viewer who reads the session as the session's ``changed`` id; no frame is Chat's
+    own. The stream opens with a comment and sends another after 25 s without
+    a frame. A subscriber more than 256 frames behind is dropped; it reconnects from
+    the ``workspace`` frame.
 
     Args:
       workspace_id: Canvas to follow.
@@ -84,7 +104,13 @@ async def workspace_events_route(
             workspace_id=workspace_id,
             read_state=read_state,
             is_active=partial(_owner_is_active, request, user_id=identity.user_id),
-            changes=iter_changed_ids(engine_of(request)),
+            changes=iter_changed_ids(
+                engine_of(request),
+                hears=TranscriptPings(
+                    engine=engine_of(request),
+                    reader=session_reader(request, identity),
+                ).hears,
+            ),
         ),
         media_type="text/event-stream",
     )
@@ -95,23 +121,284 @@ async def create_workspace_route(
     request: Request,
     identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
 ) -> WorkspaceState:
-    """Create or reopen the principal's default visual workspace.
+    """Open the station the principal changed last, making the first if none.
 
     Args:
       request: Request carrying the database engine.
       identity: Authenticated browser account.
 
     Returns:
-      state: The principal's default workspace.
+      state: The principal's station changed last.
 
     """
     require_browser(identity)
-    return await create_default_workspace(
+    return await open_latest_workspace(
         engine_of(request),
         user_id=identity.user_id,
         catalog=visual_catalog(request).catalog(),
         inbound=get_inbound(request),
         assistant=get_assistant(request),
+    )
+
+
+@router.get("/api/workspaces", response_model=list[WorkspaceSummary])
+async def list_workspaces_route(
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+) -> list[WorkspaceSummary]:
+    """List the principal's stations, the one changed last first.
+
+    Args:
+      request: Request carrying the database engine.
+      identity: Authenticated browser account.
+
+    Returns:
+      stations: Their ids, names, chats, pages and times.
+
+    """
+    require_browser(identity)
+    return await list_workspaces(engine_of(request), user_id=identity.user_id)
+
+
+@router.post("/api/workspaces/new", response_model=WorkspaceState)
+async def new_workspace_route(
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+) -> WorkspaceState:
+    """Make a station named with the lowest free ``unnamed-workstream#N``.
+
+    Args:
+      request: Request carrying the database engine.
+      identity: Authenticated browser account.
+
+    Returns:
+      state: The new station.
+
+    """
+    require_browser(identity)
+    return await new_workspace(
+        engine_of(request),
+        user_id=identity.user_id,
+        catalog=visual_catalog(request).catalog(),
+        inbound=get_inbound(request),
+        assistant=get_assistant(request),
+    )
+
+
+@router.post(
+    "/api/workspaces/for-chat/{conversation_id}",
+    response_model=WorkspaceState,
+)
+async def workspace_for_chat_route(
+    conversation_id: uuid.UUID,
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+) -> WorkspaceState:
+    """Find the principal's station that holds a chat, or make one bound to it.
+
+    A chat that was deleted is 410 ``chat_deleted``, and no station is bound to it.
+
+    Args:
+      conversation_id: The science chat to continue.
+      request: Request carrying the database engine.
+      identity: Authenticated browser account.
+
+    Returns:
+      state: The station that holds the chat.
+
+    """
+    require_browser(identity)
+    return await workspace_for_chat(
+        engine_of(request),
+        user_id=identity.user_id,
+        conversation_id=conversation_id,
+        catalog=visual_catalog(request).catalog(),
+        inbound=get_inbound(request),
+        assistant=get_assistant(request),
+    )
+
+
+@router.get(
+    "/api/workspaces/for-chat/{conversation_id}/campaign",
+    response_model=WorkspaceCampaign,
+)
+async def campaign_for_chat_route(
+    conversation_id: uuid.UUID,
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+    asker: str | None = None,
+) -> WorkspaceCampaign:
+    """Read the campaign setup of the asker's station that holds a chat.
+
+    Only the configured assistant may read for an ``asker``, and it reads the asker's
+    own station, so one writer's setup never governs another's launch from a shared
+    chat. A launch takes this setup where the asker's line leaves a field unset.
+
+    Args:
+      conversation_id: The science chat the station holds.
+      request: Request carrying the database engine and the configuration.
+      identity: The assistant's agent key.
+      asker: The account the assistant reads for.
+
+    Returns:
+      setup: The station's setup, or a null ``campaign`` when there is none.
+
+    """
+    found = await resolve_asker(request, identity=identity, email=asker)
+    if found is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the assistant may read a campaign setup for an asker.",
+        )
+    return WorkspaceCampaign(
+        campaign=await campaign_for_chat(
+            engine_of(request),
+            email=found.email,
+            conversation_id=conversation_id,
+        ),
+    )
+
+
+@router.patch(
+    "/api/workspaces/{workspace_id}",
+    response_model=WorkspaceState,
+    responses={409: {"description": "The principal has a station of that name."}},
+)
+async def rename_workspace_route(
+    workspace_id: uuid.UUID,
+    body: RenameWorkspace,
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+) -> WorkspaceState:
+    """Rename one of the principal's stations.
+
+    Args:
+      workspace_id: The station.
+      body: The new name, 1 to 120 characters once trimmed.
+      request: Request carrying the database engine.
+      identity: Authenticated browser account, which must own the station.
+
+    Returns:
+      state: The renamed station.
+
+    """
+    require_browser(identity)
+    try:
+        state = await rename_workspace(
+            engine_of(request),
+            user_id=identity.user_id,
+            workspace_id=workspace_id,
+            name=body.name,
+            inbound=get_inbound(request),
+            assistant=get_assistant(request),
+        )
+    except StationNameTakenError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    if state is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return state
+
+
+@router.put("/api/workspaces/{workspace_id}/page", status_code=204)
+async def set_workspace_page_route(
+    workspace_id: uuid.UUID,
+    body: SetPage,
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+) -> Response:
+    """Remember the page a station is on, so switching back can restore it.
+
+    No revision changes and nothing is published.
+
+    Args:
+      workspace_id: The station.
+      body: The `#/...` page.
+      request: Request carrying the database engine.
+      identity: Authenticated browser account, which must own the station.
+
+    Returns:
+      response: Empty.
+
+    """
+    require_browser(identity)
+    if not await set_workspace_page(
+        engine_of(request),
+        user_id=identity.user_id,
+        workspace_id=workspace_id,
+        route=body.route,
+    ):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return Response(status_code=204)
+
+
+@router.put("/api/workspaces/{workspace_id}/layout", status_code=204)
+async def set_workspace_layout_route(
+    workspace_id: uuid.UUID,
+    body: StationLayout,
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+) -> Response:
+    """Remember how a station's columns and windows were left.
+
+    Each key in the body replaces the stored key; the rest stay. No revision
+    changes and nothing is published.
+
+    Args:
+      workspace_id: The station.
+      body: The layout keys to store, as fractions of the stage.
+      request: Request carrying the database engine.
+      identity: Authenticated browser account, which must own the station.
+
+    Returns:
+      response: Empty.
+
+    """
+    require_browser(identity)
+    if not await set_workspace_layout(
+        engine_of(request),
+        user_id=identity.user_id,
+        workspace_id=workspace_id,
+        layout=body,
+    ):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return Response(status_code=204)
+
+
+@router.put("/api/workspaces/{workspace_id}/campaign", response_model=WorkspaceState)
+async def set_workspace_campaign_route(
+    workspace_id: uuid.UUID,
+    body: WorkspaceCampaign,
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+) -> WorkspaceState:
+    """Store the default campaign setup of one of the principal's stations.
+
+    The whole setup replaces what was stored, and a null ``campaign`` clears it. Only
+    the station's owner may write it; a launch from its chat takes the setup where the
+    asker's line leaves a field unset. No revision changes and nothing is published.
+
+    Args:
+      workspace_id: The station.
+      body: The setup to store, or a null ``campaign`` to clear it.
+      request: Request carrying the database engine.
+      identity: Authenticated browser account, which must own the station.
+
+    Returns:
+      state: The station with its setup as stored.
+
+    """
+    require_browser(identity)
+    if not await set_workspace_campaign(
+        engine_of(request),
+        user_id=identity.user_id,
+        workspace_id=workspace_id,
+        campaign=body.campaign,
+    ):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    return await _current_state(
+        request,
+        user_id=identity.user_id,
+        workspace_id=workspace_id,
     )
 
 
@@ -162,9 +449,11 @@ async def workspace_operation_route(
 ) -> WorkspaceState | JSONResponse:
     """Apply one revisioned operation and return the updated canvas.
 
-    A ``navigate`` or ``highlight`` operation, which only an agent key may send,
-    changes neither a visual nor the revision: it pushes a ``navigate`` or
-    ``highlight`` frame. A replay of an applied key returns the original state and
+    A ``navigate``, ``highlight``, ``chat`` or ``preferences`` operation, which only an
+    agent key may send, changes neither a visual nor the revision: it pushes a
+    ``navigate``, ``highlight`` or ``chat`` frame to this station, or, for
+    ``preferences``, which changes the owner's preferences, a ``preferences`` frame
+    to every station of the owner. A replay of an applied key returns the original state and
     publishes nothing.
 
     Args:
@@ -215,22 +504,23 @@ async def workspace_operation_route(
     if not applied.replayed:
         hub = get_hub(request)
         if isinstance(body.operation, Navigate):
+            if applied.restored_page:
+                hub.publish(workspace_id, frame=WorkspaceFrame(state=applied.state))
             hub.publish(workspace_id, frame=NavigateFrame(route=body.operation.route))
         elif isinstance(body.operation, Highlight):
             hub.publish(workspace_id, frame=HighlightFrame(ids=body.operation.ids))
+        elif isinstance(body.operation, ChatWindow):
+            hub.publish(workspace_id, frame=ChatFrame(hidden=body.operation.hidden))
+        elif isinstance(body.operation, SetPreferences):
+            # The stream is the owner's browser alone, so their tabs get every key.
+            if applied.preferences is not None:
+                for station in applied.stations:
+                    hub.publish(
+                        station,
+                        frame=PreferencesFrame(preferences=applied.preferences),
+                    )
         else:
-            # A show focuses what it shows. The browser moves Chat out of the way
-            # of an agent's show, and never of its owner's own.
-            shown = (
-                applied.state.focused_instance
-                if identity.api_key_id is not None
-                and isinstance(body.operation, ShowVisual)
-                else None
-            )
-            hub.publish(
-                workspace_id,
-                frame=WorkspaceFrame(state=applied.state, shown=shown),
-            )
+            hub.publish(workspace_id, frame=WorkspaceFrame(state=applied.state))
     return applied.state
 
 

@@ -9,12 +9,13 @@ from typing import TYPE_CHECKING
 
 import uuid
 
+from treekle import from_plain, json_loads
+
 import httpx2
 import pytest
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.codec import from_plain, loads
 from trackinizer.trax.profile import Profile
 from trackinizer.web.scripts.mirror_local import (
     Activity,
@@ -459,7 +460,7 @@ class _Target:
 
     def handle(self, request: httpx2.Request) -> httpx2.Response:
         path = request.url.path
-        raw = loads(request.content or b"null")
+        raw = json_loads(request.content or b"null")
         body = {} if raw is None else from_plain(raw, dict[str, object])
         if request.method == "GET":
             return self._get(path)
@@ -545,6 +546,6 @@ class _Target:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

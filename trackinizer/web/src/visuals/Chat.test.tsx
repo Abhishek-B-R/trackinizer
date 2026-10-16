@@ -1,12 +1,14 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { type ChatHead, getChatHead, listChats, sendChatLine } from "../api/chats";
-import { ApiError } from "../api/client";
+import { CHAT_DELETED, CHAT_FORK_CLOSED, CHAT_FORK_WIDER, CHAT_NOT_SHARED, CHAT_STAFF_ONLY, type ChatHead, type ChatPartial, type ChatPartialState, deleteChat, getChatHead,
+  readChatPartial, sendChatLine, shareChat, unshareChat } from "../api/chats";
+import { stationForChat } from "../api/stations";
+import { ApiError, type CallOptions } from "../api/client";
 import { findRef, getDetail } from "../api/detail";
 import type { Profile } from "../api/me";
-import { listSessionParts, readSessionRecords, type SessionRecord } from "../api/sessions";
-import type { WorkspaceState } from "../api/workspaces";
+import { listSessionParts, readSessionRecords, SESSION_NOT_OWNER, SESSION_STAFF, type SessionRecord, setSessionAudience } from "../api/sessions";
+import { getWorkspace, type WorkspaceState } from "../api/workspaces";
 import { MetaContext, ProfileContext } from "../app/boot";
 import { HighlightContext, HighlightStore } from "../app/highlights";
 import { META } from "../detail/testing";
@@ -14,36 +16,48 @@ import { LiveContext } from "../live";
 import type { LiveHub } from "../live/hub";
 import type { LiveQuery } from "../live/serial";
 import { startTrail } from "../router/trail";
-import { chooseHighlightMentions } from "../settings/highlightMentions";
+import { chooseChatStyle } from "../chatStyle";
+import { preferences, receivePreferences, sendWaiting } from "../preferences";
 import { Chat } from "./Chat";
+import { setStation, currentStation } from "../stations/store";
+import { useStation } from "../stations/useStation";
+import { currentChatColumn, setChatHidden, setChatSide } from "./chatColumnState";
 import { ChatFeed, ChatFeedContext } from "./chatFeed";
+import { FOLLOW_UP_ASK } from "./chatFollowUp";
 import { OPENING } from "./chatRecords";
-import { canvasActions } from "./testing";
-import { WorkspaceActionsProvider } from "./workspaceActions";
+import { ToastProvider } from "../ui/toast";
 import { AGREED } from "../api/testing";
 
 vi.mock("../api/chats", async (original) => ({
   ...(await original<typeof import("../api/chats")>()),
-  listChats: vi.fn(),
   getChatHead: vi.fn(),
+  readChatPartial: vi.fn(),
   sendChatLine: vi.fn(),
+  shareChat: vi.fn(),
+  unshareChat: vi.fn(),
+  deleteChat: vi.fn(),
 }));
-vi.mock("../api/sessions", () => ({ listSessionParts: vi.fn(), readSessionRecords: vi.fn() }));
+vi.mock("../api/stations", () => ({ stationForChat: vi.fn() }));
+vi.mock("../api/workspaces", () => ({ getWorkspace: vi.fn() }));
+vi.mock("../api/sessions", async (original) => ({
+  ...(await original<typeof import("../api/sessions")>()),
+  listSessionParts: vi.fn(),
+  readSessionRecords: vi.fn(),
+  setSessionAudience: vi.fn(),
+}));
 vi.mock("../api/detail", () => ({ getDetail: vi.fn(), findRef: vi.fn() }));
 
 const WORKSPACE_ID = "c5286865-67b6-4bd8-ab51-e06e10c326c5";
-const STORED = `trackinizer.v2.chat.${WORKSPACE_ID}`;
 const ME = "ada@example.com";
 const GRACE = "grace@example.com";
 const SCOUT = { kind: "shared", session_id: "kb-session", actor: "scout", cli: "sagent", status: "live" } as const;
 const NO_HELPER = { kind: "local", session_id: null, actor: null, cli: null, status: "unavailable" } as const;
 const workspace: WorkspaceState = {
-  id: WORKSPACE_ID, revision: 3, focused_instance: null, partner: SCOUT, assistant: "scout", partner_choice: "shared",
-  visuals: [{ id: "889ffcb2-cf44-43e7-9806-eb08428c6203", type: "trax.chat", version: 1,
+  id: WORKSPACE_ID, name: "unnamed-workstream#1", conversation_id: null, page: null, revision: 3, focused_instance: null, partner: SCOUT, assistant: "scout", partner_choice: "shared",
+  visuals: [{ id: "889ffcb2-cf44-43e7-9806-eb08428c6203", type: "trax.browse", version: 1,
     placement: "main", record_id: null, params: {} }],
 };
 const PROFILE: Profile = { user_id: "u1", email: ME, name: "Ada", role: "writer", last_login: null, visual_workspace_enabled: true, ...AGREED };
-const CREATED = "2026-10-03T10:00:00.000000Z";
 
 /** The records of the session each conversation is held in, as the fake server has them. */
 const sessions = new Map<string, SessionRecord[]>();
@@ -51,9 +65,9 @@ const sessions = new Map<string, SessionRecord[]>();
 let registered: LiveQuery[] = [];
 
 beforeEach(() => {
+  vi.mocked(getWorkspace).mockResolvedValue({ ...workspace, id: "w-fork", name: "unnamed-workstream#2", conversation_id: "f1" });
   OPENING.everyMs = 5;
   OPENING.giveUpMs = 150;
-  vi.mocked(listChats).mockResolvedValue([]);
   // A cited row resolves to an id unless a test says otherwise, as the server's route answers.
   vi.mocked(findRef).mockImplementation(async (kind, seq) => `id-${kind}-${seq}`);
   vi.mocked(listSessionParts).mockImplementation(async (id) => {
@@ -63,26 +77,61 @@ beforeEach(() => {
   vi.mocked(readSessionRecords).mockImplementation(async (id, { afterIdx, limit }) =>
     (sessions.get(id) ?? []).filter((record) => record.idx > afterIdx).slice(0, limit));
   vi.mocked(getChatHead).mockImplementation(async (id) => (sessions.has(`s-${id}`) ? head(id) : null));
+  vi.mocked(readChatPartial).mockImplementation(heldPartial);
 });
 
+/** The reply the assistant is writing, as the server holds it for every chat; `write` changes it. */
+let partial: ChatPartialState = { seq: 0, partial: null };
+let wakePartial = () => {};
+
+/** A read of the partial, which the server holds until its seq is not `after`. */
+async function heldPartial(_session: string, after: number, { signal }: CallOptions = {}): Promise<ChatPartialState> {
+  while (partial.seq === after) {
+    await new Promise<void>((resolve, reject) => {
+      wakePartial = resolve;
+      signal?.addEventListener("abort", () => reject(signal.reason));
+    });
+  }
+  return partial;
+}
+
+/** The assistant writes `next` as the reply under way; null clears it. */
+async function write(next: ChatPartial | null) {
+  await act(async () => {
+    partial = { seq: partial.seq + 1, partial: next };
+    wakePartial();
+  });
+}
+
 let stopTrail = () => {};
-afterEach(() => {
+/** What a fork's first line is answered with: a station of its own, holding the new conversation. */
+const FORKED = { conversation_id: "f1", session_id: null, workspace_id: "w-fork" };
+/** The conversation the station holds, set by `open`. */
+let opened: string | null = null;
+afterEach(async () => {
+  opened = null;
+  partial = { seq: 0, partial: null };
+  setStation(null);
   vi.useRealTimers();
   stopTrail();
   stopTrail = () => {};
   cleanup();
   vi.restoreAllMocks();
-  for (const mock of [getChatHead, listChats, sendChatLine, listSessionParts, readSessionRecords, getDetail, findRef]) vi.mocked(mock).mockReset();
+  for (const mock of [getChatHead, readChatPartial, sendChatLine, shareChat, unshareChat, deleteChat, stationForChat, getWorkspace, listSessionParts, readSessionRecords, setSessionAudience, getDetail, findRef]) {
+    vi.mocked(mock).mockReset();
+  }
   sessions.clear();
   registered = [];
   localStorage.clear();
-  chooseHighlightMentions(ME, true);
+  // A save still on its way (a flip of Chat's side, a style) would make the page ignore the next test's preferences.
+  await sendWaiting();
+  receivePreferences({ ...preferences(), highlight_mentions: true });
   history.replaceState(null, "", "#/");
 });
 
 function head(conversation: string, account = ME, extra: Partial<ChatHead> = {}): ChatHead {
-  return { conversation_id: conversation, session_id: `s-${conversation}`, title: "t", account, live: true,
-    forks: 0, forked_from: null, forks_on_typing: false, ...extra };
+  return { conversation_id: conversation, session_id: `s-${conversation}`, title: "t", account, live: true, forks: 0, forked_from: null,
+    forks_on_typing: false, audience: "open", may_hide: false, shared_with: [], may_share: false, may_delete: false, ...extra };
 }
 function record(idx: number, kind: string, payload: { [field: string]: unknown }): SessionRecord {
   return { idx, kind, payload, text: "", context_id: null, timestamp: null, model: null, ciphertext: null } as unknown as SessionRecord;
@@ -96,28 +145,39 @@ function hold(conversation: string, ...records: SessionRecord[]) {
   sessions.set(`s-${conversation}`, records);
 }
 
-type Actions = React.ComponentProps<typeof WorkspaceActionsProvider>["value"];
+/** The chat of the station this tab shows, as `ChatColumn` hands it: from the query cache the stream keeps. */
+function Station({ pinned }: { readonly pinned?: WorkspaceState }) {
+  const shown = useStation().data ?? null;
+  return <Chat workspace={pinned ?? shown} />;
+}
 
 /** One shell's worth of state, kept across `again` renders as the app keeps it across Chat mounting again. */
 function shell(
   state: WorkspaceState = workspace,
-  options: { actions?: Partial<NonNullable<Actions>>; profile?: Partial<Profile>; queries?: { retry: number | false; retryDelay?: number } } = {},
+  options: { profile?: Partial<Profile>; queries?: { retry: number | false; retryDelay?: number } } = {},
 ) {
   const feed = new ChatFeed();
   const highlights = new HighlightStore();
   const client = new QueryClient({ defaultOptions: { queries: options.queries ?? { retry: false } } });
-  const value = canvasActions(options.actions);
   const live = { register: (query: LiveQuery) => {
     registered.push(query);
     return { push: () => {}, dispose: () => { registered = registered.filter((each) => each !== query); } };
   } } as unknown as LiveHub;
-  const ui = (next: WorkspaceState) => <QueryClientProvider client={client}><MetaContext value={META}>
+  const held = (next: WorkspaceState) => (opened ? { ...next, conversation_id: opened } : next);
+  setStation(state.id);
+  client.setQueryData(["workspace", state.id], held(state));
+  const ui = (pinned?: WorkspaceState) => <ToastProvider><QueryClientProvider client={client}><MetaContext value={META}>
     <ProfileContext value={{ ...PROFILE, ...options.profile }}><LiveContext value={live}>
-      <ChatFeedContext value={feed}><HighlightContext value={highlights}><WorkspaceActionsProvider value={value}>
-        <Chat instance={next.visuals[0]!} focused={false} workspace={next} onWorkspaceChanged={vi.fn()} />
-      </WorkspaceActionsProvider></HighlightContext></ChatFeedContext></LiveContext></ProfileContext></MetaContext></QueryClientProvider>;
-  const view = render(ui(state));
-  return { feed, value, client, view, highlights, again: (next: WorkspaceState = state) => view.rerender(ui(next)), mount: () => { view.unmount(); return render(ui(state)); } };
+      <ChatFeedContext value={feed}><HighlightContext value={highlights}>
+        <Station pinned={pinned} />
+      </HighlightContext></ChatFeedContext></LiveContext></ProfileContext></MetaContext></QueryClientProvider></ToastProvider>;
+  const view = render(ui());
+  return {
+    feed, client, view, highlights,
+    // The same station in another state, as the stream would say it.
+    again: (next: WorkspaceState = state) => view.rerender(ui(held(next))),
+    mount: () => { view.unmount(); return render(ui()); },
+  };
 }
 
 /** The stream says the session changed; the live layer hands that to whoever follows it. */
@@ -132,7 +192,8 @@ async function type(text: string) {
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
 }
 
-const open = (id: string) => localStorage.setItem(STORED, id);
+/** The station's chat is conversation `id` when the next `shell` renders. */
+const open = (id: string) => { opened = id; };
 /** The words of each line, without its "Fork from here" button. */
 const articles = () => screen.getAllByRole("article").map((line) => [...line.children].filter((child) => child.tagName !== "BUTTON")
   .map((child) => child.textContent).join(""));
@@ -145,14 +206,265 @@ test("scout is the partner with no pairing, and Chat is ready to send", () => {
   expect(getChatHead).not.toHaveBeenCalled();
 });
 
-test("the composer says chats are public to every user and cannot be deleted, and Chat offers no delete", () => {
+test("a button in the header hides Chat, where Pin stands while it is hidden", () => {
+  setChatHidden(false);
   shell();
-  expect(screen.getByText(/public to every user and cannot be deleted/)).toBeTruthy();
-  expect(screen.queryByRole("button", { name: /delete|remove/i })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Hide Chat" }));
+  expect(currentChatColumn().hidden).toBe(true);
+  expect(screen.queryByRole("button", { name: "Hide Chat" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Pin Chat beside the page" })).toBeTruthy();
+  setChatHidden(false);
+});
+
+test("a button in the header moves Chat to the other side, and says which way", () => {
+  setChatSide("left");
+  shell();
+  fireEvent.click(screen.getByRole("button", { name: "Move Chat to the right" }));
+  expect(currentChatColumn().side).toBe("right");
+  fireEvent.click(screen.getByRole("button", { name: "Move Chat to the left" }));
+  expect(currentChatColumn().side).toBe("left");
+});
+
+test("a Chat open over the page by its strip has a Pin that stands it beside the page, and a column has none", () => {
+  setChatHidden(false);
+  shell();
+  expect(screen.queryByRole("button", { name: "Pin Chat beside the page" })).toBeNull();
+  act(() => setChatHidden(true));
+  fireEvent.click(screen.getByRole("button", { name: "Pin Chat beside the page" }));
+  expect(currentChatColumn().hidden).toBe(false);
+  expect(screen.queryByRole("button", { name: "Pin Chat beside the page" })).toBeNull();
+});
+
+test("Chat's header names the station, and has neither History nor Clear chat", () => {
+  shell();
+  expect(screen.getByRole("button", { name: "unnamed-workstream#1" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "History" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Clear chat" })).toBeNull();
+});
+
+test("Chat shows the conversation its station holds, and none for a station without a chat", async () => {
+  hold("c1", said(0, ME, "hello there"), answered(1, "in this station"));
+  open("c1");
+  const { again } = shell();
+  expect(await screen.findByText("in this station")).toBeTruthy();
+  opened = null;
+  again({ ...workspace, conversation_id: null });
+  expect(screen.queryByText("in this station")).toBeNull();
+  expect(screen.getByText("Say something to scout.")).toBeTruthy();
+});
+
+test("a relay line reads as \"you → lead-2: text\", in its own style, with no fork and no prompt; another poster's names them", async () => {
+  open("c1");
+  hold("c1", said(0, ME, "q"), answered(1, "a"), said(2, ME, "→ lead-2, tiles-a:ops: rerun the suite"), said(3, GRACE, "→ lead-3: stop"));
+  shell();
+  const mine = (await screen.findByText(/rerun the suite/)).closest("article")!;
+  expect(mine.textContent).toBe("you → lead-2, tiles-a:ops: rerun the suite");
+  expect(mine.className).toContain("chat-line-relay");
+  expect(mine.className).not.toContain("chat-line-user");
+  expect(mine.className).not.toContain("chat-line-assistant");
+  expect(within(mine).queryByRole("button", { name: "Fork from here" })).toBeNull();
+  expect(screen.getByText(/stop/).closest("article")!.textContent).toBe("grace → lead-3: stop");
+  act(() => chooseChatStyle("terminal"));
+  expect(mine.querySelector(".chat-prompt")).toBeNull();
+  act(() => chooseChatStyle("default"));
+});
+
+test("Chat asks its partner: the box reads Ask <partner>", () => {
+  shell();
+  expect(screen.getByRole("textbox", { name: "Message" }).getAttribute("placeholder")).toBe("Ask scout…");
+});
+
+test("the composer says who reads the chat, as the server's org mode lets them in", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  const notice = () => document.querySelector(".chat-notice")!.textContent;
+  const { view } = shell(workspace, { profile: { org_mode: "single" } });
+  await screen.findByText("a2");
+  expect(notice()).toBe("Read by everyone signed in to this server. Do not type secrets here.");
+  expect(document.body.textContent).not.toMatch(/Public to read|forks it instead|cannot be deleted/);
+  view.unmount();
+  shell(workspace, { profile: { org_mode: "domain" } });
+  await screen.findByText("a2");
+  expect(notice()).toBe("Read by its starter, the people they share it with, and the starter's organisation. Do not type secrets here.");
+  cleanup();
+  shell(workspace, { profile: { org_mode: "individual" } });
+  await screen.findByText("a2");
+  expect(notice()).toBe("Read by its starter and the people they share it with. Do not type secrets here.");
+  cleanup();
+  // A server older than the org mode names none.
+  shell();
+  await screen.findByText("a2");
+  expect(notice()).toMatch(/^Read by its starter, the people they share it with, and their organisation where this server lets it in\./);
+});
+
+test("the composer says a private chat is its starter's and their shares', and a staff-only one its staff readers'", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { audience: "private" }));
+  const notice = () => document.querySelector(".chat-notice")!.textContent;
+  shell(workspace, { profile: { org_mode: "single" } });
+  await screen.findByText("a2");
+  expect(notice()).toBe("Private: only its starter and the people they share it with read it. Do not type secrets here.");
+  cleanup();
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { audience: "staff" }));
+  shell(workspace, { profile: { org_mode: "single" } });
+  await screen.findByText("a2");
+  expect(notice()).toBe("Staff only: of everyone signed in to this server, only those who hold staff read it. Do not type secrets here.");
+});
+
+test("a chat I may neither share nor delete has neither button", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", GRACE));
+  shell();
+  await screen.findByText("a2");
+  expect(screen.queryByRole("button", { name: "Share" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+});
+
+test("Share lists who has the chat, adds an address, removes one, and reads the head again", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  let shared: string[] = [GRACE];
+  vi.mocked(getChatHead).mockImplementation(async () => head("c1", ME, { may_share: true, shared_with: shared }));
+  vi.mocked(shareChat).mockImplementation(async (_, who) => { shared = [...shared, who]; });
+  vi.mocked(unshareChat).mockImplementation(async (_, who) => { shared = shared.filter((each) => each !== who); });
+  shell();
+  await screen.findByText("a2");
+  fireEvent.click(await screen.findByRole("button", { name: "Share" }));
+  const panel = screen.getByRole("dialog", { name: "Share chat" });
+  expect(within(panel).getByText(GRACE)).toBeTruthy();
+  fireEvent.change(within(panel).getByRole("textbox", { name: "Email to share with" }), { target: { value: " Linus@Example.com " } });
+  fireEvent.click(within(panel).getByRole("button", { name: "Add" }));
+  await within(panel).findByText("Linus@Example.com");
+  expect(shareChat).toHaveBeenCalledWith("c1", "Linus@Example.com");
+  fireEvent.click(within(panel).getByRole("button", { name: `Remove ${GRACE}` }));
+  await waitFor(() => expect(within(panel).queryByText(GRACE)).toBeNull());
+  expect(unshareChat).toHaveBeenCalledWith("c1", GRACE);
+});
+
+test("a header pop-over closes on a press anywhere else, so Share and Delete never show together", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { may_share: true, may_delete: true }));
+  shell();
+  await screen.findByText("a2");
+  fireEvent.click(await screen.findByRole("button", { name: "Share" }));
+  // A press inside it keeps it.
+  fireEvent.pointerDown(screen.getByRole("textbox", { name: "Email to share with" }));
+  expect(screen.getByRole("dialog", { name: "Share chat" })).toBeTruthy();
+  const remove = screen.getByRole("button", { name: "Delete" });
+  fireEvent.pointerDown(remove);
+  fireEvent.click(remove);
+  expect(screen.queryByRole("dialog", { name: "Share chat" })).toBeNull();
+  expect(screen.getByRole("alertdialog", { name: "Delete this chat" })).toBeTruthy();
+  fireEvent.pointerDown(document.body);
+  expect(screen.queryByRole("alertdialog", { name: "Delete this chat" })).toBeNull();
+});
+
+test("a refused share says why in one toast line and keeps the address in the field", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { may_share: true }));
+  vi.mocked(shareChat).mockRejectedValue(new ApiError(403, "Only the starter shares a chat"));
+  shell();
+  await screen.findByText("a2");
+  fireEvent.click(await screen.findByRole("button", { name: "Share" }));
+  const field = screen.getByRole("textbox", { name: "Email to share with" });
+  fireEvent.change(field, { target: { value: "linus@example.com" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add" }));
+  expect(await screen.findByText("Only the starter shares a chat")).toBeTruthy();
+  expect((field as HTMLInputElement).value).toBe("linus@example.com");
+});
+
+test("Delete asks first, Cancel deletes nothing, and Delete chat leaves the station with an empty chat", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { may_delete: true }));
+  vi.mocked(deleteChat).mockResolvedValue();
+  const { client } = shell();
+  await screen.findByText("a2");
+  fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+  expect(screen.getByText("Delete this chat? Its forks keep their copies.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.queryByText(/Its forks keep their copies/)).toBeNull();
+  expect(deleteChat).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete chat" }));
+  await waitFor(() => expect(screen.queryByText("a2")).toBeNull());
+  expect(deleteChat).toHaveBeenCalledWith("c1");
+  expect(client.getQueryData<WorkspaceState>(["workspace", WORKSPACE_ID])?.conversation_id).toBeNull();
+  expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+});
+
+test("a share refused with chat_not_starter is said in words", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { may_share: true }));
+  vi.mocked(shareChat).mockRejectedValue(new ApiError(403, "403 Forbidden", "chat_not_starter"));
+  shell();
+  await screen.findByText("a2");
+  fireEvent.click(await screen.findByRole("button", { name: "Share" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Email to share with" }), { target: { value: "linus@example.com" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add" }));
+  expect(await screen.findByText("Only the person who started this chat can do that.")).toBeTruthy();
+});
+
+test("a share of a staff-only chat with someone who holds no staff is refused in words", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { may_share: true, audience: "staff" }));
+  vi.mocked(shareChat).mockRejectedValue(new ApiError(409, "409 Conflict", CHAT_STAFF_ONLY));
+  shell();
+  await screen.findByText("a2");
+  fireEvent.click(await screen.findByRole("button", { name: "Share" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Email to share with" }), { target: { value: "linus@example.com" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add" }));
+  expect(await screen.findByText("This chat is staff only, so it can be shared only with someone who holds staff.")).toBeTruthy();
+});
+
+test("a delete refused with chat_has_other_posters is said in words, and an unknown code keeps the server's detail", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { may_delete: true }));
+  vi.mocked(deleteChat).mockRejectedValueOnce(new ApiError(403, "403 Forbidden", "chat_has_other_posters"))
+    .mockRejectedValueOnce(new ApiError(403, "Locked by an admin", "locked"));
+  shell();
+  await screen.findByText("a2");
+  fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete chat" }));
+  expect(await screen.findByText("Others have posted in this chat, so only an admin can delete it.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Delete chat" }));
+  expect(await screen.findByText("Locked by an admin")).toBeTruthy();
+});
+
+test("a workspace frame that drops the conversation leaves the station on an empty chat, and drops a fork picked in it", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  const { client } = shell();
+  await screen.findByText("a2");
+  fireEvent.click(forkButton("a1"));
+  expect(screen.getByText(/Your next message starts a fork/)).toBeTruthy();
+  await act(async () => client.setQueryData(["workspace", WORKSPACE_ID], { ...workspace, conversation_id: null, revision: 9 }));
+  await waitFor(() => expect(screen.queryByText("a2")).toBeNull());
+  expect(screen.queryByText(/Your next message starts a fork/)).toBeNull();
+});
+
+test("a refused delete says why in a toast and keeps the chat", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { may_delete: true }));
+  vi.mocked(deleteChat).mockRejectedValue(new ApiError(403, "Someone else has posted in this chat"));
+  shell();
+  await screen.findByText("a2");
+  fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete chat" }));
+  expect(await screen.findByText("Someone else has posted in this chat")).toBeTruthy();
+  expect(screen.getByText("a2")).toBeTruthy();
 });
 
 test("a line shows pending, then the conversation's id at once, then its record once the assistant has opened the session", async () => {
-  let finish: (value: { conversation_id: string; session_id: string | null }) => void = () => {};
+  let finish: (value: { conversation_id: string; session_id: string | null; workspace_id: string }) => void = () => {};
   vi.mocked(sendChatLine).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
   const { client } = shell();
 
@@ -162,13 +474,13 @@ test("a line shows pending, then the conversation's id at once, then its record 
   expect(pendingLine.closest("article")!.className).toContain("chat-line-pending");
   expect(screen.getByText("Sending…")).toBeTruthy();
   const [line, key] = vi.mocked(sendChatLine).mock.calls[0]!;
-  expect([line, typeof key]).toEqual([{ workspaceId: WORKSPACE_ID, text: "Show me Issue#12", chatInstanceId: workspace.visuals[0]!.id,
-    expectedRecordId: null, conversationId: null, page: "#/graph", trail: [] }, "string"]);
+  expect([line, typeof key]).toEqual([{ workspaceId: WORKSPACE_ID, text: "Show me Issue#12", conversationId: null, page: "#/graph", trail: [] }, "string"]);
 
   // The receipt names the conversation; its session is not there yet.
-  await act(async () => finish({ conversation_id: "c1", session_id: null }));
+  await act(async () => finish({ conversation_id: "c1", session_id: null, workspace_id: WORKSPACE_ID }));
   await waitFor(() => expect(screen.getByText("Waiting for the assistant…")).toBeTruthy(), { interval: 1 });
-  expect(localStorage.getItem(STORED)).toBe("c1");
+  // The first line binds the conversation to the station.
+  expect(client.getQueryData<WorkspaceState>(["workspace", WORKSPACE_ID])?.conversation_id).toBe("c1");
   expect(screen.getAllByText("Show me Issue#12")).toHaveLength(1);
 
   // The assistant opens the session: the line is its record, and the pending one gives way.
@@ -187,7 +499,7 @@ test("a line shows pending, then the conversation's id at once, then its record 
 });
 
 test("the next line of a conversation names it", async () => {
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1" });
+  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1", workspace_id: WORKSPACE_ID });
   hold("c1", said(0, ME, "one"), answered(1, "an answer"));
   shell();
   await type("one");
@@ -268,10 +580,117 @@ test("a conversation whose last line is an answer shows no working line", async 
   expect(screen.queryByText(/Working/)).toBeNull();
 });
 
+test("the reply being written shows as its answer will, in place of the wait for the assistant", async () => {
+  open("c1");
+  hold("c1", said(0, ME, "q"), answered(1, "a"));
+  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1", workspace_id: WORKSPACE_ID });
+  shell();
+  await screen.findByText("a");
+  await type("and now?");
+  await screen.findByText("Waiting for the assistant…");
+  await write({ turn: "t1", text: "It is **open**.", done: false });
+  const bold = await screen.findByText("open");
+  expect(bold.tagName).toBe("STRONG");
+  expect(bold.closest("article")!.className).toContain("chat-line-partial");
+  expect(bold.closest("article")!.getAttribute("aria-busy")).toBe("true");
+  expect(screen.queryByText("Waiting for the assistant…")).toBeNull();
+  expect(readChatPartial).toHaveBeenCalledWith("s-c1", 0, expect.anything());
+});
+
+test("the stored answer takes the bubble's place, once, and a partial cleared for a tool call gives way to Working…", async () => {
+  open("c1");
+  hold("c1", said(0, ME, "hi"));
+  shell();
+  await screen.findByText("Working…");
+  await write({ turn: "t1", text: "Let me look", done: false });
+  await screen.findByText("Let me look");
+  expect(screen.queryByText("Working…")).toBeNull();
+  await write(null);
+  await screen.findByText("Working…");
+  expect(document.querySelector(".chat-line-partial")).toBeNull();
+  await write({ turn: "t1", text: "It is open.", done: false });
+  await write({ turn: "t1", text: "It is open.", done: true });
+  await screen.findByText("It is open.");
+  hold("c1", said(0, ME, "hi"), answered(1, "It is open."));
+  await changed("s-c1");
+  await waitFor(() => expect(screen.getByText("It is open.").closest("article")!.className).not.toContain("chat-line-partial"), { interval: 1 });
+  expect(document.querySelector(".chat-line-partial")).toBeNull();
+});
+
+test("my next line's Sending… shows over the bubble, and an answer stored while that line waits takes the bubble's place, once", async () => {
+  open("c1");
+  hold("c1", said(0, ME, "first"));
+  let finish: (value: { conversation_id: string; session_id: string | null; workspace_id: string }) => void = () => {};
+  vi.mocked(sendChatLine).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+  shell();
+  await screen.findByText("Working…");
+  await write({ turn: "t1", text: "The first", done: false });
+  await screen.findByText("The first");
+  await type("second");
+  await screen.findByText("Sending…");
+  expect(document.querySelector(".chat-line-partial")).toBeNull();
+  await act(async () => finish({ conversation_id: "c1", session_id: "s-c1", workspace_id: WORKSPACE_ID }));
+  await screen.findByText("The first");
+  expect(screen.queryByText("Waiting for the assistant…")).toBeNull();
+  await write({ turn: "t1", text: "The first answer", done: true });
+  expect(await screen.findByText("The first answer")).toBeTruthy();
+  hold("c1", said(0, ME, "first"), answered(1, "The first answer"));
+  await changed("s-c1");
+  await screen.findByText("Waiting for the assistant…");
+  expect(screen.getAllByText("The first answer")).toHaveLength(1);
+  expect(document.querySelector(".chat-line-partial")).toBeNull();
+});
+
+test("the transcript follows the reply being written as it grows", async () => {
+  open("c1");
+  hold("c1", said(0, ME, "hi"));
+  shell();
+  await screen.findByText("Working…");
+  const log = screen.getByRole("log", { name: "Messages" });
+  let height = 1000;
+  Object.defineProperty(log, "scrollHeight", { configurable: true, get: () => height });
+  Object.defineProperty(log, "clientHeight", { configurable: true, value: 300 });
+  await write({ turn: "t1", text: "One", done: false });
+  await screen.findByText("One");
+  expect(log.scrollTop).toBe(1000);
+  height = 1300;
+  await write({ turn: "t1", text: "One more line", done: false });
+  await screen.findByText("One more line");
+  expect(log.scrollTop).toBe(1300);
+});
+
+test("Chat reads no reply being written while its partner is gone, whose going hides the bubble", async () => {
+  open("c1");
+  hold("c1", said(0, ME, "hi"));
+  const gone = { ...workspace, partner: { ...SCOUT, status: "unavailable" as const } };
+  const { again } = shell(gone);
+  await screen.findByText("scout is unavailable.");
+  await act(() => Promise.resolve());
+  expect(readChatPartial).not.toHaveBeenCalled();
+  again(workspace);
+  await write({ turn: "t1", text: "Half a reply", done: false });
+  await screen.findByText("Half a reply");
+  again(gone);
+  expect(screen.getByText("scout is unavailable.")).toBeTruthy();
+  expect(document.querySelector(".chat-line-partial")).toBeNull();
+});
+
+test("a finished turn's text still held raises no bubble under the next line", async () => {
+  partial = { seq: 1, partial: { turn: "t0", text: "the earlier answer", done: true } };
+  open("c1");
+  hold("c1", said(0, ME, "q"), answered(1, "the earlier answer"), said(2, ME, "and then?"));
+  shell();
+  await screen.findByText("Working…");
+  // The second read asks after the held seq: the first one's answer was taken.
+  await waitFor(() => expect(readChatPartial).toHaveBeenCalledTimes(2), { interval: 1 });
+  expect(document.querySelector(".chat-line-partial")).toBeNull();
+  expect(screen.getByText("Working…")).toBeTruthy();
+});
+
 test("a line the assistant never opens a session for is said plainly after a while, and can be sent again", async () => {
   // The clock is the test's: the give-up time passes by advancing it, not by waiting.
   vi.useFakeTimers({ shouldAdvanceTime: true });
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c9", session_id: null });
+  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c9", session_id: null, workspace_id: WORKSPACE_ID });
   shell();
   await type("anyone there?");
   await screen.findByText("Waiting for the assistant…");
@@ -301,7 +720,7 @@ test("a viewer reads a chat but cannot post in it", async () => {
 
 test("a failed send keeps the draft for a retry under one key, and shows no pending line", async () => {
   vi.mocked(sendChatLine).mockRejectedValueOnce(new ApiError(0, "offline", "network"))
-    .mockResolvedValueOnce({ conversation_id: "c1", session_id: null });
+    .mockResolvedValueOnce({ conversation_id: "c1", session_id: null, workspace_id: WORKSPACE_ID });
   shell();
   await type("hi");
   fireEvent.click(await screen.findByRole("button", { name: "Retry message" }));
@@ -332,13 +751,13 @@ test("the composer refuses a blank or too long message before sending it", async
   expect((await screen.findByRole("alert")).textContent).toContain("at most 16,384");
   expect(sendChatLine).not.toHaveBeenCalled();
   fireEvent.change(box, { target: { value: "x".repeat(16_384) } });
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: null });
+  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: null, workspace_id: WORKSPACE_ID });
   fireEvent.click(screen.getByRole("button", { name: "Send message" }));
   await waitFor(() => expect(sendChatLine).toHaveBeenCalledOnce(), { interval: 1 });
 });
 
 test("the box stays focused and editable while a message is sending, and what is typed meanwhile stays", async () => {
-  let finish: (value: { conversation_id: string; session_id: string | null }) => void = () => {};
+  let finish: (value: { conversation_id: string; session_id: string | null; workspace_id: string }) => void = () => {};
   vi.mocked(sendChatLine).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
   shell();
   await type("first");
@@ -346,89 +765,12 @@ test("the box stays focused and editable while a message is sending, and what is
   await screen.findByText("Sending…");
   expect(box.disabled).toBe(false);
   fireEvent.change(box, { target: { value: "second, typed meanwhile" } });
-  await act(async () => finish({ conversation_id: "c1", session_id: null }));
+  await act(async () => finish({ conversation_id: "c1", session_id: null, workspace_id: WORKSPACE_ID }));
   expect((screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement).value).toBe("second, typed meanwhile");
 });
 
-test("a receipt that comes back after the user picked another conversation does not reopen the old one", async () => {
-  let finish: (value: { conversation_id: string; session_id: string | null }) => void = () => {};
-  vi.mocked(sendChatLine).mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
-  shell();
-  await type("first");
-  await screen.findByText("Sending…");
-  fireEvent.click(screen.getByRole("button", { name: "Clear chat" }));
-  await act(async () => finish({ conversation_id: "c1", session_id: null }));
-  expect(localStorage.getItem(STORED)).toBeNull();
-  expect(within(screen.getByRole("log")).queryByText("first")).toBeNull();
-});
-
-test("Clear chat starts a new chat and keeps the old one, which History opens again", async () => {
-  open("c1");
-  hold("c1", said(0, ME, "old question"), answered(1, "old answer"));
-  vi.mocked(listChats).mockResolvedValue([
-    { conversation_id: "c1", session_id: "s-c1", title: "old question", account: ME, modified: CREATED },
-  ]);
-  shell();
-  expect(await screen.findByText("old answer")).toBeTruthy();
-  // One control: there is no separate New chat, and nothing is deleted.
-  expect(screen.queryByRole("button", { name: "New chat" })).toBeNull();
-  expect(screen.queryByRole("button", { name: "Clear" })).toBeNull();
-
-  fireEvent.click(screen.getByRole("button", { name: "Clear chat" }));
-  expect(screen.queryByText("old answer")).toBeNull();
-  expect(localStorage.getItem(STORED)).toBeNull();
-  expect(screen.getByRole("button", { name: "Clear chat" })).toHaveProperty("disabled", true);
-
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  fireEvent.click(await screen.findByRole("menuitemradio", { name: /old question/ }));
-  expect(await screen.findByText("old answer")).toBeTruthy();
-  expect(localStorage.getItem(STORED)).toBe("c1");
-});
-
-test("History lists the chats the user started or posted in with their age and starter, and picking one opens it and closes the menu", async () => {
-  vi.mocked(listChats).mockResolvedValue([
-    { conversation_id: "c9", session_id: "s-c9", title: "What changed last week", account: GRACE,
-      modified: new Date(Date.now() - 3 * 3_600_000).toISOString() },
-  ]);
-  hold("c9", said(0, GRACE, "What changed last week"), answered(1, "Last week we merged it"));
-  vi.mocked(getChatHead).mockResolvedValue(head("c9", GRACE));
-  shell();
-  expect(screen.queryByRole("menu", { name: "History" })).toBeNull();
-  const button = screen.getByRole("button", { name: "History" });
-  expect(button.getAttribute("aria-haspopup")).toBe("menu");
-  fireEvent.click(button);
-  const menu = screen.getByRole("menu", { name: "History" });
-  const entry = await within(menu).findByRole("menuitemradio", { name: /What changed last week/ });
-  expect(entry.textContent).toContain("3h ago");
-  expect(entry.textContent).toContain(GRACE);
-  expect(entry.getAttribute("aria-checked")).toBe("false");
-  fireEvent.click(entry);
-  expect(await screen.findByText("Last week we merged it")).toBeTruthy();
-  expect(getChatHead).toHaveBeenCalledWith("c9", expect.any(Object));
-  expect(screen.queryByRole("menu", { name: "History" })).toBeNull();
-  expect(localStorage.getItem(STORED)).toBe("c9");
-  fireEvent.click(button);
-  expect((await screen.findByRole("menuitemradio", { name: /What changed last week/ })).getAttribute("aria-checked")).toBe("true");
-});
-
-test("an empty History says so", async () => {
-  shell();
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  expect(await screen.findByText("No conversations yet.")).toBeTruthy();
-});
-
-test("Escape closes an open menu", () => {
-  shell();
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  expect(screen.getByRole("menu", { name: "History" })).toBeTruthy();
-  fireEvent.keyDown(screen.getByRole("menu", { name: "History" }), { key: "Escape" });
-  expect(screen.queryByRole("menu", { name: "History" })).toBeNull();
-});
-
-test("Chat mounting again keeps the open conversation, with storage refused too", async () => {
-  vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("denied"); });
-  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("denied"); });
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1" });
+test("Chat mounting again keeps the station's conversation, which the station holds", async () => {
+  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1", workspace_id: WORKSPACE_ID });
   hold("c1", said(0, ME, "hi"));
   const { mount } = shell();
   await type("hi");
@@ -447,11 +789,14 @@ test("a request from outside Chat to continue a science chat's session opens its
   } as never);
   hold("c7", said(0, GRACE, "from the Console"), answered(1, "an answer there"));
   vi.mocked(getChatHead).mockResolvedValue(head("c7", GRACE));
+  vi.mocked(stationForChat).mockResolvedValue({ ...workspace, id: "w7", name: "unnamed-workstream#7", conversation_id: "c7" });
   const { feed } = shell();
   expect(screen.getByText("Say something to scout.")).toBeTruthy();
   act(() => feed.continueIn("sess-1"));
   expect(await screen.findByText("an answer there")).toBeTruthy();
-  expect(localStorage.getItem(STORED)).toBe("c7");
+  // The user's station for that chat is shown, the server having found or made it.
+  expect(stationForChat).toHaveBeenCalledWith("c7");
+  expect(currentStation().id).toBe("w7");
   expect(getDetail).toHaveBeenCalledWith("sess-1", expect.any(Object));
   expect(feed.snapshot().request).toBeNull();
 });
@@ -464,7 +809,7 @@ test("a request to continue a session that is no science chat says so and opens 
   const { feed } = shell();
   act(() => feed.continueIn("sess-2"));
   expect((await screen.findByRole("status")).textContent).toBe("That session is not a science chat.");
-  expect(localStorage.getItem(STORED)).toBeNull();
+  expect(stationForChat).not.toHaveBeenCalled();
   expect(getChatHead).not.toHaveBeenCalled();
 });
 
@@ -482,13 +827,16 @@ test("a request waits for Chat to mount: a Chat shown later takes it", async () 
   } as never);
   hold("c7", answered(0, "waiting for you"));
   vi.mocked(getChatHead).mockResolvedValue(head("c7", GRACE));
+  vi.mocked(stationForChat).mockResolvedValue({ ...workspace, id: "w7", name: "unnamed-workstream#7", conversation_id: "c7" });
   const feed = new ChatFeed();
   feed.continueIn("sess-1");
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  setStation(workspace.id);
+  client.setQueryData(["workspace", workspace.id], workspace);
   render(<QueryClientProvider client={client}><MetaContext value={META}><ProfileContext value={PROFILE}>
-    <ChatFeedContext value={feed}><WorkspaceActionsProvider value={canvasActions()}>
-      <Chat instance={workspace.visuals[0]!} focused={false} workspace={workspace} onWorkspaceChanged={vi.fn()} />
-    </WorkspaceActionsProvider></ChatFeedContext></ProfileContext></MetaContext></QueryClientProvider>);
+    <ChatFeedContext value={feed}>
+      <Station />
+    </ChatFeedContext></ProfileContext></MetaContext></QueryClientProvider>);
   expect(await screen.findByText("waiting for you")).toBeTruthy();
 });
 
@@ -566,26 +914,12 @@ test("a live partner shows none of the setup, and a live local helper is named a
 test("a record link in an answer is a plain link that only sets the address, and writes nothing", async () => {
   open("c1");
   hold("c1", answered(0, "See Issue#12 and 61d3a095-c7f1-4d27-a4c4-a5b1c218a31e."));
-  const { value } = shell();
+  shell();
   const issue = await screen.findByRole("link", { name: /Issue#12/ });
   expect(issue.getAttribute("href")).toBe("#/ref/Issue/12");
   const lookup = screen.getByRole("link", { name: /61d3a095/ });
   expect(lookup.getAttribute("href")).toBe("#/lookup/61d3a095-c7f1-4d27-a4c4-a5b1c218a31e");
   expect(fireEvent.click(lookup)).toBe(true);
-  expect(value.operate).not.toHaveBeenCalled();
-  expect(sendChatLine).not.toHaveBeenCalled();
-});
-
-test("a Chat about a record links to it and has a control that clears the context and leaves Chat where it is", async () => {
-  vi.mocked(getDetail).mockResolvedValue({
-    self: { id: "record", kind: "Issue", seq: 42, title: "A useful issue" }, edges: {}, backlinks: {}, changes: [],
-  } as never);
-  const about = { ...workspace, visuals: [{ ...workspace.visuals[0]!, placement: "floating" as const, record_id: "record" }] };
-  const { value } = shell(about);
-  const context = await screen.findByRole("link", { name: "Issue#42 A useful issue" });
-  expect(context.getAttribute("href")).toBe("#/lookup/record");
-  fireEvent.click(screen.getByRole("button", { name: "Clear context" }));
-  expect(value.operate).toHaveBeenCalledWith({ kind: "show", visual_type: "trax.chat", record_id: null });
   expect(sendChatLine).not.toHaveBeenCalled();
 });
 
@@ -612,7 +946,7 @@ async function sentFrom(hashes: readonly string[]) {
   stopTrail = startTrail();
   shell();
   for (const hash of hashes.slice(1)) go(hash);
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: null });
+  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: null, workspace_id: WORKSPACE_ID });
   await type("where am I");
   await waitFor(() => expect(sendChatLine).toHaveBeenCalledTimes(1), { interval: 1 });
   const { page, trail } = vi.mocked(sendChatLine).mock.calls[0]![0];
@@ -635,7 +969,7 @@ test("a page the server would refuse is sent as null, with the pages before it a
   expect(await sentFrom(["#/graph", "#/settings", "#top"])).toEqual({ page: null, trail: ["#/graph", "#/settings"] });
 });
 
-test("with no Chat context pinned, Chat names the record on screen and follows the page", async () => {
+test("Chat names the record on screen and follows the page", async () => {
   knowRecords();
   history.replaceState(null, "", "#/activity");
   shell();
@@ -654,22 +988,6 @@ test("with no Chat context pinned, Chat names the record on screen and follows t
 
   go("#/activity");
   expect(chip()).toBeNull();
-});
-
-test("the record on screen never replaces the record Chat is pinned to", async () => {
-  knowRecords();
-  vi.mocked(getDetail).mockImplementation(async (id: string) => ({
-    self: id === "record" ? { id, kind: "Issue", seq: 42, title: "A useful issue" } : { id, kind: "Experiment", seq: 407, title: `Run of ${id}` },
-    edges: {}, backlinks: {}, changes: [],
-  }) as never);
-  history.replaceState(null, "", `#/lookup/${LOOKED_UP}`);
-  const about = { ...workspace, visuals: [{ ...workspace.visuals[0]!, placement: "floating" as const, record_id: "record" }] };
-  shell(about);
-  expect(await screen.findByRole("link", { name: "Issue#42 A useful issue" })).toBeTruthy();
-  expect(screen.queryByLabelText("Screen context")).toBeNull();
-  go("#/ref/Experiment/407");
-  expect(screen.queryByLabelText("Screen context")).toBeNull();
-  expect(screen.getByLabelText("Record context")).toBeTruthy();
 });
 
 test("the transcript follows the newest row, the working line included, unless the reader scrolled up", async () => {
@@ -700,11 +1018,6 @@ test("the transcript follows the newest row, the working line included, unless t
   expect(log.scrollTop).toBe(100);
 });
 
-test("Chat shows no write error of its own: the canvas shows it once", () => {
-  shell(workspace, { actions: { writeError: "Could not update the canvas." } });
-  expect(screen.queryByText("Could not update the canvas.")).toBeNull();
-});
-
 test("a read that failed offers Retry", async () => {
   open("c1");
   hold("c1", answered(0, "back"));
@@ -718,25 +1031,21 @@ test("Chat's reads use the app's read retry: a read that fails once is read agai
   open("c1");
   hold("c1", answered(0, "second try"));
   vi.mocked(getChatHead).mockRejectedValueOnce(new ApiError(503, "unavailable")).mockResolvedValue(head("c1"));
-  vi.mocked(listChats).mockRejectedValueOnce(new ApiError(503, "unavailable")).mockResolvedValueOnce([
-    { conversation_id: "c1", session_id: "s-c1", title: "Retried history", account: ME, modified: CREATED }]);
   shell(workspace, { queries: { retry: 1, retryDelay: 0 } });
   expect(await screen.findByText("second try")).toBeTruthy();
   expect(screen.queryByRole("alert")).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "History" }));
-  expect(await screen.findByRole("menuitemradio", { name: /Retried history/ })).toBeTruthy();
 });
 
 const TALK = [said(0, ME, "q1"), answered(1, "a1"), said(2, GRACE, "q2"), answered(3, "a2")];
 const forkButton = (line: string) => within(screen.getByText(line).closest("article")!).getByRole("button", { name: "Fork from here" });
 
-test("typing in a chat of my own organisation joins it, and sends no fork", async () => {
+test("typing in a chat I read joins it, and sends no fork", async () => {
   open("c1");
   hold("c1", ...TALK);
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1" });
+  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1", workspace_id: WORKSPACE_ID });
   shell();
   await screen.findByText("a2");
-  expect(screen.queryByText(/outside your organisation/)).toBeNull();
+  expect(screen.queryByText(/not shared with you/)).toBeNull();
   await type("and so?");
   await waitFor(() => expect(sendChatLine).toHaveBeenCalledOnce(), { interval: 1 });
   expect(vi.mocked(sendChatLine).mock.calls[0]![0]).toMatchObject({ conversationId: "c1" });
@@ -746,9 +1055,11 @@ test("typing in a chat of my own organisation joins it, and sends no fork", asyn
 test("Fork from here on an earlier line makes the next message a fork after it, and the reader lands in the fork", async () => {
   open("c1");
   hold("c1", ...TALK);
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "f1", session_id: null });
+  vi.mocked(sendChatLine).mockResolvedValue(FORKED);
   shell();
   await screen.findByText("a2");
+  // Only an answer forks: a line typed to the assistant has no button.
+  expect(within(screen.getByText("q1").closest("article")!).queryByRole("button", { name: "Fork from here" })).toBeNull();
   fireEvent.click(forkButton("a1"));
   expect((await screen.findByText(/Your next message starts a fork of this chat after/)).textContent).toContain("“a1”");
   await type("is a1 wrong?");
@@ -756,9 +1067,10 @@ test("Fork from here on an earlier line makes the next message a fork after it, 
   const [line, key] = vi.mocked(sendChatLine).mock.calls[0]!;
   expect(line).toMatchObject({ conversationId: null, fork: { sessionId: "s-c1", part: 0, idx: 1 } });
   expect(typeof key).toBe("string");
-  // The fork is open now, and the banner has done its work.
-  await waitFor(() => expect(localStorage.getItem(STORED)).toBe("f1"), { interval: 1 });
+  // The fork is open now, the banner has done its work, and the line sent has left the box.
+  await waitFor(() => expect(currentStation().id).toBe("w-fork"), { interval: 1 });
   expect(screen.queryByText(/Your next message starts a fork/)).toBeNull();
+  await waitFor(() => expect(screen.getByRole("textbox", { name: "Message" })).toHaveProperty("value", ""), { interval: 1 });
   // The line shows in the fork while the assistant opens it, and not in the original.
   expect(await within(screen.getByRole("log")).findByText("is a1 wrong?")).toBeTruthy();
   expect(screen.queryByText("a2")).toBeNull();
@@ -767,7 +1079,7 @@ test("Fork from here on an earlier line makes the next message a fork after it, 
 test("my line in a fork shows until the fork holds one more of mine than it opened with, not than the original has", async () => {
   open("c1");
   hold("c1", said(0, ME, "q1"), answered(1, "a1"), said(2, ME, "q2"), answered(3, "a2"));
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "f1", session_id: null });
+  vi.mocked(sendChatLine).mockResolvedValue(FORKED);
   shell();
   await screen.findByText("a2");
   fireEvent.click(forkButton("a1"));
@@ -787,10 +1099,10 @@ test("my line in a fork shows until the fork holds one more of mine than it open
 test("Cancel fork goes back to posting into the chat", async () => {
   open("c1");
   hold("c1", ...TALK);
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1" });
+  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1", workspace_id: WORKSPACE_ID });
   shell();
   await screen.findByText("a2");
-  fireEvent.click(forkButton("q2"));
+  fireEvent.click(forkButton("a1"));
   fireEvent.click(await screen.findByRole("button", { name: "Cancel fork" }));
   expect(screen.queryByText(/Your next message starts a fork/)).toBeNull();
   await type("still here");
@@ -799,31 +1111,106 @@ test("Cancel fork goes back to posting into the chat", async () => {
   expect(vi.mocked(sendChatLine).mock.calls[0]![0]).not.toHaveProperty("fork");
 });
 
-test("typing in a chat started outside my organisation forks it at its latest line, and I land in the fork", async () => {
+test("a chat not shared with me says so, reads none of its lines and takes none of mine", async () => {
   open("c1");
   hold("c1", ...TALK);
   vi.mocked(getChatHead).mockResolvedValue(head("c1", GRACE, { forks_on_typing: true }));
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "f1", session_id: null });
   shell();
-  await screen.findByText("a2");
-  expect(screen.getByText(/outside your organisation/)).toBeTruthy();
-  await type("a question of my own");
-  await waitFor(() => expect(sendChatLine).toHaveBeenCalledOnce(), { interval: 1 });
-  expect(vi.mocked(sendChatLine).mock.calls[0]![0]).toMatchObject({ conversationId: null, fork: { sessionId: "s-c1", part: 0, idx: 3 } });
-  await waitFor(() => expect(localStorage.getItem(STORED)).toBe("f1"), { interval: 1 });
+  expect((await screen.findByText(/This chat is not shared with you/)).textContent).toBe(
+    "This chat is not shared with you, so you can neither read it nor post in it. Ask its starter to share it.");
+  const box = screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
+  expect(box.placeholder).toBe("This chat is not shared with you");
+  expect(box.disabled).toBe(true);
+  expect(listSessionParts).not.toHaveBeenCalled();
+  expect(readSessionRecords).not.toHaveBeenCalled();
+  expect(screen.queryByText("a2")).toBeNull();
+  expect(screen.queryByText("Loading the conversation…")).toBeNull();
+  expect(screen.queryByRole("alert")).toBeNull();
 });
 
-test("Fork from here in a chat outside my organisation forks after the line picked, not the latest", async () => {
+test("a staff-only chat says so in its header, offers no fork, and tells a reader without staff why it is closed", async () => {
   open("c1");
   hold("c1", ...TALK);
-  vi.mocked(getChatHead).mockResolvedValue(head("c1", GRACE, { forks_on_typing: true }));
-  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "f1", session_id: null });
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", GRACE, { audience: "staff" }));
+  const { view } = shell();
+  await screen.findByText("a2");
+  expect(within(document.querySelector<HTMLElement>(".chat-head")!).getByText("Staff only")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Fork from here" })).toBeNull();
+  view.unmount();
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", GRACE, { audience: "staff", forks_on_typing: true }));
+  shell();
+  expect((await screen.findByText(/staff only and you hold no staff/)).textContent).toBe(
+    "This chat is staff only and you hold no staff, so you can neither read it nor post in it.");
+  expect((screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement).placeholder).toBe("This chat is staff only");
+});
+
+test("a private chat says so in its header and offers no fork; an open one offers it and has no mark", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { audience: "private" }));
+  const { view } = shell();
+  await screen.findByText("a2");
+  expect(within(document.querySelector<HTMLElement>(".chat-head")!).getByText("Private")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Fork from here" })).toBeNull();
+  view.unmount();
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME));
   shell();
   await screen.findByText("a2");
-  fireEvent.click(forkButton("q1"));
-  await type("from the first line");
-  await waitFor(() => expect(sendChatLine).toHaveBeenCalledOnce(), { interval: 1 });
-  expect(vi.mocked(sendChatLine).mock.calls[0]![0]).toMatchObject({ fork: { part: 0, idx: 0 } });
+  expect(screen.getAllByRole("button", { name: "Fork from here" })).toHaveLength(2);
+  expect(document.querySelector(".chat-badge")).toBeNull();
+});
+
+test("lines read before the chat closed to me go with it", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  const { client } = shell();
+  await screen.findByText("a2");
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", GRACE, { audience: "staff", forks_on_typing: true }));
+  await act(() => client.invalidateQueries({ queryKey: ["chat", "head", "c1"] }));
+  await screen.findByText(/staff only and you hold no staff/);
+  expect(screen.queryByText("a2")).toBeNull();
+});
+
+test("the starter's switch says Public or Private and a click flips it; nobody else is offered it", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  let audience = "open";
+  vi.mocked(getChatHead).mockImplementation(async () => head("c1", ME, { may_hide: true, audience }));
+  vi.mocked(setSessionAudience).mockImplementation(async (session, next) => {
+    audience = next;
+    return { session_id: session, audience: next, sessions: [session] };
+  });
+  const { view } = shell();
+  await screen.findByText("a2");
+  const controls = () => within(screen.getByRole("toolbar", { name: "Chat controls" }));
+  fireEvent.click(controls().getByRole("button", { name: "Public chat: make it private" }));
+  expect((await controls().findByRole("button", { name: "Private chat: make it public" })).textContent).toBe("Private");
+  // The switch says it for the starter: no badge besides.
+  expect(document.querySelector(".chat-badge")).toBeNull();
+  fireEvent.click(controls().getByRole("button", { name: "Private chat: make it public" }));
+  expect((await controls().findByRole("button", { name: "Public chat: make it private" })).textContent).toBe("Public");
+  expect(vi.mocked(setSessionAudience).mock.calls.map(([session, next]) => [session, next])).toEqual([["s-c1", "private"], ["s-c1", "open"]]);
+  view.unmount();
+  vi.mocked(getChatHead).mockImplementation(async () => head("c1", GRACE));
+  shell();
+  await screen.findByText("a2");
+  expect(screen.queryByRole("button", { name: /^(Public|Private) chat:/ })).toBeNull();
+});
+
+test("a refused flip says why in a toast, in words for the server's code, and leaves the chat as it was", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockResolvedValue(head("c1", ME, { may_hide: true }));
+  vi.mocked(setSessionAudience)
+    .mockRejectedValueOnce(new ApiError(403, "403 Forbidden", SESSION_NOT_OWNER))
+    .mockRejectedValueOnce(new ApiError(409, "409 Conflict", SESSION_STAFF));
+  shell();
+  await screen.findByText("a2");
+  fireEvent.click(screen.getByRole("button", { name: "Public chat: make it private" }));
+  expect(await screen.findByText("Only the person who started this chat can make it public or private.")).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Public chat: make it private" }));
+  expect(await screen.findByText("This chat is staff only, so it is never made public or private.")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Public chat: make it private" }).textContent).toBe("Public");
 });
 
 test("a conversation cannot be typed into before its head says whose it is", async () => {
@@ -834,37 +1221,132 @@ test("a conversation cannot be typed into before its head says whose it is", asy
   shell();
   const box = screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
   expect(box.disabled).toBe(true);
-  await act(async () => release(head("c1", GRACE, { forks_on_typing: true })));
+  await act(async () => release(head("c1", GRACE)));
   await screen.findByText("a2");
   await waitFor(() => expect(box.disabled).toBe(false), { interval: 1 });
   expect(sendChatLine).not.toHaveBeenCalled();
 });
 
-test("a post the server refuses as outside the chat's organisation is sent again as a fork at its latest line", async () => {
+test("a post the server refuses as not shared with me is shown, never sent again as a fork", async () => {
   open("c1");
   hold("c1", ...TALK);
-  vi.mocked(sendChatLine).mockRejectedValueOnce(new ApiError(403, "fork it")).mockResolvedValue({ conversation_id: "f1", session_id: null });
+  vi.mocked(sendChatLine).mockRejectedValue(new ApiError(403, "This chat is not shared with you", CHAT_NOT_SHARED));
   shell();
   await screen.findByText("a2");
   await type("a question of my own");
-  await waitFor(() => expect(sendChatLine).toHaveBeenCalledTimes(2), { interval: 1 });
-  const [[first, firstKey], [second, secondKey]] = vi.mocked(sendChatLine).mock.calls as [[object, string], [object, string]];
-  expect(first).toMatchObject({ conversationId: "c1" });
-  expect(first).not.toHaveProperty("fork");
-  expect(second).toMatchObject({ conversationId: null, fork: { sessionId: "s-c1", part: 0, idx: 3 } });
-  expect(secondKey).not.toBe(firstKey);
-  await waitFor(() => expect(localStorage.getItem(STORED)).toBe("f1"), { interval: 1 });
+  expect((await screen.findByRole("alert")).textContent).toContain("This chat is not shared with you");
+  expect(sendChatLine).toHaveBeenCalledOnce();
+  expect(vi.mocked(sendChatLine).mock.calls[0]![0]).not.toHaveProperty("fork");
+  expect(currentStation().id).toBe(WORKSPACE_ID);
 });
 
-test("a refused post in a chat with no stored line to fork after says why and is not sent again", async () => {
+test.each([
+  [CHAT_FORK_CLOSED, "This chat was hidden or made staff only, so it can no longer be forked."],
+  [CHAT_FORK_WIDER, "This chat is shared with you, not with your organisation, which would read a fork of it; post in it instead."],
+])("a fork the server refuses (%s) says why, drops the line it was to start from, keeps the draft, and reads the head again", async (code, why) => {
+  open("c1");
+  hold("c1", ...TALK);
+  // The server names the refusal by its code alone.
+  vi.mocked(sendChatLine).mockRejectedValue(new ApiError(409, "409 Conflict", code));
+  shell();
+  await screen.findByText("a2");
+  fireEvent.click(forkButton("a1"));
+  const heads = vi.mocked(getChatHead).mock.calls.length;
+  await type("a branch");
+  expect(await screen.findByText(why)).toBeTruthy();
+  expect(screen.queryByText(/Your next message starts a fork/)).toBeNull();
+  expect(screen.getByRole("textbox", { name: "Message" })).toHaveProperty("value", "a branch");
+  await waitFor(() => expect(vi.mocked(getChatHead).mock.calls.length).toBeGreaterThan(heads));
+  expect(sendChatLine).toHaveBeenCalledOnce();
+});
+
+test("a 403 that is not the chat's refusal of the poster is shown, never sent as a fork", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(sendChatLine).mockRejectedValue(new ApiError(403, "Viewers cannot post", "role"));
+  shell();
+  await screen.findByText("a2");
+  await type("a question");
+  expect((await screen.findByRole("alert")).textContent).toContain("Viewers cannot post");
+  expect(sendChatLine).toHaveBeenCalledOnce();
+});
+
+test("the box waits for the chat's lines, which a line sent counts its own among", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  let release: (records: SessionRecord[]) => void = () => {};
+  vi.mocked(readSessionRecords).mockImplementation(() => new Promise((resolve) => { release = resolve; }));
+  shell();
+  await waitFor(() => expect(getChatHead).toHaveBeenCalled());
+  const box = screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement;
+  await waitFor(() => expect(readSessionRecords).toHaveBeenCalled());
+  expect(box.disabled).toBe(true);
+  await act(async () => release(sessions.get("s-c1")!));
+  await screen.findByText("a2");
+  await waitFor(() => expect(box.disabled).toBe(false), { interval: 1 });
+});
+
+test("a post into a deleted chat lets it go and starts a new chat with the same line", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(sendChatLine).mockRejectedValueOnce(new ApiError(410, "This chat was deleted; start a new one", CHAT_DELETED))
+    .mockResolvedValue({ conversation_id: "n1", session_id: null, workspace_id: WORKSPACE_ID });
+  const { client } = shell();
+  await screen.findByText("a2");
+  await type("still there?");
+  await waitFor(() => expect(sendChatLine).toHaveBeenCalledTimes(2), { interval: 1 });
+  const [[first], [second]] = vi.mocked(sendChatLine).mock.calls as [[object, string], [object, string]];
+  expect(first).toMatchObject({ conversationId: "c1" });
+  expect(second).toMatchObject({ text: "still there?", conversationId: null });
+  expect(second).not.toHaveProperty("fork");
+  await waitFor(() => expect(client.getQueryData<WorkspaceState>(["workspace", WORKSPACE_ID])?.conversation_id).toBe("n1"));
+});
+
+test("a fork of a deleted chat's line lets the chat go and starts a new chat with the line", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(sendChatLine).mockRejectedValueOnce(new ApiError(410, "This chat was deleted; start a new one", CHAT_DELETED))
+    .mockResolvedValue({ conversation_id: "n1", session_id: null, workspace_id: WORKSPACE_ID });
+  const { client } = shell();
+  await screen.findByText("a2");
+  fireEvent.click(forkButton("a1"));
+  await type("a branch");
+  await waitFor(() => expect(sendChatLine).toHaveBeenCalledTimes(2), { interval: 1 });
+  const [[first], [second]] = vi.mocked(sendChatLine).mock.calls as [[object, string], [object, string]];
+  expect(first).toMatchObject({ conversationId: null, fork: { sessionId: "s-c1" } });
+  expect(second).toMatchObject({ text: "a branch", conversationId: null });
+  expect(second).not.toHaveProperty("fork");
+  await waitFor(() => expect(client.getQueryData<WorkspaceState>(["workspace", WORKSPACE_ID])?.conversation_id).toBe("n1"));
+  expect(screen.queryByText(/Your next message starts a fork/)).toBeNull();
+});
+
+test("opening a deleted chat by link says it was deleted", async () => {
+  vi.mocked(getDetail).mockResolvedValue({ self: { cli_session_id: "chat:c9", labels: ["science-chat"] } } as never);
+  vi.mocked(stationForChat).mockRejectedValue(new ApiError(410, "This chat was deleted; start a new one", CHAT_DELETED));
+  const { feed } = shell();
+  act(() => feed.continueIn("s9"));
+  expect(await screen.findByText("This chat was deleted; start a new one")).toBeTruthy();
+});
+
+test("a head read that says the chat is deleted (410) leaves the station on an empty chat, with no error to retry", async () => {
+  open("c1");
+  hold("c1", ...TALK);
+  vi.mocked(getChatHead).mockRejectedValue(new ApiError(410, "This chat was deleted; start a new one", CHAT_DELETED));
+  const { client } = shell();
+  await waitFor(() => expect(client.getQueryData<WorkspaceState>(["workspace", WORKSPACE_ID])?.conversation_id).toBeNull());
+  expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+  expect(screen.queryByText("a2")).toBeNull();
+});
+
+test("a refused post in a chat with no stored line says why and is not sent again", async () => {
   open("c1");
   hold("c1");
   vi.mocked(getChatHead).mockResolvedValue(head("c1", GRACE));
-  vi.mocked(sendChatLine).mockRejectedValue(new ApiError(403, "started outside your organisation"));
+  vi.mocked(sendChatLine).mockRejectedValue(new ApiError(403, "403 Forbidden", CHAT_NOT_SHARED));
   shell();
   await waitFor(() => expect((screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement).disabled).toBe(false), { interval: 1 });
   await type("hello");
-  expect((await screen.findByRole("alert")).textContent).toContain("started outside your organisation");
+  expect((await screen.findByRole("alert")).textContent).toContain("403 Forbidden");
   expect(sendChatLine).toHaveBeenCalledOnce();
 });
 
@@ -875,9 +1357,11 @@ test("a chat says how often it was forked, and a fork says what it was forked fr
   vi.mocked(getChatHead).mockImplementation(async (id) => (id === "f1" ? head("f1", ME, { forked_from: "c0", forks: 1 }) : head(id)));
   shell();
   expect(await screen.findByText("Forked once.")).toBeTruthy();
+  vi.mocked(stationForChat).mockResolvedValue({ ...workspace, id: "w-c0", name: "unnamed-workstream#3", conversation_id: "c0" });
   fireEvent.click(screen.getByRole("button", { name: "another chat" }));
   expect(await screen.findByText("the original")).toBeTruthy();
-  expect(localStorage.getItem(STORED)).toBe("c0");
+  expect(stationForChat).toHaveBeenCalledWith("c0");
+  expect(currentStation().id).toBe("w-c0");
   cleanup();
   vi.mocked(getChatHead).mockResolvedValue(head("c0", ME, { forks: 3 }));
   shell();
@@ -890,7 +1374,8 @@ test("a line still being sent, and a chat I cannot post in, offer no fork", asyn
   vi.mocked(sendChatLine).mockImplementation(() => new Promise(() => {}));
   const { view } = shell();
   await screen.findByText("a2");
-  expect(screen.getAllByRole("button", { name: "Fork from here" })).toHaveLength(4);
+  // One for each answer, a1 and a2.
+  expect(screen.getAllByRole("button", { name: "Fork from here" })).toHaveLength(2);
   await type("on its way");
   const pending = (await within(screen.getByRole("log")).findByText("on its way")).closest("article")!;
   expect(within(pending).queryByRole("button", { name: "Fork from here" })).toBeNull();
@@ -1040,12 +1525,12 @@ test("answers already in a conversation when it opens light nothing: only a new 
 
 test("with the switch off an answer lights nothing, and turning it on lights only answers that come after", async () => {
   const { highlights, reply } = await conversation();
-  act(() => chooseHighlightMentions(ME, false));
+  act(() => receivePreferences({ ...preferences(), highlight_mentions: false }));
   await reply("Issue#1 and Issue#2");
   await screen.findByText(/Issue#1/);
   expect(marked(highlights)).toEqual([]);
   expect(findRef).not.toHaveBeenCalled();
-  act(() => chooseHighlightMentions(ME, true));
+  act(() => receivePreferences({ ...preferences(), highlight_mentions: true }));
   expect(marked(highlights)).toEqual([]);
   await reply("Issue#3");
   await waitFor(() => expect(marked(highlights)).toEqual([idOf("Issue", 3)]), { interval: 1 });
@@ -1057,7 +1542,53 @@ test("the switch is honoured while a lookup is under way", async () => {
   vi.mocked(findRef).mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
   await reply("Issue#1");
   await waitFor(() => expect(findRef).toHaveBeenCalledTimes(1), { interval: 1 });
-  act(() => chooseHighlightMentions(ME, false));
+  act(() => receivePreferences({ ...preferences(), highlight_mentions: false }));
   await act(async () => release("row"));
   expect(marked(highlights)).toEqual([]);
+});
+
+test("in the Terminal style a user's line, mine or another's, follows a shell prompt, and an answer has none", async () => {
+  open("c1");
+  hold("c1", said(0, ME, "my question"), answered(1, "an answer"), said(2, GRACE, "and mine"));
+  shell();
+  await screen.findByText("an answer");
+  expect(document.querySelector(".chat-prompt")).toBeNull();
+  act(() => chooseChatStyle("terminal"));
+  const prompts = Array.from(document.querySelectorAll(".chat-prompt"), (prompt) => prompt.parentElement!.textContent);
+  expect(prompts).toEqual(["ada@localhost:[unnamed-workstream#1]$ my question", "grace@localhost:[unnamed-workstream#1]$ and mine"]);
+  act(() => chooseChatStyle("default"));
+  expect(document.querySelector(".chat-prompt")).toBeNull();
+});
+
+test("a recap whose last answer proposes a next experiment offers to launch it, sending the canned ask", async () => {
+  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1", workspace_id: WORKSPACE_ID });
+  open("c1");
+  hold("c1", said(0, ME, "how did it go?"), answered(1, "## Results\nThe climb held.\n\n## Next experiment\nRaise the effort to high."));
+  shell();
+  const launch = await screen.findByRole("button", { name: "Launch the follow-up" });
+  fireEvent.click(launch);
+  await waitFor(() => expect(sendChatLine).toHaveBeenCalledOnce(), { interval: 1 });
+  expect(vi.mocked(sendChatLine).mock.calls[0]![0].text).toBe(FOLLOW_UP_ASK);
+});
+
+test("a plain last answer offers no follow-up", async () => {
+  open("c1");
+  hold("c1", said(0, ME, "and then?"), answered(1, "The run plateaued; nothing new to try."));
+  shell();
+  await screen.findByText("The run plateaued; nothing new to try.");
+  expect(screen.queryByRole("button", { name: "Launch the follow-up" })).toBeNull();
+});
+
+test("hovering a stored line shows when it was sent, in the reader's own time; a line still being sent shows none", async () => {
+  vi.mocked(sendChatLine).mockResolvedValue({ conversation_id: "c1", session_id: "s-c1", workspace_id: WORKSPACE_ID });
+  open("c1");
+  hold("c1", { ...said(0, ME, "my question"), timestamp: "2026-10-13T11:50:00Z" } as SessionRecord);
+  shell();
+  const line = (await screen.findByText("my question")).closest("article")!;
+  expect(line.getAttribute("title")).toMatch(/^Sent .*2026/);
+  await type("still sending");
+  await screen.findByText("still sending");
+  const pending = document.querySelector(".chat-line-pending");
+  expect(pending).not.toBeNull();
+  expect(pending!.getAttribute("title")).toBeNull();
 });

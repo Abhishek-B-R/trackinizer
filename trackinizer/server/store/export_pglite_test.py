@@ -13,18 +13,21 @@ from uuid import UUID, uuid4
 
 import json
 
+from treekle import from_plain, json_loads
+
 import pytest
 import pytest_asyncio
 
-from trackinizer.lib.codec import from_plain, loads
 from trackinizer.lib.postgres.testing import reset_schema
 from trackinizer.server.api.export_routes import export_lines
+from trackinizer.server.audience import SessionReader
 from trackinizer.server.embedders.stub import StubEmbedder
 from trackinizer.server.store.core import Store
 from trackinizer.server.store.export import _SCOPE_COLUMNS
 from trackinizer.server.store.session_ir import SlashCommandRow
 from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.types.streams import Stdout
+from trackinizer.wire.audience import AUDIENCES
 from trackinizer.wire.bodies import SubmitExperiment, SubmitIssue
 from trackinizer.wire.filters import Filter
 from trackinizer.wire.wire_export import (
@@ -42,16 +45,28 @@ if TYPE_CHECKING:
     from trackinizer.server.store.export import GraphExport
 
 
+# Reads every session's transcript, as a whole backup is taken.
+_ANYONE: Final = SessionReader(
+    audiences=AUDIENCES,
+    every_session=True,
+    every_chat=True,
+    oversight=True,
+)
 _LEFT_OUT: Final = frozenset(
     {
         "allowlist",
         "api_keys",
         "applied_migrations",
+        "code_blobs",
+        "code_snapshots",
+        "credit_entries",
         "inquiry_embeddings",
         "inquiry_lock_log",
         "machine_credentials",
         "machine_enrollments",
         "machines",
+        "science_chat_shares",
+        "science_chat_tombstones",
         "session_bodies",
         "session_ciphertext",
         "session_embeddings",
@@ -62,7 +77,6 @@ _LEFT_OUT: Final = frozenset(
         "visual_report_revisions",
         "visual_reports",
         "visual_workspace_operations",
-        "visual_workspace_presets",
         "visual_workspaces",
     },
 )
@@ -113,9 +127,10 @@ async def _seed(store: Store) -> dict[str, UUID]:
     session = uuid4()
     async with store.engine.acquire() as conn:
         await conn.execute(
-            "INSERT INTO inquiries (id, kind, seq, status, account, title) "
+            "INSERT INTO inquiries (id, kind, seq, status, account, title, "
+            "agentsession_audience) "
             "VALUES ($1, 'AgentSession', nextval('seq_agentsession'), 'active', "
-            "'tester@example.com', 'export test')",
+            "'tester@example.com', 'export test', 'open')",
             session,
         )
     part = await store.upsert_session_manifest(
@@ -171,7 +186,7 @@ async def test_the_export_carries_every_seeded_row(store: Store) -> None:
     """Rows, edges, audit, metrics and session parts all come out, in order."""
     ids = await _seed(store)
 
-    graph = await store.export_graph()
+    graph = await store.export_graph(reader=_ANYONE)
 
     assert [table for table, _ in graph.tables] == list(EXPORT_TABLES)
     inquiry_ids = {row["id"] for row in _rows(graph, "inquiries")}
@@ -199,11 +214,11 @@ async def test_the_export_carries_every_seeded_row(store: Store) -> None:
 @pytest.mark.asyncio(loop_scope="session")
 async def test_the_header_names_the_applied_migrations(store: Store) -> None:
     """A reader learns which schema wrote the rows from the first line alone."""
-    graph = await store.export_graph()
+    graph = await store.export_graph(reader=_ANYONE)
     async with store.engine.acquire() as conn:
         applied = await conn.fetch("SELECT name FROM applied_migrations")
 
-    header = from_plain(loads(next(iter(export_lines(graph)))), dict[str, object])
+    header = json_loads(next(iter(export_lines(graph))), dict[str, object])
 
     assert header["format"] == EXPORT_FORMAT
     assert header["version"] == EXPORT_VERSION
@@ -222,8 +237,8 @@ async def test_every_line_is_json_and_an_unchanged_graph_exports_identically(
     """Real column types serialize, and two exports of one graph match byte for byte."""
     await _seed(store)
 
-    first = b"".join(export_lines(await store.export_graph()))
-    second = b"".join(export_lines(await store.export_graph()))
+    first = b"".join(export_lines(await store.export_graph(reader=_ANYONE)))
+    second = b"".join(export_lines(await store.export_graph(reader=_ANYONE)))
 
     assert first == second
     lines = first.decode().splitlines()
@@ -236,12 +251,12 @@ async def test_every_line_is_json_and_an_unchanged_graph_exports_identically(
 async def test_rows_written_later_land_at_the_end(store: Store) -> None:
     """A re-export appends new inquiries instead of reshuffling the old ones."""
     await _seed(store)
-    before = _rows(await store.export_graph(), "inquiries")
+    before = _rows(await store.export_graph(reader=_ANYONE), "inquiries")
 
     await store.submit_issue(
         SubmitIssue(account="tester@example.com", title="Asked later"),
     )
-    after = _rows(await store.export_graph(), "inquiries")
+    after = _rows(await store.export_graph(reader=_ANYONE), "inquiries")
 
     assert after[: len(before)] == before
     assert after[-1]["title"] == "Asked later"
@@ -304,6 +319,7 @@ async def test_a_selector_exports_only_the_inquiries_it_matches(store: Store) ->
     ids = await _seed_partitioned(store)
 
     graph = await store.export_graph(
+        reader=_ANYONE,
         selector=(Filter(field="labels", op="is", value="org:rekursiv"),),
     )
 
@@ -323,6 +339,7 @@ async def test_clauses_and_together_the_way_the_request_spells_it(
     ids = await _seed_partitioned(store)
 
     graph = await store.export_graph(
+        reader=_ANYONE,
         selector=(
             Filter(field="labels", op="is", value="org:rekursiv"),
             Filter(field="labels", op="nre", value="^machine:"),
@@ -342,6 +359,7 @@ async def test_an_edge_rides_along_only_when_both_ends_do(store: Store) -> None:
     ids = await _seed_partitioned(store)
 
     graph = await store.export_graph(
+        reader=_ANYONE,
         selector=(
             Filter(field="labels", op="is", value="org:rekursiv"),
             Filter(field="labels", op="nre", value="^machine:"),
@@ -367,6 +385,7 @@ async def test_the_selector_reaches_the_tables_hanging_off_the_inquiries(
     ids = await _seed_partitioned(store)
 
     graph = await store.export_graph(
+        reader=_ANYONE,
         selector=(Filter(field="labels", op="is", value="org:rekursiv"),),
     )
 
@@ -387,18 +406,17 @@ async def test_the_header_says_which_subgraph_this_is(store: Store) -> None:
     await _seed_partitioned(store)
     selector = (Filter(field="labels", op="is", value="org:rekursiv"),)
 
-    scoped = await store.export_graph(selector=selector)
-    whole = await store.export_graph()
+    scoped = await store.export_graph(reader=_ANYONE, selector=selector)
+    whole = await store.export_graph(reader=_ANYONE)
 
-    header = from_plain(loads(next(iter(export_lines(scoped)))), dict[str, object])
+    header = json_loads(next(iter(export_lines(scoped))), dict[str, object])
     assert header["selector"] == [
         {"field": "labels", "op": "is", "value": "org:rekursiv"},
     ]
     # Absent, not empty: a whole-graph export is byte-identical to the ones
     # written before selectors existed.
-    assert "selector" not in from_plain(
-        loads(next(iter(export_lines(whole)))),
-        dict[str, object],
+    assert "selector" not in json_loads(
+        next(iter(export_lines(whole))), dict[str, object]
     )
 
 
@@ -408,8 +426,10 @@ async def test_an_empty_selector_is_the_whole_graph(store: Store) -> None:
     """The unfiltered export is untouched, byte for byte, by this feature."""
     await _seed_partitioned(store)
 
-    explicit = b"".join(export_lines(await store.export_graph(selector=())))
-    default = b"".join(export_lines(await store.export_graph()))
+    explicit = b"".join(
+        export_lines(await store.export_graph(reader=_ANYONE, selector=()))
+    )
+    default = b"".join(export_lines(await store.export_graph(reader=_ANYONE)))
 
     assert explicit == default
 
@@ -423,6 +443,7 @@ async def test_a_selector_matching_nothing_exports_a_header_and_no_rows(
     await _seed_partitioned(store)
 
     graph = await store.export_graph(
+        reader=_ANYONE,
         selector=(Filter(field="labels", op="is", value="org:nobody"),),
     )
 
@@ -431,6 +452,6 @@ async def test_a_selector_matching_nothing_exports_a_header_and_no_rows(
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

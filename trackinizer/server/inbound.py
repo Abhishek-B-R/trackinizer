@@ -21,7 +21,7 @@ the only per-process state standing between the server and ``--workers N``.
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from uuid import UUID
@@ -55,6 +55,14 @@ class Inbound:
     sender:`` injection prefix. ``None`` for a direct (session-id) enqueue."""
 
     context: WorkspaceMessageContext | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Handed:
+    """Who sent one chat line a poller took, and until when it counts as posted."""
+
+    source: str | None
+    until: float
 
 
 class IdempotencyReuseError(Exception):
@@ -96,6 +104,18 @@ class InboundQueue:
 
     max_seen_keys: int = 4_096
 
+    max_handed_chats: int = 10_000
+
+    handed_ttl_sec: float = 600.0
+    """How long a taken chat line counts as posted, unrecorded. The assistant records a
+    line as it hands it to its agent, before the turn, so seconds are the norm."""
+
+    max_turns: int = 10_000
+
+    turn_ttl_sec: float = 3_600.0
+    """How long the key that took a chat line holds its poster's turn: the line may wait
+    behind a turn of its chat, then run a turn of its own."""
+
     poller_ttl_sec: float = 45.0
 
     _clock: Callable[[], float] = field(default=time.monotonic, repr=False)
@@ -114,6 +134,16 @@ class InboundQueue:
     _waiters: dict[UUID, list[_Waiter]] = field(
         default_factory=lambda: defaultdict(list),
     )
+
+    # Who sent each chat line a poller took and its chat does not yet record, by
+    # conversation, the one handed a line longest ago first: a delete counts these as
+    # posted, as it counts the queued ones.
+    _handed: OrderedDict[UUID, list[_Handed]] = field(default_factory=OrderedDict)
+
+    # Until when each key that took a chat line holds its poster's turn, by key and
+    # lowercased poster, the one taken longest ago first. Unlike ``_handed``, the chat
+    # recording the line does not end it: the turn runs after that.
+    _turns: OrderedDict[tuple[UUID, str], float] = field(default_factory=OrderedDict)
 
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -389,6 +419,147 @@ class InboundQueue:
         """
         with self._lock:
             return len(self._queues.get(session_id, ()))
+
+    def hand_out(self, messages: Sequence[Inbound], *, taker: UUID | None) -> None:
+        """Remember who sent each chat line a poller took, and which key took it.
+
+        A drained line is in no queue and not yet in its chat's records, so for the
+        moment between, only this says it was posted. It is kept in memory alone: a
+        restart forgets it, and so does the chat's delete. One not recorded within
+        ``handed_ttl_sec`` no longer counts: its run may have stopped mid-turn, or let
+        its drain go, and it would hold the chat's delete off until a restart. Over
+        ``max_handed_chats`` chats, the one handed a line longest ago is forgotten.
+
+        The key that took a chat line holds its poster's turn for ``turn_ttl_sec``
+        (:meth:`took_line`), whether or not the chat has recorded it since; over
+        ``max_turns``, the turn taken longest ago is forgotten.
+
+        Args:
+          messages: What one drain gave its poller.
+          taker: The API key that drained them; ``None`` for a browser session, which
+            holds no turn.
+
+        """
+        with self._lock:
+            now = self._clock()
+            for message in messages:
+                context = message.context
+                if context is None or context.conversation_id is None:
+                    continue
+                handed = self._handed.setdefault(context.conversation_id, [])
+                self._handed.move_to_end(context.conversation_id)
+                handed.append(
+                    _Handed(source=message.source, until=now + self.handed_ttl_sec),
+                )
+                del handed[: -self.max_per_session]
+                if taker is not None and message.source is not None:
+                    turn = (taker, message.source.lower())
+                    self._turns[turn] = now + self.turn_ttl_sec
+                    self._turns.move_to_end(turn)
+            while len(self._handed) > self.max_handed_chats:
+                forgotten, _ = self._handed.popitem(last=False)
+                _LOGGER.warning(
+                    "taken chat lines over cap (%d chats); forgot those of chat %s",
+                    self.max_handed_chats,
+                    forgotten,
+                )
+            while len(self._turns) > self.max_turns:
+                _ = self._turns.popitem(last=False)
+
+    def took_line(self, taker: UUID, *, poster: str) -> bool:
+        """Say whether ``taker`` took a chat line ``poster`` sent, within the turn TTL.
+
+        Args:
+          taker: An API key.
+          poster: An attested sender, in any case.
+
+        Returns:
+          held: Whether that key drained a chat line of theirs in the last
+            ``turn_ttl_sec``.
+
+        """
+        with self._lock:
+            return self._turns.get((taker, poster.lower()), 0.0) > self._clock()
+
+    def recorded(self, conversation_id: UUID, *, senders: Sequence[str]) -> None:
+        """Forget one handed-out line of each sender, now its chat records it.
+
+        Args:
+          conversation_id: The science chat.
+          senders: The poster of each line its session was just given.
+
+        """
+        with self._lock:
+            handed = self._handed.get(conversation_id, [])
+            for sender in senders:
+                taken = next(
+                    (
+                        at
+                        for at, line in enumerate(handed)
+                        if (line.source or "").lower() == sender.lower()
+                    ),
+                    None,
+                )
+                if taken is not None:
+                    del handed[taken]
+            if not handed:
+                _ = self._handed.pop(conversation_id, None)
+
+    def conversation_senders(self, conversation_id: UUID) -> list[str | None]:
+        """Name the sender of each line on its way into a conversation.
+
+        That is each line still queued for it, on any session, and each one a poller
+        took within ``handed_ttl_sec`` that its chat does not yet record.
+
+        Args:
+          conversation_id: The science chat.
+
+        Returns:
+          senders: Each such line's attested ``source``: the queued ones, oldest
+            first per session, then the handed-out ones.
+
+        """
+        with self._lock:
+            now = self._clock()
+            return [
+                *(
+                    message.source
+                    for queue in self._queues.values()
+                    for message in queue
+                    if message.context is not None
+                    and message.context.conversation_id == conversation_id
+                ),
+                *(
+                    line.source
+                    for line in self._handed.get(conversation_id, ())
+                    if line.until > now
+                ),
+            ]
+
+    def drop_conversation(self, conversation_id: UUID) -> int:
+        """Remove every line still queued for a conversation, and forget handed ones.
+
+        Args:
+          conversation_id: The science chat.
+
+        Returns:
+          dropped: How many queued lines were removed.
+
+        """
+        dropped = 0
+        with self._lock:
+            _ = self._handed.pop(conversation_id, None)
+            for session_id in list(self._queues):
+                queue = self._queues[session_id]
+                kept = deque(
+                    message
+                    for message in queue
+                    if message.context is None
+                    or message.context.conversation_id != conversation_id
+                )
+                dropped += len(queue) - len(kept)
+                self._queues[session_id] = kept
+        return dropped
 
     def is_full(self, session_id: UUID) -> bool:
         """Say whether one more message would evict the oldest waiting one.

@@ -11,6 +11,8 @@ are that union's, not the IR's: old ``text`` vs IR ``content``, old
 
 from __future__ import annotations
 
+from treekle import immutable
+
 import pytest
 
 from trackinizer.lib.agent.types.sessions import (
@@ -26,7 +28,6 @@ from trackinizer.lib.agent.types.sessions import (
     UncategorizedToolResult,
     UserMessage,
 )
-from trackinizer.lib.codec import immutable
 from trackinizer.server.store import legacy_retype
 from trackinizer.server.store.legacy_retype import (
     LEGACY_KINDS,
@@ -362,6 +363,6 @@ class TestContract:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

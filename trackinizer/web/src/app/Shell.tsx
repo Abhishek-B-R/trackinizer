@@ -1,4 +1,4 @@
-import { Suspense, useCallback, useState } from "react";
+import { Suspense, useCallback, useRef, useState } from "react";
 import { createCommands } from "../commands/create";
 import { PaletteContext, usePaletteState } from "../commands/palette";
 import { useCommands } from "../commands/registry";
@@ -14,6 +14,7 @@ import { BarStack, OfflineBar, PausedBar } from "../ui/bars";
 import { Icon } from "../ui/icons";
 import { kindLook } from "../ui/kinds";
 import { panelCommand, usePanel } from "../ui/panel";
+import { RAIL_FOLD_AFTER_MS, useHoverOpen } from "../visuals/hoverOpen";
 import { EmptyState, OpenDrawerContext, ViewHeader } from "../ui/view";
 import { useMeta, useProfile, useWriteMode } from "./boot";
 import { SIDEBAR, Sidebar } from "./Sidebar";
@@ -22,27 +23,34 @@ import { SIDEBAR, Sidebar } from "./Sidebar";
  * The agent canvas around the views, for users who have not opted out
  * (`visual_workspace_enabled`, on by default): a chunk of its own, so that a
  * first load without it does not carry it, loaded only for a user who has it on,
- * with the first renderer it shows.
+ * with Chat's column and the registry of the renderers it shows.
  */
 const Canvas = lazyView(
   async () => {
-    // With the renderer it shows first, so its first render suspends on nothing.
-    // The registry chunk loads in parallel with the canvas chunk, not after it.
-    const [module, registry] = await Promise.all([import("../visuals/Canvas"), import("../visuals/registry")]);
-    await registry.preloadFirstRenderers();
+    // Chat's column loads in parallel with the canvas chunk and with it, so the
+    // column's first render suspends on nothing.
+    const [module] = await Promise.all([import("../visuals/Canvas"), import("../visuals/registry"), ChatColumn.preload()]);
     return module;
   },
   (module) => module.Canvas,
 );
 
-/** A route that shows a view; a new inquiry shows its form over one. */
-type ViewRoute = Exclude<Route, { name: "new" }>;
+/** Chat, a column beside the canvas rather than a visual in it. */
+const ChatColumn = lazyView(() => import("../visuals/ChatColumn"), (module) => module.ChatColumn);
+
+/** A route that shows a page; a new inquiry's form, Settings and Admin show over one. */
+type ViewRoute = Exclude<Route, { name: "new" | "settings" | "admin" }>;
+
+/** Settings and Admin: a sheet over the page, half its width, from the sidebar's rail. */
+type SheetRoute = Extract<Route, { name: "settings" | "admin" }>;
 
 /**
  * The signed-in app: the sidebar, the bars, the current route's view, and the
- * palette and the create form, with the shell's own commands. Collapsed, the
- * sidebar is a rail of its icons; narrow, it is a drawer whether collapsed or
- * not.
+ * palette and the create form, with the shell's own commands. The sidebar
+ * stands at the canvas's left edge: right of Chat when Chat is at the left,
+ * leftmost when Chat is at the right, and leftmost too with no canvas. It is a
+ * rail of its icons that opens over the workbench while hovered, or pinned
+ * open; narrow, it is a drawer whether collapsed or not.
  */
 export function Shell() {
   const { route, navigate } = useRouter();
@@ -50,9 +58,10 @@ export function Shell() {
   const { role, visual_workspace_enabled: visualWorkspaceEnabled } = useProfile();
   const writable = useWriteMode() === "enabled";
   const creatable = creatableKinds(kinds);
-  // The view under a `#/new/<Kind>` route: the one before it, or home, the graph,
-  // when the app opened on that link.
-  const view = route.name === "new" ? null : route;
+  // The page under a `#/new/<Kind>` route or a sheet: the one before it, or home,
+  // the graph, when the app opened on that link.
+  const sheet = isSheet(route) ? route : null;
+  const view = route.name === "new" || isSheet(route) ? null : route;
   const [background, setBackground] = useState<ViewRoute>(view ?? HOME);
   if (view && view !== background) setBackground(view);
   // No route opens the palette: a search link opens the search page.
@@ -62,6 +71,18 @@ export function Shell() {
   const openDrawer = useCallback(() => setDrawerOpen(true), []);
   const closeDrawer = useCallback(() => setDrawerOpen(false), []);
   const sidebar = usePanel(SIDEBAR);
+  // A rail opens over the workbench while the pointer rests on it or the keyboard is in it, and folds soon after both leave.
+  const dock = useRef<HTMLDivElement>(null);
+  const peek = useHoverOpen(dock, { foldAfterMs: RAIL_FOLD_AFTER_MS });
+  const peeking = sidebar.collapsed && peek.open;
+  const navigated = () => {
+    closeDrawer();
+    peek.set(false);
+  };
+  const openWorkbench = () => {
+    peek.set(true);
+    requestAnimationFrame(() => dock.current?.querySelector<HTMLElement>(".workbench-slot input:not(:disabled), .workbench-slot button:not(:disabled)")?.focus());
+  };
 
   useCommands([
     {
@@ -105,11 +126,27 @@ export function Shell() {
     panelCommand(sidebar),
   ]);
 
+  // With the canvas, Chat's row holds the rail, beside the canvas; without it, the app's grid does.
+  const chatRow = visualWorkspaceEnabled && canvasLoaded;
+  const rail = (
+    <div ref={dock} className="sidebar-dock">
+      <Sidebar onNavigate={navigated} onWorkbench={openWorkbench} panel={sidebar} />
+    </div>
+  );
+  // With the canvas, the sheet opens over the canvas's page from the rail's edge (ChatColumn); without it, over the main area.
+  const sheetView = sheet ? (
+    <aside className="sheet" aria-label={sheet.name === "settings" ? "Your settings" : "Admin"}>
+      <Suspense fallback={<div className="view" aria-busy="true" />}>
+        {sheet.name === "settings" ? <SettingsView /> : <AdminView />}
+      </Suspense>
+    </aside>
+  ) : null;
+
   return (
     <PaletteContext value={palette}>
       <OpenDrawerContext value={openDrawer}>
-        <div className={`app${drawerOpen ? " drawer-open" : ""}${sidebar.collapsed ? " sidebar-collapsed" : ""}`}>
-          <Sidebar onNavigate={closeDrawer} panel={sidebar} />
+        <div className={`app${drawerOpen ? " drawer-open" : ""}${sidebar.collapsed ? " sidebar-collapsed" : ""}${peeking ? " sidebar-peek" : ""}${chatRow ? " rail-in-row" : ""}`}>
+          {chatRow ? null : rail}
           <div className="drawer-scrim" onClick={closeDrawer} />
           <main className="main">
             <BarStack>
@@ -117,10 +154,10 @@ export function Shell() {
               <PausedBar />
               {/* A view whose chunk is still loading (src/router/views.ts) holds an empty, busy frame. */}
               <Suspense fallback={<div className="view" aria-busy="true" />}>
-                {/* A canvas route holds the shell's busy frame until the canvas's chunk is in, then mounts its view once, inside it. */}
-                {isCanvasRoute(view ?? background) && visualWorkspaceEnabled ? (
+                {/* The canvas holds the shell's busy frame until its chunk is in, then mounts the page once, inside it. */}
+                {visualWorkspaceEnabled ? (
                   canvasLoaded ? (
-                    <Canvas><RouteView route={view ?? background} /></Canvas>
+                    <ChatColumn rail={rail} sheet={sheetView}><Canvas><RouteView route={view ?? background} /></Canvas></ChatColumn>
                   ) : (
                     <div className="view" aria-busy="true" />
                   )
@@ -128,6 +165,7 @@ export function Shell() {
                   <RouteView route={view ?? background} />
                 )}
               </Suspense>
+              {chatRow ? null : sheetView}
             </BarStack>
           </main>
         </div>
@@ -142,9 +180,9 @@ export function Shell() {
   );
 }
 
-/** The canvas wraps every route but Settings and Admin, so Chat stays while an agent moves the page. */
-function isCanvasRoute(route: ViewRoute): boolean {
-  return route.name !== "settings" && route.name !== "admin";
+/** Whether `route` opens a sheet over the page rather than a page. */
+function isSheet(route: Route): route is SheetRoute {
+  return route.name === "settings" || route.name === "admin";
 }
 
 function RouteView({ route }: { route: ViewRoute }) {
@@ -159,10 +197,6 @@ function RouteView({ route }: { route: ViewRoute }) {
       return <ActivityView />;
     case "console":
       return <ConsoleView />;
-    case "settings":
-      return <SettingsView />;
-    case "admin":
-      return <AdminView />;
     case "search":
       return <SearchView q={route.q} />;
     case "graph":

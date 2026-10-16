@@ -8,6 +8,8 @@ import type { AllowlistEntry, User } from "../api/admin";
 import type { Profile, Role, Token } from "../api/me";
 import { AGREED, type Sent, stubFetch } from "../api/testing";
 import type { WorkspaceOperation, WorkspaceState } from "../api/workspaces";
+import { DEFAULT_PREFERENCES, type Preferences } from "../preferences";
+import { setStation } from "../stations/store";
 import { type Meta, MetaContext, ProfileContext } from "../app/boot";
 import { Session, SessionContext } from "../app/session";
 import { ToastProvider } from "../ui/toast";
@@ -111,6 +113,7 @@ export function user(id: string, email: string, fields: Partial<User> = {}): Use
     status: "active",
     created_at: "2026-09-01T10:00:00+00:00",
     last_login: null,
+    staff: false,
     ...fields,
   };
 }
@@ -131,8 +134,10 @@ export function serveAccount(
   caller: Profile,
   seed: { tokens?: Token[]; users?: User[]; allowlist?: AllowlistEntry[]; workspace?: Partial<WorkspaceState> } = {},
 ) {
+  // A tab starts without a station, so a test never opens the one an earlier test left.
+  setStation(null);
   const server = {
-    workspace: { id: "w-ada", revision: 4, visuals: [], partner: null, assistant: "scout", partner_choice: "shared", ...seed.workspace } as WorkspaceState,
+    workspace: { id: "w-ada", name: "unnamed-workstream#1", conversation_id: null, page: null, revision: 4, visuals: [], partner: null, assistant: "scout", partner_choice: "shared", ...seed.workspace } as WorkspaceState,
     tokens: seed.tokens ?? [],
     users: seed.users ?? [],
     allowlist: seed.allowlist ?? [],
@@ -162,6 +167,14 @@ export function serveAccount(
       if (scripted) return scripted(request);
     }
     const text = await request.clone().text();
+    if (`${request.method} ${path}` === "PATCH /api/me/preferences") {
+      // The server's merge: the keys sent change, a null one goes back to its default, the rest keep theirs.
+      const change = JSON.parse(text) as { [key: string]: unknown };
+      const merged: { [key: string]: unknown } = { ...(caller.preferences ?? DEFAULT_PREFERENCES) };
+      for (const [key, value] of Object.entries(change)) merged[key] = value ?? DEFAULT_PREFERENCES[key as keyof Preferences];
+      caller.preferences = merged as Preferences;
+      return Response.json(caller.preferences);
+    }
     const body = (text ? JSON.parse(text) : {}) as AccountBody;
     return answer(server, caller, `${request.method} ${path}`, body);
   });
@@ -172,7 +185,7 @@ const CANVAS = "/api/workspaces";
 
 type Server = ReturnType<typeof serveAccount>;
 
-type AccountBody = { name?: string; role?: Role; email_or_pattern?: string; enabled?: boolean; revision?: number; operation?: WorkspaceOperation };
+type AccountBody = { name?: string; role?: Role; email_or_pattern?: string; enabled?: boolean; revision?: number; operation?: WorkspaceOperation; campaign?: WorkspaceState["campaign"] };
 
 function answer(server: Server, caller: Profile, call: string, body: AccountBody): Response {
   const [method, path] = call.split(" ") as [string, string];
@@ -183,6 +196,10 @@ function answer(server: Server, caller: Profile, call: string, body: AccountBody
     return Response.json({ enabled: caller.visual_workspace_enabled });
   }
   if (call === `POST ${CANVAS}` || call === `GET ${CANVAS}/${server.workspace.id}`) return Response.json(server.workspace);
+  if (call === `PUT /api/workspaces/${server.workspace.id}/campaign`) {
+    server.workspace = { ...server.workspace, campaign: body.campaign ?? null };
+    return Response.json(server.workspace);
+  }
   if (call === `POST /api/workspaces/${server.workspace.id}/operations`) return operate(server, body);
   if (call === "GET /api/me/tokens") return Response.json({ tokens: server.tokens });
   if (call === "GET /api/admin/users") return Response.json({ users: server.users });

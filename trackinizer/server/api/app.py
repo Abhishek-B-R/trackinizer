@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Final, cast
@@ -21,29 +21,34 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from starlette.types import Send
+from treekle import from_plain
 
 import asyncpg
 
 from trackinizer.addons.addon import ServerContext
 from trackinizer.addons.deployment import Deployment, supervise
-from trackinizer.lib.codec import from_plain
 from trackinizer.server.api import (
     addons_routes,
     admin_routes,
     auth_routes,
+    chat_partial_routes,
+    code_routes,
+    console_relay_routes,
     edge,
     edit,
     export_routes,
+    lineage_routes,
     locks,
     logout_routes,
     machine_host_routes,
     machines_routes,
     meta_routes,
     metrics_routes,
-    preset_routes,
     query,
     reports_routes,
     science_chat_routes,
+    service_account_routes,
+    session_audience_routes,
     session_ir_routes,
     sessions_routes,
     submit,
@@ -70,6 +75,7 @@ from trackinizer.server.store.core import Store
 from trackinizer.server.subscriber import push_changes_to_live_subscribers
 from trackinizer.server.visuals.catalog import default_workspace
 from trackinizer.types.errors import (
+    ChatDeletedError,
     ConflictError,
     NotFoundError,
     ValidationError,
@@ -315,19 +321,24 @@ ROUTERS: Final = (
     addons_routes.router,
     admin_routes.router,
     auth_routes.router,
+    chat_partial_routes.router,
+    code_routes.router,
+    console_relay_routes.router,
     edge.router,
     edit.router,
     export_routes.router,
+    lineage_routes.router,
     locks.router,
     logout_routes.router,
     machine_host_routes.router,
     machines_routes.router,
     meta_routes.router,
     metrics_routes.router,
-    preset_routes.router,
     query.router,
     reports_routes.router,
     science_chat_routes.router,
+    service_account_routes.router,
+    session_audience_routes.router,
     session_ir_routes.router,
     sessions_routes.router,
     submit.router,
@@ -474,6 +485,25 @@ async def conflict_handler(request: Request, exc: ConflictError) -> JSONResponse
     )
 
 
+@app.exception_handler(ChatDeletedError)
+async def chat_deleted_handler(request: Request, exc: ChatDeletedError) -> JSONResponse:
+    """Translate a ``ChatDeletedError`` into HTTP 410 ``chat_deleted``.
+
+    Args:
+      request: FastAPI Request object (unused).
+      exc: The refusal, whose text is the readable message.
+
+    Returns:
+      response: JSON response with 410 status and the code and message.
+
+    """
+    del request
+    return JSONResponse(
+        status_code=410,
+        content={"detail": {"code": exc.code, "message": str(exc)}},
+    )
+
+
 @app.exception_handler(ValidationError)
 async def validation_handler(request: Request, exc: ValidationError) -> JSONResponse:
     """Translate a ``ValidationError`` into HTTP 422 (Unprocessable Content).
@@ -508,7 +538,8 @@ async def request_validation_handler(
     route it is an enrollment token, so the answer there names only each error's
     type, location and message. An unexpected body key is also the rejected input,
     so its location names the field as ``extra``. The route is the matched one, not
-    the URL, which a path prefix changes.
+    the URL, which a path prefix changes. An input that JSON cannot carry back, such
+    as the ``Infinity`` Python's encoder writes, is dropped the same way on any route.
 
     Args:
       request: FastAPI Request object.
@@ -523,7 +554,10 @@ async def request_validation_handler(
         isinstance(route, APIRoute)
         and (route.path.startswith(VARIABLES_PATH) or route.path == JOIN_PATH)
     ):
-        return await request_validation_exception_handler(request, exc)
+        # Rendering refuses a non-finite number with ValueError, which would make
+        # the refusal of a bad body a 500.
+        with suppress(ValueError):
+            return await request_validation_exception_handler(request, exc)
     errors = from_plain(exc.errors(), list[dict[str, object]])
     return JSONResponse(
         status_code=422,
@@ -617,6 +651,33 @@ async def check_violation_handler(
     return JSONResponse(
         status_code=409,
         content={"detail": "check constraint violated"},
+    )
+
+
+@app.exception_handler(asyncpg.DataError)
+async def data_error_handler(request: Request, exc: asyncpg.DataError) -> JSONResponse:
+    """Translate a value the database cannot store into HTTP 422.
+
+    SQLSTATE class 22 is the data itself: a NUL byte in text, a number out of
+    range, a malformed timestamp. A resend fails the same way, so as a 500 it read
+    as an outage, and an uploader retried it forever. The message can quote the
+    value, which may be a secret, so only the SQLSTATE is returned.
+
+    Args:
+      request: FastAPI Request object (unused).
+      exc: The DataError from asyncpg, read only for its SQLSTATE.
+
+    Returns:
+      response: JSON response with 422 status, a generic detail and a code.
+
+    """
+    del request
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": f"the database cannot store a value (SQLSTATE {exc.sqlstate})",
+            "code": "unstorable_value",
+        },
     )
 
 

@@ -50,10 +50,11 @@ import json
 import statistics
 import time
 
+from treekle import PlainTree, ReadError, from_plain, json_loads
+
 import httpx2
 
 from trackinizer.lib import zstd_compat
-from trackinizer.lib.codec import PlainTree, ReadError, from_plain, loads
 from trackinizer.trax.profile import load_profile
 from trackinizer.web.scripts.mirror_local import source_token
 
@@ -131,7 +132,12 @@ def main() -> int:
         headers=_headers(url, profile),
         timeout=30.0,
     ) as http:
-        version = from_plain(_read(http, "/api/version"), dict[str, object])
+        version = from_plain(
+            json_loads(
+                http.get("/api/version", params=()).raise_for_status().content.decode(),
+            ),
+            dict[str, object],
+        )
         rows = measure(http, repeats=flags.repeats, queries=queries, hub=flags.hub)
         stream = sample_stream(http, seconds=flags.stream_sec)
     sha = from_plain(version.get("sha"), str)
@@ -143,7 +149,7 @@ def main() -> int:
     if flags.baseline:
         changes = moved(
             rows,
-            from_plain(loads(flags.baseline.read_text()), dict[str, object]),
+            json_loads(flags.baseline.read_text(), dict[str, object]),
         )
         print(f"\nmoved more than 2x from {flags.baseline}: {len(changes) or 'none'}")
         for name, what, before, after in changes:
@@ -172,13 +178,24 @@ def measure(
 
     """
     kinds = from_plain(
-        from_plain(_read(http, "/api/meta/enums"), dict[str, object]).get(
+        from_plain(
+            json_loads(
+                http.get("/api/meta/enums", params=())
+                .raise_for_status()
+                .content.decode(),
+            ),
+            dict[str, object],
+        ).get(
             "inquiry_kind_all",
         ),
         list[str],
     )
     issues = from_plain(
-        _read(http, "/api/inquiries", (("kind", "Issue"), ("limit", 50))),
+        json_loads(
+            http.get("/api/inquiries", params=(("kind", "Issue"), ("limit", 50)))
+            .raise_for_status()
+            .content.decode(),
+        ),
         list[dict[str, object]],
     )
     return [
@@ -219,10 +236,7 @@ def sample_stream(http: httpx2.Client, *, seconds: float) -> Stream:
                 return Stream(seconds=0.0, frames=0, distinct_ids=0, status=status)
             for line in response.iter_lines():
                 if line.startswith("data:"):
-                    frame = from_plain(
-                        loads(line.removeprefix("data:")),
-                        dict[str, object],
-                    )
+                    frame = json_loads(line.removeprefix("data:"), dict[str, object])
                     ids.append(from_plain(frame.get("id"), str))
                 if time.perf_counter() - start >= seconds:
                     break
@@ -404,7 +418,12 @@ def _list_rows(
     kinds: Sequence[str],
     repeats: int,
 ) -> list[Row]:
-    profile = from_plain(_read(http, "/api/me/profile"), dict[str, object])
+    profile = from_plain(
+        json_loads(
+            http.get("/api/me/profile", params=()).raise_for_status().content.decode(),
+        ),
+        dict[str, object],
+    )
     mine = json.dumps(
         {
             "field": "account",
@@ -456,7 +475,14 @@ def _detail_rows(
         )
     hub_id = _hub_id(http, issues=issues, hub=hub)
     if hub_id:
-        view = from_plain(_read(http, f"/api/web/get/{hub_id}"), dict[str, object])
+        view = from_plain(
+            json_loads(
+                http.get(f"/api/web/get/{hub_id}", params=())
+                .raise_for_status()
+                .content.decode(),
+            ),
+            dict[str, object],
+        )
         head = from_plain(view.get("self"), dict[str, object])
         relations = sum(
             len(from_plain(peers, list[object]))
@@ -485,7 +511,11 @@ def _hub_id(
     if hub:
         kind, _, seq = hub.partition("#")
         found = from_plain(
-            _read(http, f"/api/inquiries/{kind}/{seq}"),
+            json_loads(
+                http.get(f"/api/inquiries/{kind}/{seq}", params=())
+                .raise_for_status()
+                .content.decode(),
+            ),
             dict[str, object],
         )
         return from_plain(found.get("id"), str)
@@ -513,7 +543,11 @@ def _activity_rows(http: httpx2.Client, *, repeats: int) -> list[Row]:
         for tab in tabs
     ]
     newest = from_plain(
-        _read(http, "/api/change_log", (("kind", "status"), ("limit", 1))),
+        json_loads(
+            http.get("/api/change_log", params=(("kind", "status"), ("limit", 1)))
+            .raise_for_status()
+            .content.decode(),
+        ),
         list[dict[str, object]],
     )
     since = from_plain(newest[0].get("created"), str) if newest else "1970-01-01"
@@ -647,7 +681,7 @@ def _get(http: httpx2.Client, path: str, params: Params = ()) -> Sample:
 def _message(body: bytes) -> str:
     """Return an error body's `detail`, else its JSON, else the start of its text."""
     try:
-        value = loads(body)
+        value = json_loads(body)
     except ValueError:
         return body[:200].decode(errors="replace")
     try:
@@ -693,13 +727,6 @@ def _decoded(raw: bytes, content_encoding: str) -> bytes:
             )
         raw = decoder(raw)
     return raw
-
-
-def _read(http: httpx2.Client, path: str, params: Params = ()) -> PlainTree:
-    """GET untimed, for what the measurements need to know first."""
-    return loads(
-        http.get(path, params=params).raise_for_status().content.decode(),
-    )
 
 
 def _summary(row: Row) -> dict[str, PlainTree]:

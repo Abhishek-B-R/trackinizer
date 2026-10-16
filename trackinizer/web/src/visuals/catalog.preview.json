@@ -12,18 +12,6 @@
       "record_kinds": []
     },
     {
-      "type": "trax.chat",
-      "version": 1,
-      "title": "Chat",
-      "description": "Talk with the assistant or a trax run session.",
-      "requires": [
-        "session"
-      ],
-      "default_size": "compact",
-      "parameter_schema": {},
-      "record_kinds": null
-    },
-    {
       "type": "trax.subgraph",
       "version": 1,
       "title": "Context graph",
@@ -60,6 +48,30 @@
       "default_size": "wide",
       "parameter_schema": {},
       "record_kinds": ["Artifact"]
+    },
+    {
+      "type": "trax.summary",
+      "version": 1,
+      "title": "Campaign summary",
+      "description": "What a campaign did, for readers who may not read its transcripts: its sessions, steps, phases and beliefs.",
+      "requires": ["record"],
+      "default_size": "wide",
+      "parameter_schema": {},
+      "record_kinds": ["Issue", "AgentSession"]
+    },
+    {
+      "type": "trax.files",
+      "version": 1,
+      "title": "Files",
+      "description": "A record's files and what changed in them, each change with its diff.",
+      "requires": ["record"],
+      "default_size": "wide",
+      "parameter_schema": {
+        "path": {"type": "string", "default": "", "minimum": null, "maximum": null, "max_length": 512},
+        "changed": {"type": "boolean", "default": false, "minimum": null, "maximum": null, "max_length": null},
+        "file": {"type": "string", "default": "", "minimum": null, "maximum": null, "max_length": 512}
+      },
+      "record_kinds": null
     }
   ]
 }

@@ -1,12 +1,6 @@
 .visual-canvas { position: relative; display: flex; flex: 1; min-height: 0; flex-direction: column; }
-.visual-toolbar { display: flex; align-items: center; height: 38px; min-height: 38px; padding: 0 12px 0 18px; border-bottom: 1px solid var(--line); }
-.visual-toolbar-label { color: var(--muted); font-size: 12px; }
-.visual-toolbar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
-.visual-toolbar-actions .btn:disabled { opacity: .5; }
 .visual-write-error { padding: 7px 16px; border-bottom: 1px solid var(--line); color: var(--error-text); font-size: 12px; }
-.visual-configure { position: absolute; z-index: 35; top: 42px; right: 12px; width: min(350px, calc(100vw - 24px)); max-height: calc(100vh - 54px); overflow: auto; padding: 14px; background: var(--surface-overlay); border: 1px solid var(--line-strong); border-radius: var(--panel-radius); box-shadow: 0 16px 48px #0009; }
-.visual-configure-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
-.visual-configure-head h2 { font-size: 13px; font-weight: 600; }
+.workbench-controls { display: flex; flex-direction: column; }
 .visual-option { display: flex; align-items: flex-start; gap: 10px; padding: 10px 6px; border-top: 1px solid var(--line); cursor: pointer; }
 .visual-option input { margin-top: 3px; accent-color: var(--accent); }
 .visual-option span { display: flex; flex-direction: column; gap: 2px; }
@@ -15,23 +9,10 @@
 .visual-artifact-select { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px; }
 .visual-artifact-select input { flex: 1; min-width: 0; padding: 7px 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface-raised); color: var(--text); font: inherit; text-align: center; }
 .visual-artifact-select p { flex-basis: 100%; }
-.visual-presets { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
-.visual-presets h3 { margin-bottom: 9px; font-size: 13px; font-weight: 600; }
-.visual-presets form, .visual-presets form label { display: flex; flex-direction: column; gap: 6px; }
-.visual-presets form { gap: 9px; }
-.visual-presets form label { color: var(--muted); font-size: 12px; }
-.visual-presets form label span { color: var(--muted); }
-.visual-presets input, .visual-presets textarea { width: 100%; padding: 7px 8px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface-raised); color: var(--text); font: inherit; }
-.visual-presets textarea { resize: vertical; }
-.visual-presets form .btn { align-self: flex-start; }
-.visual-presets ul { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; padding: 0; list-style: none; }
-.visual-presets li { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.visual-presets li small { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
-.visual-presets [role="alert"], .visual-preset-status { margin-top: 8px; color: var(--error-text); font-size: 12px; }
-.visual-presets .visual-preset-status { color: var(--accent-hover); }
 .visual-stage { display: flex; flex: 1; min-height: 0; position: relative; overflow: auto; }
 .visual-tile { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
 .visual-tile-browse { overflow: hidden; }
+.visual-browse-content { display: contents; }
 .visual-tile-floating { position: absolute; right: 16px; width: min(390px, calc(100% - 32px)); height: min(480px, calc(100% - 100px)); min-width: min(280px, calc(100vw - 32px)); min-height: min(220px, calc(100vh - 80px)); max-width: calc(100vw - 32px); max-height: calc(100vh - 80px); border: 1px solid var(--line-strong); border-radius: var(--panel-radius); box-shadow: 0 16px 48px #0008; overflow: hidden; }
 .visual-tile-focused { outline: 1px solid var(--accent); outline-offset: -1px; }
 .visual-tile-toolbar { display: flex; align-items: center; gap: 6px; min-height: 32px; padding: 2px 8px; border-bottom: 1px solid var(--line); font-size: 11px; color: var(--muted); }
@@ -44,20 +25,21 @@
 .visual-loading, .visual-unsupported { padding: 20px; color: var(--muted); }
 .chat-panel .chat-record-context { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 8px 12px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); font-size: 12px; }
 .chat-record-context a { color: var(--accent-hover); overflow-wrap: anywhere; }
-.chat-record-context .btn { margin-left: auto; }
 .chat-panel { display: flex; flex: 1; flex-direction: column; min-height: 0; min-width: 0; }
 .chat-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
 .chat-partner { display: flex; align-items: baseline; gap: 8px; min-width: 0; margin-right: auto; }
 .chat-partner strong { font-size: 14px; font-weight: 600; }
 .chat-partner-note { color: var(--muted); font-size: 12px; }
+/* A chat its starter hid, or one made staff only. */
+.chat-badge { padding: 0 6px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--muted); font-size: 11px; line-height: 18px; }
 .chat-head-actions { display: flex; align-items: center; gap: 4px; }
 .chat-head-actions .btn:disabled { opacity: .5; }
-.chat-menu { display: flex; flex-direction: column; max-height: 260px; overflow: auto; margin: 8px 12px 0; padding: 4px; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface-raised); }
-.chat-menu-option { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; width: 100%; padding: 8px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text); text-align: left; }
-.chat-menu-option:hover, .chat-menu-option:focus-visible { background: var(--surface-overlay); }
-.chat-menu-option[aria-current="true"] { box-shadow: inset 2px 0 0 var(--accent); }
-.chat-menu-option:disabled { opacity: .5; }
-.chat-menu-option span { color: var(--muted); font-size: 12px; }
+/* A header pop-over opens away from the screen's edge Chat stands at: leftwards from Chat at the
+   right, rightwards, over the workbench, from Chat at the left, where leftwards would run off the page. */
+.chat-head-pop .station-menu { left: auto; right: 0; }
+.chat-row-left .chat-head-pop .station-menu { left: 0; right: auto; }
+.chat-share-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 0 0 0 8px; font-size: 12px; overflow-wrap: anywhere; }
+.chat-head-pop .chat-note { margin: 0; }
 .chat-error { margin: 8px 12px 0; color: var(--error-text); font-size: 12px; }
 .chat-note { color: var(--muted); font-size: 12px; }
 .chat-off { display: flex; flex-direction: column; gap: 6px; }
@@ -70,9 +52,13 @@
 .chat-line-assistant { align-self: flex-start; background: var(--surface-raised); }
 .chat-line-pending { opacity: .7; }
 .chat-line-other { align-self: flex-start; }
+.chat-line-relay { align-self: stretch; max-width: none; padding: 0 2px; border: 0; background: transparent; color: var(--muted); font-size: 12px; }
 .chat-line-author { display: block; margin-bottom: 3px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .chat-notice { margin: 0; padding: 6px 12px 0; color: var(--muted); font-size: 11px; }
 .chat-line-body { margin: 0; }
+/* A recap's "keep going": shown at once, not on hover, since it is the message's call to action. */
+.chat-line-followup { display: inline-flex; margin-top: 8px; padding: 3px 10px; border: 1px solid var(--accent); border-radius: 7px; color: var(--accent-hover); background: transparent; font-size: 12px; }
+.chat-line-followup:hover { background: var(--accent-soft); }
 /* Seen on hover or focus, and always where there is no hover to find it by. */
 .chat-line-fork { display: block; margin-top: 4px; padding: 0; font-size: 11px; opacity: 0; }
 .chat-line:hover .chat-line-fork, .chat-line:focus-within .chat-line-fork { opacity: 1; }
@@ -80,12 +66,16 @@
 .chat-fork-banner { margin: 0; padding: 6px 12px 0; color: var(--muted); font-size: 12px; }
 .chat-line p.chat-line-body { white-space: pre-wrap; }
 .chat-status { align-self: flex-start; color: var(--muted); font-size: 12px; font-style: italic; }
+/* The reply the assistant is writing ends in a caret after its last word. It needs no rule
+   of its own for prefers-reduced-motion: styles.css stops every animation there, so it stands still. */
+.chat-line-partial .chat-line-body > :last-child::after { content: ""; display: inline-block; width: 2px; height: 1.1em; margin-left: 2px; vertical-align: text-bottom; background: currentColor; animation: chat-caret 1s steps(2) infinite; }
+@keyframes chat-caret { 50% { opacity: 0; } }
 .chat-panel .composer { padding: 8px 12px 12px; border-top: 1px solid var(--line); }
-/* The page and the other main visuals share a strip: each has 240 px at least, and a strip with more than fit scrolls inside itself. Visuals docked at a side stand in one column there, left or right of it, up to 360 px or 30% wide, so Chat's header and box stay on the screen however many visuals there are. */
+/* The page and the other main visuals share a strip: each has 240 px at least, and a strip with more than fit scrolls inside itself. Visuals docked at a side stand in one column there, left or right of it, up to 360 px or 30% wide. */
 .visual-main-strip { display: flex; flex: 1 1 0; min-width: 0; min-height: 0; overflow-x: auto; }
 .visual-main-strip > .visual-tile { flex: var(--tile-share, 1) 0 var(--tile-basis, 240px); min-width: 240px; }
 /* The page's lists need 300 px for their own toolbar. */
-.visual-main-strip > .visual-tile-browse { flex-basis: var(--tile-basis, 300px); min-width: 300px; }
+.visual-main-strip > .visual-browse-slot { flex-basis: var(--tile-basis, 300px); min-width: 300px; }
 .visual-main-strip > .visual-tile + .visual-tile, .visual-main-strip > .visual-divider + .visual-tile { border-left: 1px solid var(--line); }
 .visual-side-column { display: flex; flex: 0 1 var(--column-width, min(360px, 30%)); flex-direction: column; min-width: 260px; max-width: 70%; min-height: 0; border-left: 1px solid var(--line); overflow-y: auto; }
 .visual-side-column > .visual-tile { flex: var(--tile-share, 1) 1 0; min-height: 280px; }
@@ -101,13 +91,13 @@
   .visual-side-column > .visual-tile { flex: 0 0 min(400px, 48vh); min-height: 0; }
   .visual-main-strip > .visual-tile + .visual-tile, .visual-main-strip > .visual-divider + .visual-tile { border-left: 0; border-top: 1px solid var(--line); }
 }
-@media (max-width: 900px) { .visual-tile-floating { position: relative; top: auto !important; right: auto; width: 100%; height: 34px; border-radius: 0; box-shadow: none; flex: 0 0 auto; } .visual-tile-floating.visual-tile-mobile-expanded { height: min(400px, 48vh); } .visual-mobile-tab-toggle { display: inline-block; } }
+@media (max-width: 900px) { .visual-tile-floating { position: relative; top: auto !important; right: auto; left: auto !important; width: 100% !important; min-width: 0; max-width: 100%; height: 34px !important; min-height: 0; border-radius: 0; box-shadow: none; flex: 0 0 auto; } .visual-tile-floating.visual-tile-mobile-expanded { height: min(400px, 48vh) !important; } .visual-mobile-tab-toggle { display: inline-block; } }
 /* A tile's whole top bar drags it (a press without movement focuses it); the controls on the bar keep their own cursors. */
 .visual-tile-toolbar-draggable { cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; }
 .visual-tile-toolbar-draggable:active { cursor: grabbing; }
 .visual-tile-toolbar-draggable button, .visual-tile-toolbar-draggable select { cursor: pointer; }
 .visual-tile-toolbar .visual-tile-fold { min-width: 22px; line-height: 1; }
-/* A folded tile is its top bar alone; its contents stay mounted, so Chat keeps its conversation and its stream. */
+/* A folded tile is its top bar alone; its contents stay mounted, so a visual keeps its state. */
 @media (min-width: 901px) {
   .visual-tile-floating.visual-tile-collapsed { height: auto !important; min-height: 0; }
   .visual-tile-collapsed > :not(.visual-tile-toolbar) { display: none; }
@@ -117,11 +107,10 @@
   .visual-tile-toolbar .visual-tile-fold { display: none; }
   .visual-tile-toolbar-draggable { cursor: auto; touch-action: auto; user-select: auto; -webkit-user-select: auto; }
   .visual-column-edge, .visual-divider, .visual-window-edge { display: none; }
-  /* Chat standing aside is a header in its strip's flow, as tall as a floating tile there and not as its strip's tiles. */
+  /* A floating tile is a header in its strip's flow. */
   .visual-main-strip > .visual-tile-floating, .visual-side-column > .visual-tile-floating { flex: 0 0 auto; }
 }
-/* Chat standing aside floats from inside its strip, over the stage. Folded, its bar is filled, so it is found at a glance (a phone's header is folded until Expand opens it); a column that holds nothing else in the flow takes no room. */
-.visual-tile-aside.visual-tile-collapsed:not(.visual-tile-mobile-expanded) > .visual-tile-toolbar { background: var(--accent); color: #fff; }
+/* A column that holds nothing in the flow takes no room. */
 @media (min-width: 901px) {
   .visual-side-column-vacant { flex: 0 0 0; min-width: 0; border: 0; overflow: visible; }
 }
@@ -150,3 +139,23 @@
 .visual-window-edge-w, .visual-window-edge-nw, .visual-window-edge-sw { left: 0; }
 .visual-window-edge-ne, .visual-window-edge-sw { cursor: nesw-resize; }
 .visual-window-edge-nw, .visual-window-edge-se { cursor: nwse-resize; }
+/* The canvas's top bar, a browser's: Back, Forward and Home, then the canvas tabs, then +. Its height is whole
+   pixels: a fractional one leaves the stage off the pixel grid, and docked Browse, sized by its slot's whole-pixel
+   clientWidth and clientHeight, would miss its slot by half a pixel (src/visuals/Canvas.tsx, projectBrowse). */
+.canvas-bar { display: flex; flex: 0 0 auto; align-items: flex-end; gap: 2px; height: 38px; padding: 6px 8px 0; border-bottom: 1px solid var(--line); background: var(--surface); font-size: 13px; }
+.canvas-bar-button { display: inline-flex; flex: none; align-items: center; justify-content: center; width: 28px; height: 28px; margin-bottom: 3px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
+.canvas-bar-button:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }
+.canvas-bar-button:disabled { opacity: .4; cursor: default; }
+/* The strip's width is fractional and its scroll whole pixels: the end padding keeps the last tab whole when scrolled to the end. */
+.canvas-tabs { display: flex; flex: 0 1 auto; gap: 2px; min-width: 0; margin-left: 6px; padding-inline-end: 2px; overflow-x: auto; scrollbar-width: none; }
+.canvas-tab { display: inline-flex; flex: 0 1 auto; align-items: center; min-width: 6em; max-width: 14em; border: 1px solid transparent; border-bottom: 0; border-radius: 7px 7px 0 0; color: var(--muted); }
+.canvas-tab:hover { background: var(--surface-hover); color: var(--text); }
+.canvas-tab[aria-current="true"] { border-color: var(--line); background: var(--bg); color: var(--text); font-weight: 600; }
+.canvas-tab-open { flex: 1; min-width: 0; padding: 6px 4px 6px 10px; border: 0; background: transparent; color: inherit; font: inherit; line-height: 18px; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.canvas-tab-close { display: inline-flex; margin-right: 4px; padding: 2px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; opacity: 0; }
+.canvas-tab:hover .canvas-tab-close, .canvas-tab[aria-current="true"] .canvas-tab-close, .canvas-tab-close:focus-visible { opacity: 1; }
+.canvas-tab-close:hover { background: var(--surface-overlay); color: var(--text); }
+@media (hover: none) { .canvas-tab-close { opacity: 1; } }
+input.canvas-tab-name { flex: 0 0 14em; padding: 6px 10px; border-color: var(--accent); background: var(--bg); color: var(--text); font: inherit; line-height: 18px; outline: 0; }
+/* A canvas with nothing on it, as an empty Home leaves it. */
+.visual-empty { margin: auto; padding: 24px; color: var(--muted); font-size: 13px; text-align: center; }

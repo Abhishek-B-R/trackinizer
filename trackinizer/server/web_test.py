@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
@@ -32,16 +32,18 @@ else:
 
     asyncpg = lazy_import("asyncpg")
 
+from treekle import from_plain, json_loads
+
 import pytest
 import pytest_asyncio
 
 from trackinizer.conftest import FakeEngine, make_conn, make_store, new_uuid
-from trackinizer.lib.codec import from_plain, loads
 from trackinizer.lib.postgres import Conn
 from trackinizer.lib.postgres.testing import reset_schema
 from trackinizer.server import web
 from trackinizer.server.api import auth_routes
 from trackinizer.server.api.query import get_inquiry_route
+from trackinizer.server.audience import SessionReader
 from trackinizer.server.auth import AuthIdentity, current_user
 from trackinizer.server.config import Config
 from trackinizer.server.embedders.stub import StubEmbedder
@@ -50,7 +52,11 @@ from trackinizer.server.route_iter import (
     registered_paths,
 )
 from trackinizer.server.store.core import Store
-from trackinizer.server.store.session_feed import WHOLE_FEED, FeedScope
+from trackinizer.server.store.session_feed import (
+    WHOLE_FEED,
+    FeedScope,
+    StationAgents,
+)
 from trackinizer.types.columns import column_specs, storage_name
 from trackinizer.types.inquiries import INQUIRY_CLASSES, KIND_TO_CLASS, Inquiry
 from trackinizer.wire.bodies import (
@@ -84,6 +90,13 @@ _TEST_IDENTITY = AuthIdentity(
     api_key_id=uuid.UUID("33333333-3333-3333-3333-333333333333"),
     email="webtest@example.com",
     role="viewer",
+)
+# How the transcript test reads ``_TEST_IDENTITY``'s listings on a server with no
+# configuration, where each person is an organisation of one.
+_TEST_READER = SessionReader(
+    audiences=frozenset({"open", "private"}),
+    email="webtest@example.com",
+    hidden=False,
 )
 
 # The relations ``GET /api/inquiries/{id}`` projects onto the row. The web detail
@@ -374,6 +387,13 @@ class TestSerialization:
         # JSONB is decoded to a dict by the codec; surfaced verbatim, not
         # ISO-formatted or stringified.
         assert out["config"] == cfg
+
+    def test_row_to_dict_surfaces_any_rows_app(self) -> None:
+        app = {"tracker": {"budget_usd": 20}}
+        out = web._row_to_dict(
+            cast("asyncpg.Record", _inquiry_row(kind="Issue", app=app)),
+        )
+        assert out["app"] == app
 
     def test_row_to_dict_surfaces_agentsession_fields(self) -> None:
         started = datetime(2026, 5, 18, 9, tzinfo=UTC)
@@ -867,6 +887,37 @@ class TestRoutes:
             f': open\n\ndata: {{"id": "{subject_id}"}}\n\n'.encode()
         )
 
+    @pytest.mark.asyncio
+    async def test_subscribe_holds_back_a_hidden_transcripts_ping_from_a_viewer(
+        self,
+    ) -> None:
+        engine = FakeEngine()
+        # The database says the viewer reads the session, once they hold its audience.
+        engine.conn.fetchval = AsyncMock(return_value=True)
+        hidden, shown = new_uuid(), new_uuid()
+        engine.listen_messages = [
+            json.dumps({"id": str(hidden), "audience": "staff"}),
+            json.dumps({"id": str(shown)}),
+        ]
+        request = _request(object(), engine)
+
+        async def relayed(audiences: frozenset[str]) -> list[str | bytes | memoryview]:
+            response = await web.web_subscribe(
+                cast(Request, request),
+                identity=replace(_TEST_IDENTITY, read_audiences=audiences),
+            )
+            return [chunk async for chunk in response.body_iterator]
+
+        def frame(subject: uuid.UUID) -> bytes:
+            return f'data: {{"id": "{subject}"}}\n\n'.encode()
+
+        assert await relayed(frozenset({"open"})) == [b": open\n\n", frame(shown)]
+        assert await relayed(frozenset({"open", "staff"})) == [
+            b": open\n\n",
+            frame(hidden),
+            frame(shown),
+        ]
+
     def test_without_the_app_the_old_paths_serve_nothing(self, tmp_path: Path) -> None:
         # The old pages are gone. Without ``--app-dir`` there is no ``/app/`` to
         # send their paths to, so each answers 404, even where an old build's
@@ -1029,6 +1080,48 @@ class TestFeedRoute:
 class TestFeedReads:
     """The feed, its facets and its histogram take one set of repeatable filters."""
 
+    def test_backward_feed_cursor_reaches_the_store_whole(self) -> None:
+        store = AsyncMock()
+        store.read_feed = AsyncMock(return_value=[])
+        client = self._client(store)
+        session = new_uuid()
+        created = datetime(2026, 6, 1, tzinfo=UTC)
+        response = client.get(
+            "/api/web/feed",
+            params={
+                "tail": "true",
+                "before_created": created.isoformat(),
+                "before_session": str(session),
+                "before_part": 1,
+                "before_seq": 7,
+            },
+        )
+        assert response.status_code == 200
+        assert store.read_feed.call_args.kwargs.get("before") == (
+            created,
+            session,
+            1,
+            7,
+        )
+
+    def test_backward_feed_cursor_requires_every_component(self) -> None:
+        store = AsyncMock()
+        client = self._client(store)
+        cursor = {
+            "before_created": "2026-06-01T00:00:00Z",
+            "before_session": str(new_uuid()),
+            "before_part": "0",
+            "before_seq": "7",
+        }
+        for missing in cursor:
+            response = client.get(
+                "/api/web/feed",
+                params={key: value for key, value in cursor.items() if key != missing},
+            )
+            assert response.status_code == 400, missing
+            assert "before_" in response.text
+        store.read_feed.assert_not_called()
+
     @classmethod
     def _client(cls, store: AsyncMock) -> TestClient:
         app = FastAPI()
@@ -1060,12 +1153,111 @@ class TestFeedReads:
             rooms=("lab",),
             clis=("codex",),
             kinds=("ToolCall", "UserMessage"),
+            reader=_TEST_READER,
         )
         assert scope_of(("room", "lab"), ("actor", "eng")) == FeedScope(
             actors=("eng",),
             rooms=("lab",),
+            reader=_TEST_READER,
         )
-        assert scope_of() == WHOLE_FEED
+        assert scope_of() == replace(WHOLE_FEED, reader=_TEST_READER)
+
+    def test_each_read_is_scoped_to_the_reader_its_caller_is(self) -> None:
+        store = self._histogram_store()
+        store.read_feed = AsyncMock(return_value=[])
+        store.read_feed_facets = AsyncMock(
+            return_value=FeedFacetsResponse(actors=[], rooms=[], kinds=[]),
+        )
+        reads = {
+            "/api/web/feed": store.read_feed,
+            "/api/web/feed/facets": store.read_feed_facets,
+            "/api/web/feed/histogram": store.read_feed_histogram,
+        }
+        app = FastAPI()
+        app.state.engine = FakeEngine()
+        app.state.store = store
+        web.attach(app)
+        client = TestClient(app)
+
+        for audiences in (
+            frozenset({"open", "private"}),
+            frozenset({"open", "private", "staff"}),
+        ):
+            caller = replace(_TEST_IDENTITY, read_audiences=audiences)
+
+            async def identity(caller: AuthIdentity = caller) -> AuthIdentity:
+                return caller
+
+            app.dependency_overrides[current_user] = identity
+            for path, read in reads.items():
+                assert client.get(path).status_code == 200, path
+                scope = cast(FeedScope, read.call_args.kwargs["scope"])
+                assert scope.reader == SessionReader(
+                    audiences=audiences,
+                    email=_TEST_IDENTITY.email,
+                    oversight="staff" in audiences,
+                    hidden=False,
+                ), path
+
+    def test_feed_whose_mine_keeps_the_callers_sessions(self) -> None:
+        """Every read narrows to the caller's own account, whatever else is named."""
+        scopes = self._scopes({"whose": "mine", "cli": "codex"})
+
+        assert (
+            scopes
+            == [
+                FeedScope(
+                    clis=("codex",),
+                    account=_TEST_IDENTITY.email,
+                    reader=_TEST_READER,
+                ),
+            ]
+            * 3
+        )
+
+    def test_feed_whose_campaigns_keeps_sessions_of_briefs_labelled_with_the_asker(
+        self,
+    ) -> None:
+        scopes = self._scopes({"whose": "campaigns"})
+
+        assert (
+            scopes == [FeedScope(asker=_TEST_IDENTITY.email, reader=_TEST_READER)] * 3
+        )
+
+    def test_feed_whose_everyone_is_the_default(self) -> None:
+        """Everyone is every session the caller reads; ``hidden`` keeps private ones."""
+        named = self._scopes({"whose": "everyone"})
+        hidden = self._scopes({"hidden": "true"})
+
+        assert named == self._scopes({}) == [FeedScope(reader=_TEST_READER)] * 3
+        assert hidden == [FeedScope(reader=replace(_TEST_READER, hidden=True))] * 3
+        assert (
+            self._client(AsyncMock())
+            .get(
+                "/api/web/feed",
+                params={"whose": "theirs"},
+            )
+            .status_code
+            == 422
+        )
+
+    def _scopes(self, params: dict[str, str]) -> list[FeedScope]:
+        """Return the scope each of the feed, its facets and histogram was read with."""
+        store = self._histogram_store()
+        store.read_feed = AsyncMock(return_value=[])
+        store.read_feed_facets = AsyncMock(
+            return_value=FeedFacetsResponse(actors=[], rooms=[], kinds=[]),
+        )
+        client = self._client(store)
+        scopes: list[FeedScope] = []
+        for path, read in (
+            ("/api/web/feed", store.read_feed),
+            ("/api/web/feed/facets", store.read_feed_facets),
+            ("/api/web/feed/histogram", store.read_feed_histogram),
+        ):
+            assert client.get(path, params=params).status_code == 200, path
+            scopes.append(cast(FeedScope, read.call_args.kwargs["scope"]))
+        return scopes
 
     def test_the_feed_keeps_only_conversation_when_asked(self) -> None:
         store = AsyncMock()
@@ -1076,6 +1268,33 @@ class TestFeedReads:
             response = client.get("/api/web/feed", params=params)
             assert response.status_code == 200, response.text
             assert store.read_feed.call_args.kwargs["conversation"] is conversation
+
+    def test_a_station_filters_all_three_reads_to_its_callers_agents(self) -> None:
+        store = self._histogram_store()
+        store.read_feed = AsyncMock(return_value=[])
+        store.read_feed_facets = AsyncMock(
+            return_value=FeedFacetsResponse(actors=[], rooms=[], kinds=[]),
+        )
+        client = self._client(store)
+        station = uuid.uuid4()
+        wanted = FeedScope(
+            station=StationAgents(workspace_id=station, user_id=_TEST_IDENTITY.user_id),
+            kinds=("ToolCall",),
+            reader=_TEST_READER,
+        )
+
+        for path, read in (
+            ("/api/web/feed", store.read_feed),
+            ("/api/web/feed/facets", store.read_feed_facets),
+            ("/api/web/feed/histogram", store.read_feed_histogram),
+        ):
+            response = client.get(
+                path,
+                params={"station": str(station), "kind": "ToolCall"},
+            )
+            assert response.status_code == 200, response.text
+            assert read.call_args.kwargs["scope"] == wanted
+        assert client.get("/api/web/feed", params={"station": "x"}).status_code == 422
 
     def test_facets_count_a_window_under_the_filters(self) -> None:
         store = AsyncMock()
@@ -1095,7 +1314,7 @@ class TestFeedReads:
         assert store.read_feed_facets.call_args.kwargs == {
             "since": datetime(2026, 10, 1, tzinfo=UTC),
             "until": datetime(2026, 10, 2, tzinfo=UTC),
-            "scope": FeedScope(clis=("codex",)),
+            "scope": FeedScope(clis=("codex",), reader=_TEST_READER),
         }
         backwards = (("since", window[1][1]), ("until", window[0][1]))
         assert client.get("/api/web/feed/facets", params=backwards).status_code == 400
@@ -1115,7 +1334,7 @@ class TestFeedReads:
             "since": None,
             "until": None,
             "buckets": 120,
-            "scope": FeedScope(kinds=("ToolCall",)),
+            "scope": FeedScope(kinds=("ToolCall",), reader=_TEST_READER),
         }
         for buckets, status in ((1, 400), (2, 200), (1_000, 200), (1_001, 400)):
             response = client.get(
@@ -1827,6 +2046,7 @@ async def test_self_is_the_inquiry_route_on_a_real_engine(pglite_store: Store) -
                 title="filled",
                 outcome="ok",
                 config={"lr": 0.1, "nested": {"warmup": 100}},
+                app={"tracker": {"verdict": "works"}},
             ),
             SubmitPaper(
                 account=account,
@@ -1843,6 +2063,7 @@ async def test_self_is_the_inquiry_route_on_a_real_engine(pglite_store: Store) -
                 rooms=["lab"],
             ),
         ],
+        session_audience="open",
     )
     request = cast(Request, _request(pglite_store, pglite_store.engine))
     for target_id in ids:
@@ -1855,6 +2076,10 @@ async def test_self_is_the_inquiry_route_on_a_real_engine(pglite_store: Store) -
         assert detail["self"] == {
             key: value for key, value in canonical.items() if key not in _EDGE_RELATIONS
         }
+    filled = await web.web_get(ids[10], request, identity=_TEST_IDENTITY)
+    assert from_plain(filled["self"], dict[str, object])["app"] == {
+        "tracker": {"verdict": "works"},
+    }
 
 
 @pytest.mark.db_pglite
@@ -2192,7 +2417,7 @@ class TestSubscribeProbe:
         if status != 200:
             return status, headers, []
         frames = [
-            from_plain(loads(frame.removeprefix(b"data: ")), dict[str, object])
+            json_loads(frame.removeprefix(b"data: "), dict[str, object])
             for frame in body.split(b"\n\n")[:-1]
         ]
         return status, headers, frames
@@ -2285,6 +2510,6 @@ class _StartTags(HTMLParser):
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

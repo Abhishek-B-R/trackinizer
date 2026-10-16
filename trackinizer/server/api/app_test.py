@@ -13,18 +13,19 @@ import time
 
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+from treekle import from_plain, json_loads
 
 import asyncpg
 import pytest
 
 from trackinizer.conftest import FakeEngine, make_store
-from trackinizer.lib.codec import from_plain, loads
 from trackinizer.server.api import app
 from trackinizer.server.api.app import (
     RequestLoggingMiddleware,
     _RequestLogSpan,
     check_violation_handler,
     conflict_handler,
+    data_error_handler,
     fk_violation_handler,
     lifespan,
     not_found_handler,
@@ -78,7 +79,7 @@ class TestCLIHelpers:
             assert response.status_code == 409
             # ``response.body`` is ``bytes | memoryview``; coerce to
             # ``bytes`` for json.loads's narrower type signature.
-            body = from_plain(loads(bytes(response.body)), dict[str, object])
+            body = json_loads(bytes(response.body), dict[str, object])
             assert prefix in from_plain(body["detail"], str)
 
     def test_handlers_do_not_leak_constraint_detail(self) -> None:
@@ -101,31 +102,56 @@ class TestCLIHelpers:
             asyncio.run(unique_violation_handler(req, unique_exc)),
         ]
         for response in responses:
-            body = from_plain(loads(bytes(response.body)), dict[str, object])
+            body = json_loads(bytes(response.body), dict[str, object])
             assert response.status_code == 409
             detail = from_plain(body["detail"], str)
             assert leak not in detail
             assert "from_id" not in detail
             assert constraint not in detail
 
+    def test_a_value_the_database_cannot_store_is_a_422_that_does_not_echo_it(
+        self,
+    ) -> None:
+        req = cast(Request, Mock())
+        quoted = "the-value-the-database-quoted"
+        exc = asyncpg.CharacterNotInRepertoireError(
+            f'invalid byte sequence for encoding "UTF8": 0x00 near {quoted}',
+        )
+
+        response = asyncio.run(data_error_handler(req, exc))
+
+        body = json_loads(bytes(response.body), dict[str, object])
+        assert response.status_code == 422
+        assert body == {
+            "detail": "the database cannot store a value (SQLSTATE 22021)",
+            "code": "unstorable_value",
+        }
+        assert quoted not in bytes(response.body).decode()
+
+    def test_every_value_the_database_cannot_store_reaches_the_422_handler(
+        self,
+    ) -> None:
+        assert app.app.exception_handlers[asyncpg.DataError] is data_error_handler
+        assert issubclass(asyncpg.UntranslatableCharacterError, asyncpg.DataError)
+
     def test_conflict_handler_emits_error_code(self) -> None:
         req = cast(Request, Mock())
         response = asyncio.run(conflict_handler(req, ConflictError("clash")))
-        body = from_plain(loads(bytes(response.body)), dict[str, object])
+        body = json_loads(bytes(response.body), dict[str, object])
         assert response.status_code == 409
         assert body == {"detail": "clash", "code": "conflict"}
 
     def test_not_found_handler_emits_404_and_code(self) -> None:
         req = cast(Request, Mock())
         response = asyncio.run(not_found_handler(req, NotFoundError("gone")))
-        body = from_plain(loads(bytes(response.body)), dict[str, object])
+        body = json_loads(bytes(response.body), dict[str, object])
         assert response.status_code == 404
         assert body == {"detail": "gone", "code": "not_found"}
 
     def test_validation_handler_emits_422_and_code(self) -> None:
         req = cast(Request, Mock())
         response = asyncio.run(validation_handler(req, ValidationError("bad input")))
-        body = from_plain(loads(bytes(response.body)), dict[str, object])
+        body = json_loads(bytes(response.body), dict[str, object])
         assert response.status_code == 422
         assert body == {"detail": "bad input", "code": "validation"}
 
@@ -262,6 +288,37 @@ class TestRequestLogging:
         assert from_plain(fields.get("stage"), str) == "http_request"
         assert from_plain(fields.get("error_type"), str, default="?") == ""
         assert 0.0 <= from_plain(fields.get("duration_sec"), float, default=-1) < 60.0
+
+    def test_a_span_reads_the_request_from_the_asgi_scope(self) -> None:
+        """The span names the request and leaves its id on the scope's state."""
+        request_id = uuid4()
+        scope: dict[str, object] = {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/x",
+            "headers": [(b"x-request-id", str(request_id).encode())],
+        }
+        send = AsyncMock()
+
+        span = _RequestLogSpan.from_scope(scope, send=send)
+
+        assert scope["state"] == {"request_id": str(request_id)}
+        assert (span.request_id, span.method, span.path) == (
+            str(request_id),
+            "POST",
+            "/api/x",
+        )
+        assert span.downstream is send
+        assert 0.0 < span.started <= time.perf_counter()
+
+    def test_a_span_for_a_bare_scope_has_an_empty_method_and_path(self) -> None:
+        scope: dict[str, object] = {"type": "http"}
+
+        span = _RequestLogSpan.from_scope(scope, send=AsyncMock())
+
+        assert (span.method, span.path) == ("", "")
+        assert str(UUID(span.request_id)) == span.request_id
+        assert scope["state"] == {"request_id": span.request_id}
 
 
 class TestAuthDisabledWarning:
@@ -522,6 +579,24 @@ def test_a_validation_error_outside_variables_keeps_its_input(
     assert detail[0]["input"] == "not-a-uuid"
 
 
+def test_a_validation_error_whose_input_json_cannot_carry_is_422_not_500(
+    route_client: tuple[TestClient, Store, FakeEngine],
+) -> None:
+    """``Infinity`` parses, but cannot be echoed back, so its 422 drops the input."""
+    client, _, _ = route_client
+
+    response = client.post(
+        "/api/inquiries/lookup",
+        content="[Infinity]",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    detail = from_plain(response.json(), dict[str, list[dict[str, object]]])["detail"]
+    assert detail
+    assert all(set(error) == {"type", "loc", "msg"} for error in detail)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -656,6 +731,6 @@ def _lifespan_secrets(
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

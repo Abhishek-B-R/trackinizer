@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Final
 
 import json
 
+from treekle import from_plain
+
 import pytest
 
 from trackinizer.lib.agent.sessions import claude, codex, fuse
@@ -19,7 +21,6 @@ from trackinizer.lib.agent.types.sessions import (
     TurnContext,
     UserMessage,
 )
-from trackinizer.lib.codec import from_plain
 
 
 if TYPE_CHECKING:
@@ -297,6 +298,6 @@ def _declared_id(part: Sequence[SessionRecord]) -> str:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

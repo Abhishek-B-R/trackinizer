@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import MappingProxyType
 
+from treekle import ReadError, immutable
+
 import pytest
 
 from trackinizer.lib.agent.types.sessions import (
@@ -12,7 +14,6 @@ from trackinizer.lib.agent.types.sessions import (
     UserMessage,
 )
 from trackinizer.lib.agent.types.stored import from_stored, to_stored
-from trackinizer.lib.codec import ReadError, immutable
 
 
 _MESSAGE = UserMessage(
@@ -99,6 +100,6 @@ def test_a_value_that_is_no_json_object_cannot_be_stored() -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

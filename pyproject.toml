@@ -23,6 +23,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
+    "treekle>=0.1.0",
     # database
     "asyncpg>=0.31.0",
     "py-pglite[asyncpg,extensions]>=0.5.3",
@@ -218,6 +219,7 @@ markers = [
     "gpu_triton: requires Triton kernels",
     "network_anthropic: reaches Anthropic over the network",
     "network_duckduckgo: reaches DuckDuckGo over the network",
+    "network_e2b: reaches E2B over the network",
     "network_gemini: reaches Gemini over the network",
     "network_google_search: reaches Google Search over the network",
     "network_github: reaches GitHub over the network",
@@ -229,7 +231,7 @@ markers = [
     "network_openreview: reaches OpenReview over the network",
     "network_pypi: reaches PyPI over the network",
     "network_searxng: reaches a SearXNG service over the network",
-    "network_shadeform: reaches Shadeform over the network",
+    "network_gpu_cloud: reaches a GPU cloud provider over the network",
     "network_slack: reaches Slack over the network",
     "network_together: reaches Together over the network",
     "network_wandb: reaches Weights & Biases over the network",
@@ -739,6 +741,7 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
+treekle = { git = "https://github.com/rekursiv-ai/treekle", branch = "main" }
 rekursiv-ai-typeshed = { path = "packages/rekursiv-ai-typeshed" }
 # uv-only (stripped from the built wheel). Linux -> CPU wheel for lock/CI;
 # non-linux falls through to PyPI (macOS torch has no +cpu variant).

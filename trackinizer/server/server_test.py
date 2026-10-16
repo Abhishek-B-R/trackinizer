@@ -36,7 +36,6 @@ from trackinizer.server.server import (
     logger,
     main,
 )
-from trackinizer.server.visuals.catalog import Workspace
 
 
 if TYPE_CHECKING:
@@ -235,6 +234,33 @@ class TestPureFunctions:
         flags, _ = _parse_args(argparse.ArgumentParser(), ["--assistant", "s=x@y.z"])
         assert Config.from_args(flags).assistant == Assistant(actor="s", email="x@y.z")
 
+    def test_staff_flag_names_who_holds_the_staff_audience(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("TRACKINIZER_STAFF", raising=False)
+        flags, remaining = _parse_args(
+            argparse.ArgumentParser(),
+            ["--staff", "*@example.com,ada@x.y"],
+        )
+
+        assert remaining == []
+        assert Config.from_args(flags).staff == ("*@example.com", "ada@x.y")
+        assert (
+            Config.from_args(_parse_args(argparse.ArgumentParser(), [])[0]).staff == ()
+        )
+
+    def test_staff_flag_defaults_from_the_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("TRACKINIZER_STAFF", "*@example.com")
+
+        flags, _ = _parse_args(argparse.ArgumentParser(), [])
+        assert Config.from_args(flags).staff == ("*@example.com",)
+        flags, _ = _parse_args(argparse.ArgumentParser(), ["--staff", "a@x.y"])
+        assert Config.from_args(flags).staff == ("a@x.y",)
+
     def test_parse_args_overrides(self) -> None:
         parser = argparse.ArgumentParser()
         flags, _ = _parse_args(
@@ -313,10 +339,9 @@ class TestPureFunctions:
         )
         fresh = FastAPI()
         monkeypatch.setattr(server, "app", fresh)
-        server._configure_app(flags)
-        catalog: object = getattr(fresh.state, "visual_catalog", None)
-        assert isinstance(catalog, Workspace)
-        assert catalog.default_visual == "trax.chat"
+        # Chat is no visual, so the override reaches the catalog and is refused there.
+        with pytest.raises(ValueError, match="Default visual must be registered"):
+            server._configure_app(flags)
 
     @pytest.mark.parametrize(
         ("argv", "message"),
@@ -688,6 +713,6 @@ class TestCoverageRoutesAndCli:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

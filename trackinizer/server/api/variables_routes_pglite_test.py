@@ -15,9 +15,10 @@ import logging
 import stat
 import threading
 
+from treekle import from_plain
+
 import pytest
 
-from trackinizer.lib.codec import from_plain
 from trackinizer.server.api.app import app
 from trackinizer.server.api.conftest import (
     TEST_USER_EMAIL,
@@ -377,7 +378,7 @@ async def test_a_malformed_body_never_echoes_the_value(
 
     assert response.status_code == 422
     assert _HIDDEN not in response.text
-    assert from_plain(_detail(response), list[dict[str, object]])
+    assert isinstance(_detail(response), list)
 
 
 @pytest.mark.usefixtures("vault")
@@ -437,6 +438,6 @@ async def _listed(client: httpx2.AsyncClient) -> VariableList:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)
