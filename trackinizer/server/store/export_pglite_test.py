@@ -416,7 +416,8 @@ async def test_the_header_says_which_subgraph_this_is(store: Store) -> None:
     # Absent, not empty: a whole-graph export is byte-identical to the ones
     # written before selectors existed.
     assert "selector" not in json_loads(
-        next(iter(export_lines(whole))), dict[str, object]
+        next(iter(export_lines(whole))),
+        dict[str, object],
     )
 
 
@@ -427,7 +428,7 @@ async def test_an_empty_selector_is_the_whole_graph(store: Store) -> None:
     await _seed_partitioned(store)
 
     explicit = b"".join(
-        export_lines(await store.export_graph(reader=_ANYONE, selector=()))
+        export_lines(await store.export_graph(reader=_ANYONE, selector=())),
     )
     default = b"".join(export_lines(await store.export_graph(reader=_ANYONE)))
 

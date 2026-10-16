@@ -229,7 +229,8 @@ def test_a_malformed_clause_is_400_not_a_whole_graph(
 def test_no_selector_leaves_the_key_out(export_client: TestClient) -> None:
     """A whole-graph export is unchanged by this feature, header included."""
     header = json_loads(
-        export_client.get(EXPORT_API_PATH).text.splitlines()[0], dict[str, object]
+        export_client.get(EXPORT_API_PATH).text.splitlines()[0],
+        dict[str, object],
     )
 
     assert "selector" not in header
