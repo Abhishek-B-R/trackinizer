@@ -8,8 +8,8 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
+from treekle import from_plain
 
-from trackinizer.lib.codec import from_plain
 from trackinizer.server.api._deps import get_store
 from trackinizer.server.api.visuals_routes import visual_catalog
 from trackinizer.server.auth import require_role
@@ -38,6 +38,7 @@ class TimelineRecord(BaseModel):
     modified: datetime
     description: str | None = Field(max_length=2_000)
     outcome: str | None = Field(max_length=2_000)
+    labels: list[str] | None = None
 
 
 class TimelineEvidence(BaseModel):
@@ -101,9 +102,10 @@ async def evidence_timeline_route(
 
     The anchor Issue supplies `leads` (its `narrows` ancestors, at most three,
     farthest first), results, and directions. An Issue is its own anchor; an
-    Experiment is anchored on the Issue that produced it; any other kind stays
-    the record and takes the nearest `produced_by` Issue, with the anchor itself
-    as its nearest lead. A record with no anchor is returned alone.
+    Experiment is anchored on its sole Issue producer; any other kind stays
+    the record and takes its sole `produced_by` Issue as its nearest lead.
+    Multiple producers or broader Issues stop the overview's ancestry spine;
+    all origins remain available through the paged lineage endpoint.
 
     Args:
       record_id: Selected record UUID, of any kind.

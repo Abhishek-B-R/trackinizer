@@ -12,6 +12,8 @@ from types import MappingProxyType
 from typing import Final, get_args
 from uuid import uuid4
 
+from treekle import from_plain, immutable, mutable
+
 import pytest
 
 from trackinizer.lib.agent.types.sessions import (
@@ -40,7 +42,6 @@ from trackinizer.lib.agent.types.sessions import (
     WebSearchResult,
     WebSearchResults,
 )
-from trackinizer.lib.codec import from_plain, immutable, mutable
 from trackinizer.types.session_records import (
     _BY_KIND,
     MAX_SEARCH_TEXT_BYTES,
@@ -338,6 +339,6 @@ def test_templates_decode_from_both_frozen_and_mutable_payloads() -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

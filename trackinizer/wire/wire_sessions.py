@@ -34,6 +34,9 @@ _MAX_MESSAGE_CHARS: Final = 16_384
 ``inject`` writes to the PTY under the pump lock (each write stalls human
 keystrokes for its duration) and the memory a process-local queue holds."""
 
+_MAX_ACCOUNT_CHARS: Final = 254
+"""Upper bound on an account email, which RFC 5321 caps at 254 characters."""
+
 
 # Every textual identity/scope field on these bodies (``cli``, ``actor``,
 # ``cli_session_id``, ``room``) is matched or stored verbatim, so a whitespace-only
@@ -49,17 +52,23 @@ def _reject_blank(value: str | None) -> str | None:
 
 
 __all__ = [
+    "CAMPAIGN_ASKER_INFIX",
+    "CONSOLE_RELAY_MARK",
     "FEED_FACETS_PATH",
     "FEED_HISTOGRAM_PATH",
     "FEED_PATH",
     "SEND_MESSAGE_PATH",
     "SESSION_API_PATHS",
+    "SESSION_AUDIENCE_PATH",
     "SESSION_END_PATH",
     "SESSION_INBOUND_PATH",
     "SESSION_PARTS_PATH",
     "SESSION_RECORDS_PATH",
     "SESSION_START_PATH",
     "VERSION_PATH",
+    "ConsoleRelay",
+    "ConsoleRelayReceipt",
+    "ConsoleTarget",
     "DrainInboundResponse",
     "FeedActorFacet",
     "FeedBucket",
@@ -70,20 +79,50 @@ __all__ = [
     "FeedKindFacet",
     "FeedResponse",
     "FeedRoomFacet",
+    "FeedWhose",
     "InboundDrainItem",
     "InboundEnqueueRequest",
     "InboundEnqueueResponse",
     "SendMessage",
     "SendMessageResponse",
+    "SessionAudienceChange",
+    "SessionAudienceResponse",
     "SessionEnd",
     "SessionEndResponse",
     "SessionStart",
     "SessionStartResponse",
-    "WorkspaceArtifactContent",
     "WorkspaceMessageContext",
     "WorkspaceRecordContext",
     "WorkspaceVisibleVisual",
+    "campaign_asker_label",
+    "session_audience_path",
 ]
+
+
+CAMPAIGN_ASKER_INFIX: Final = ":asker:"
+"""What joins a campaign's slug and the email of the person who launched it, in the
+label ``<slug>:asker:<email>`` its brief carries: the feed's ``whose=campaigns`` keeps
+the sessions labelled with, or in a room named for, a slug so labelled with the
+caller."""
+
+
+type FeedWhose = Literal["mine", "campaigns", "everyone"]
+"""Whose sessions a feed read keeps: the caller's own, those of the campaigns the
+caller launched, or every one the caller reads."""
+
+
+def campaign_asker_label(slug: str, email: str) -> str:
+    """Return the label that names who launched a campaign, for its brief.
+
+    Args:
+      slug: The campaign's slug, which its lead's session carries as a label.
+      email: The launcher's account.
+
+    Returns:
+      label: ``<slug>:asker:<email>``, the email lowercase.
+
+    """
+    return f"{slug}{CAMPAIGN_ASKER_INFIX}{email.lower()}"
 
 
 class SessionStart(BaseModel):
@@ -116,6 +155,12 @@ class SessionStart(BaseModel):
     idempotency_key: uuid.UUID | None = None
     """Optional client-supplied key; a repeat ``start`` with the same key
     returns the original session id without minting a duplicate."""
+
+    private: bool = False
+    """Open the session hidden: ``private``, read only by its owner and the people who
+    oversee. A key pinned to another audience than ``open`` or ``private`` is refused
+    (403 ``audience_not_held``). A server that predates the field ignores it, which
+    :attr:`SessionStartResponse.audience` then shows."""
 
     _reject_blank_scalars = field_validator(
         "cli",
@@ -157,6 +202,10 @@ class SessionStartResponse(BaseModel):
     """The granted routing name. Equals the requested ``--as`` actor unless it
     collided with a live session, in which case the server appended a suffix
     (``scientist`` -> ``scientist#2``); the client adopts whatever is here."""
+
+    audience: str | None = None
+    """Who reads the session's transcript, as the server holds it; ``None`` from a
+    server that predates the field."""
 
 
 class FeedEvent(BaseModel):
@@ -266,6 +315,16 @@ class FeedActorFacet(BaseModel):
     ended: datetime | None
     """When the session ended; ``None`` while it is live."""
 
+    account: str = ""
+    """Who the session is held under."""
+
+    audience: str | None = None
+    """Who reads its transcript: ``open``, ``private`` or ``staff``."""
+
+    hideable: bool = False
+    """Whether the caller may hide the session, or show it again: its owner, while it
+    is not ``staff``. Never for a science chat, which is hidden from Chat."""
+
 
 class FeedRoomFacet(BaseModel):
     """One room's share of a feed window."""
@@ -321,87 +380,42 @@ class FeedHistogramResponse(BaseModel):
 class InboundEnqueueRequest(BaseModel):
     """A message a client asks trackinizer to inject into a live session.
 
-    The enqueue **request** carries only ``text`` -- the one field the route
-    uses. ``source`` is attested by the route from the authenticated principal
-    (a client cannot forge another sender), and ``room`` has no enqueue
-    semantics (the direct-session enqueue route discards it; routed delivery is
-    the separate ``@actor:room`` send-message path). ``extra="forbid"`` makes a
-    client-sent ``source`` or ``room`` a 422 rather than a silently-ignored
-    field -- the request and response shapes are deliberately distinct (the
-    response :class:`InboundDrainItem` carries both ``source`` and ``room``), so
-    neither can be confused for the other.
+    The enqueue **request** carries ``text`` -- the one field the route delivers --
+    and, from the configured assistant alone, the ``asker`` it sends for. ``source``
+    is attested by the route from the authenticated principal (a client cannot forge
+    another sender), and ``room`` has no enqueue semantics (the direct-session
+    enqueue route discards it; routed delivery is the separate ``@actor:room``
+    send-message path). ``extra="forbid"`` makes a client-sent ``source`` or ``room``
+    a 422 rather than a silently-ignored field -- the request and response shapes are
+    deliberately distinct (the response :class:`InboundDrainItem` carries both
+    ``source`` and ``room``), so neither can be confused for the other.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     text: str = Field(min_length=1, max_length=_MAX_MESSAGE_CHARS)
 
+    asker: str | None = Field(default=None, max_length=_MAX_ACCOUNT_CHARS)
+    """The account of the user the configured assistant sends this line for.
+
+    The server lets the assistant send to a session the assistant cannot read only
+    for a user who may write to it (that session's account, or a writer who holds its
+    audience), so the assistant names whom it speaks for. Any other sender's ``asker``
+    is ignored.
+    """
+
+    _validate_scalars = field_validator("asker", mode="after")(
+        staticmethod(_reject_blank),
+    )
+
 
 class WorkspaceRecordContext(BaseModel):
-    """A graph record targeted by chat, with a bounded title preview."""
+    """A graph record the sender sees on screen, with a bounded title preview."""
 
     id: uuid.UUID
     kind: str
     seq: int
     title: str = Field(max_length=512)
-
-
-class WorkspaceArtifactCitation(BaseModel):
-    """A publication-time graph row and its optional signed edge."""
-
-    record_id: uuid.UUID
-    kind: str
-    seq: int
-    title: str
-    claim_id: uuid.UUID | None = None
-    claim_kind: str | None = None
-    claim_seq: int | None = None
-    claim_title: str | None = None
-    edge_kind: Literal["proves", "favors"] | None = None
-    valence: float | None = Field(default=None, ge=-1, le=1)
-    note: str | None = None
-
-
-class WorkspaceArtifactOutcome(BaseModel):
-    """The measured result frozen in an Artifact finding."""
-
-    result: str
-    denominator: int
-    split: str
-
-
-class WorkspaceArtifactFinding(BaseModel):
-    """One Artifact conclusion and its publication-time evidence."""
-
-    claim: str
-    outcome: WorkspaceArtifactOutcome
-    uncertainty: str
-    citations: list[WorkspaceArtifactCitation]
-
-
-class WorkspaceArtifactSection(BaseModel):
-    """A published section with its evidenced findings."""
-
-    title: str
-    summary: str
-    details: str
-    findings: list[WorkspaceArtifactFinding]
-
-
-class WorkspaceArtifactContent(BaseModel):
-    """Server-read publication metadata and frozen citations for chat."""
-
-    revision: int = Field(ge=1)
-    artifact_id: uuid.UUID
-    issue_id: uuid.UUID
-    title: str
-    summary: str
-    author: str
-    created_at: datetime
-    scope: Literal["team"]
-    format: Literal["html", "structured"]
-    citations: list[WorkspaceArtifactCitation]
-    sections: list[WorkspaceArtifactSection]
 
 
 class WorkspaceVisibleVisual(BaseModel):
@@ -411,6 +425,10 @@ class WorkspaceVisibleVisual(BaseModel):
     type: str
     record: WorkspaceRecordContext | None = None
     """The record the visual shows, when it shows one that exists."""
+
+    params: dict[str, str | int | bool] = Field(default_factory=dict)
+    """The visual's parameters as the canvas holds them, such as the narrowing a
+    reader set in the pane, so an agent that shows it again can keep them."""
 
 
 class WorkspacePage(BaseModel):
@@ -422,15 +440,62 @@ class WorkspacePage(BaseModel):
     record: WorkspaceRecordContext | None = None
 
 
+class ConsoleTarget(BaseModel):
+    """An agent a Console line was sent to, as ``@actor`` or ``@actor:room``."""
+
+    actor: str = Field(min_length=1)
+    room: str | None = None
+
+    _validate_scalars = field_validator("actor", "room", mode="after")(
+        staticmethod(_reject_blank),
+    )
+
+
+CONSOLE_RELAY_MARK: Final = "→ "
+"""What a Console relay line starts with in a station's chat: an arrow, then a space.
+The web draws a line that starts with it as a relay, neither the person's nor the
+partner's."""
+
+
+class ConsoleRelay(BaseModel):
+    """What a person sent agents directly from the Console, told to their station's chat.
+
+    Posted by the browser after the per-agent sends, and carried in the context of
+    the message the chat's partner then receives. The partner records it in the
+    chat as :meth:`line` and answers nothing, but reads it in its next prompt, so it
+    never contradicts what the person told the agents.
+    """
+
+    targets: list[ConsoleTarget] = Field(min_length=1, max_length=200)
+    text: str = Field(min_length=1, max_length=_MAX_MESSAGE_CHARS)
+
+    def line(self) -> str:
+        """Return the chat line that records the relay: ``-> a, b:room: text``.
+
+        Returns:
+          line: The relay mark, each target as ``actor`` or ``actor:room``, then
+            the text.
+
+        """
+        names = ", ".join(
+            target.actor if target.room is None else f"{target.actor}:{target.room}"
+            for target in self.targets
+        )
+        return f"{CONSOLE_RELAY_MARK}{names}: {self.text}"
+
+
+class ConsoleRelayReceipt(BaseModel):
+    """Whether the station's chat partner took a Console relay."""
+
+    delivered: bool
+    """False when the station has no chat, or its partner is not running or is full.
+    The agents already have the message, so this is not an error."""
+
+
 class WorkspaceMessageContext(BaseModel):
     """Server-derived canvas context attached to an inbound message."""
 
     workspace_id: uuid.UUID
-    record_id: uuid.UUID | None = None
-    """Persisted target ID, including records on a separate read profile."""
-
-    record: WorkspaceRecordContext | None = None
-    artifact_content: WorkspaceArtifactContent | None = None
     visible_visuals: list[WorkspaceVisibleVisual]
     agent_instructions: str | None = Field(default=None, max_length=8_192)
     continuation_record_id: uuid.UUID | None = None
@@ -446,6 +511,10 @@ class WorkspaceMessageContext(BaseModel):
 
     trail: list[WorkspacePage] = Field(default_factory=list)
     """The pages they came through before it, oldest first."""
+
+    relay: ConsoleRelay | None = None
+    """Set when the message is not a question for the partner but a note of what the
+    person told agents from the Console; the message text is the relay's text."""
 
 
 class InboundDrainItem(BaseModel):
@@ -513,7 +582,14 @@ class SendMessage(BaseModel):
     text: str = Field(min_length=1, max_length=_MAX_MESSAGE_CHARS)
     """The message body to inject into each matched session."""
 
-    _validate_scalars = field_validator("actor", "room", mode="after")(
+    asker: str | None = Field(default=None, max_length=_MAX_ACCOUNT_CHARS)
+    """The account of the user the configured assistant sends this message for.
+
+    See :attr:`InboundEnqueueRequest.asker`: the assistant names whom it speaks for,
+    and any other sender's ``asker`` is ignored.
+    """
+
+    _validate_scalars = field_validator("actor", "room", "asker", mode="after")(
         staticmethod(_reject_blank),
     )
 
@@ -527,6 +603,25 @@ class SendMessageResponse(BaseModel):
     """
 
     delivered: list[uuid.UUID]
+
+
+class SessionAudienceChange(BaseModel):
+    """Hide a session from everyone but its owner and those who oversee, or show it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    audience: Literal["open", "private"]
+    """``private`` hides the session; ``open`` shows it again."""
+
+
+class SessionAudienceResponse(BaseModel):
+    """The audience a session now has, and every session that moved with it."""
+
+    session_id: uuid.UUID
+    audience: Literal["open", "private"]
+    sessions: list[uuid.UUID]
+    """The sessions whose audience this changed: the one named, or for a science
+    chat every session under its id. Empty when it already had the audience."""
 
 
 class SessionEnd(BaseModel):
@@ -555,6 +650,7 @@ SESSION_START_PATH: Final = "/api/sessions/start"
 SESSION_RECORDS_PATH: Final = "/api/sessions/{session_id}/records"
 SESSION_PARTS_PATH: Final = "/api/sessions/{session_id}/parts"
 SESSION_END_PATH: Final = "/api/sessions/{session_id}/end"
+SESSION_AUDIENCE_PATH: Final = "/api/sessions/{session_id}/audience"
 SESSION_INBOUND_PATH: Final = "/api/sessions/{session_id}/inbound"
 SEND_MESSAGE_PATH: Final = "/api/messages"
 VERSION_PATH: Final = "/api/version"
@@ -574,6 +670,7 @@ SESSION_API_PATHS: tuple[str, ...] = (
     SESSION_RECORDS_PATH,
     SESSION_PARTS_PATH,
     SESSION_END_PATH,
+    SESSION_AUDIENCE_PATH,
     SESSION_INBOUND_PATH,
     SEND_MESSAGE_PATH,
     VERSION_PATH,
@@ -591,6 +688,11 @@ def session_records_path(session_id: uuid.UUID) -> str:
 def session_end_path(session_id: uuid.UUID) -> str:
     """Return the end path for one session."""
     return SESSION_END_PATH.format(session_id=session_id)
+
+
+def session_audience_path(session_id: uuid.UUID) -> str:
+    """Return the path that hides one session or shows it again."""
+    return SESSION_AUDIENCE_PATH.format(session_id=session_id)
 
 
 def session_inbound_path(session_id: uuid.UUID) -> str:

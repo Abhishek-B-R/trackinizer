@@ -2,7 +2,8 @@
 
 Three principals share one PGlite database: the browser user, a second user, and
 the account the assistant runs under. Each acts through a browser
-identity (no API key) or an agent identity (an API key that opened sessions).
+identity (no API key) or an agent identity (an API key that opened sessions), with
+the ``hd`` claim Google gives its login: its email's domain, unless a consumer one.
 """
 
 from __future__ import annotations
@@ -13,7 +14,8 @@ from typing import TYPE_CHECKING, Final
 
 import uuid
 
-from trackinizer.lib.codec import from_plain, loads
+from treekle import from_plain, json_loads
+
 from trackinizer.server.api.app import app
 from trackinizer.server.api.conftest import (
     TEST_API_KEY_ID,
@@ -22,6 +24,7 @@ from trackinizer.server.api.conftest import (
     install_identity,
     make_test_identity,
 )
+from trackinizer.server.audience import CONSUMER_DOMAINS
 from trackinizer.server.chat_hub import ChatHub
 from trackinizer.server.config import Assistant, Config
 from trackinizer.server.inbound import InboundQueue
@@ -39,7 +42,7 @@ if TYPE_CHECKING:
 
     import httpx2
 
-    from trackinizer.server.auth import Role
+    from trackinizer.server.auth import AuthIdentity, Role
     from trackinizer.server.store.core import Store
 
 
@@ -80,7 +83,9 @@ def browser(user_id: uuid.UUID = TEST_USER_ID, *, email: str = TEST_USER_EMAIL) 
       email: Their email.
 
     """
-    install_identity(make_test_identity(user_id=user_id, api_key_id=None, email=email))
+    install_identity(
+        _signed_in(make_test_identity(user_id=user_id, api_key_id=None, email=email)),
+    )
 
 
 def act_as_user_agent(role: Role = "viewer") -> None:
@@ -161,7 +166,7 @@ async def start_session(
     if started.status_code != 201:
         raise ValueError(f"session start answered {started.status_code}")
     session_id = from_plain(
-        from_plain(loads(started.content), dict[str, object])["id"],
+        json_loads(started.content, dict[str, object])["id"],
         str,
     )
     polled = await client.get(f"/api/sessions/{session_id}/inbound")
@@ -214,6 +219,7 @@ async def seed_session(
                 "account": account or agent.email,
                 "labels": canonical_strs(labels),
                 "subscribers": (),
+                "agentsession_audience": "open",
                 "agentsession_cli": cli,
                 "agentsession_cli_session_id": cli_session_id,
                 "agentsession_rooms": (),
@@ -342,81 +348,29 @@ async def open_workspace(
     *,
     user_id: uuid.UUID = TEST_USER_ID,
     email: str = TEST_USER_EMAIL,
+    new: bool = False,
 ) -> uuid.UUID:
-    """Create the user's canvas as a browser.
+    """Open the user's station as a browser.
 
     Args:
       client: The test client.
       user_id: The signed-in user.
       email: Their email.
+      new: Make another station instead of opening the one used last.
 
     Returns:
-      workspace_id: The canvas.
+      workspace_id: The station.
 
     """
     browser(user_id, email=email)
-    created = await client.post("/api/workspaces")
+    created = await client.post("/api/workspaces/new" if new else "/api/workspaces")
     if created.status_code != 200:
         raise ValueError(f"workspace create answered {created.status_code}")
     return uuid.UUID(
-        from_plain(from_plain(loads(created.content), dict[str, object])["id"], str),
-    )
-
-
-async def open_canvas(
-    client: httpx2.AsyncClient,
-    *,
-    user_id: uuid.UUID = TEST_USER_ID,
-    email: str = TEST_USER_EMAIL,
-) -> tuple[uuid.UUID, uuid.UUID]:
-    """Create the user's canvas as a browser and show its Chat visual.
-
-    What ``open_workspace`` then ``show_chat`` do, reading the new canvas's revision
-    from the answer that created it instead of asking for it again.
-
-    Args:
-      client: The test client.
-      user_id: The signed-in user.
-      email: Their email.
-
-    Returns:
-      workspace_id: The new canvas.
-      chat_id: Its Chat visual's instance id.
-
-    """
-    browser(user_id, email=email)
-    created = await client.post("/api/workspaces")
-    if created.status_code != 200:
-        raise ValueError(f"workspace create answered {created.status_code}")
-    state = from_plain(loads(created.content), dict[str, object])
-    workspace_id = uuid.UUID(from_plain(state["id"], str))
-    chat_id = await _show_chat_at(
-        client,
-        workspace_id=workspace_id,
-        revision=from_plain(state["revision"], int),
-    )
-    return workspace_id, chat_id
-
-
-async def show_chat(
-    client: httpx2.AsyncClient,
-    *,
-    workspace_id: uuid.UUID,
-) -> uuid.UUID:
-    """Show the Chat visual as the installed browser.
-
-    Args:
-      client: The test client.
-      workspace_id: The canvas.
-
-    Returns:
-      chat_id: The Chat visual's instance id.
-
-    """
-    return await _show_chat_at(
-        client,
-        workspace_id=workspace_id,
-        revision=await revision_of(client, workspace_id=workspace_id),
+        from_plain(
+            json_loads(created.content, dict[str, object])["id"],
+            str,
+        ),
     )
 
 
@@ -424,7 +378,6 @@ async def send_chat(
     client: httpx2.AsyncClient,
     *,
     workspace_id: uuid.UUID,
-    chat_id: uuid.UUID,
     text: str,
     conversation_id: uuid.UUID | None = None,
     key: uuid.UUID | None = None,
@@ -436,7 +389,6 @@ async def send_chat(
     Args:
       client: The test client.
       workspace_id: The canvas.
-      chat_id: Its Chat visual.
       text: The line.
       conversation_id: The conversation to post into; none starts one.
       key: The idempotency key; a fresh one by default.
@@ -456,8 +408,6 @@ async def send_chat(
         json={
             "workspace_id": str(workspace_id),
             "text": text,
-            "chat_instance_id": str(chat_id),
-            "expected_record_id": None,
             "conversation_id": None
             if conversation_id is None
             else str(conversation_id),
@@ -480,7 +430,7 @@ def conversation_of(response: httpx2.Response) -> uuid.UUID:
     """
     if response.status_code != 200:
         raise ValueError(f"send answered {response.status_code}")
-    receipt = from_plain(loads(response.content), dict[str, object])
+    receipt = json_loads(response.content, dict[str, object])
     return uuid.UUID(from_plain(receipt["conversation_id"], str))
 
 
@@ -489,7 +439,6 @@ async def converse(
     store: Store,
     *,
     workspace_id: uuid.UUID,
-    chat_id: uuid.UUID,
     text: str = "hello",
 ) -> uuid.UUID:
     """Post a line as the browser, and have the assistant open the conversation.
@@ -498,7 +447,6 @@ async def converse(
       client: The test client.
       store: The test database.
       workspace_id: The canvas.
-      chat_id: Its Chat visual.
       text: The line.
 
     Returns:
@@ -507,7 +455,7 @@ async def converse(
     """
     browser()
     conversation_id = conversation_of(
-        await send_chat(client, workspace_id=workspace_id, chat_id=chat_id, text=text),
+        await send_chat(client, workspace_id=workspace_id, text=text),
     )
     return await open_science_chat(client, store, conversation_id=conversation_id)
 
@@ -517,7 +465,6 @@ async def seed_converse(
     store: Store,
     *,
     workspace_id: uuid.UUID,
-    chat_id: uuid.UUID,
     text: str = "hello",
 ) -> uuid.UUID:
     """Post a line as the browser, and have the assistant open the conversation.
@@ -528,7 +475,6 @@ async def seed_converse(
       client: The test client.
       store: The test database.
       workspace_id: The canvas.
-      chat_id: Its Chat visual.
       text: The line.
 
     Returns:
@@ -537,7 +483,7 @@ async def seed_converse(
     """
     browser()
     conversation_id = conversation_of(
-        await send_chat(client, workspace_id=workspace_id, chat_id=chat_id, text=text),
+        await send_chat(client, workspace_id=workspace_id, text=text),
     )
     return await seed_science_chat(store, conversation_id=conversation_id)
 
@@ -553,8 +499,8 @@ async def revision_of(client: httpx2.AsyncClient, *, workspace_id: uuid.UUID) ->
       revision: Its current revision.
 
     """
-    state = from_plain(
-        loads((await client.get(f"/api/workspaces/{workspace_id}")).content),
+    state = json_loads(
+        (await client.get(f"/api/workspaces/{workspace_id}")).content,
         dict[str, object],
     )
     return from_plain(state["revision"], int)
@@ -578,41 +524,24 @@ async def drain(
     return await client.get(f"/api/sessions/{session_id}/inbound")
 
 
-async def _show_chat_at(
-    client: httpx2.AsyncClient,
-    *,
-    workspace_id: uuid.UUID,
-    revision: int,
-) -> uuid.UUID:
-    """Show the Chat visual on a canvas at ``revision``; return its instance id."""
-    # pragma: no mutate start -- a header name's case is an equivalent mutant.
-    headers = {"Idempotency-Key": str(uuid.uuid4())}
-    # pragma: no mutate end
-    shown = await client.post(
-        f"/api/workspaces/{workspace_id}/operations",
-        json={
-            "revision": revision,
-            "operation": {"kind": "show", "visual_type": "trax.chat"},
-        },
-        headers=headers,
-    )
-    if shown.status_code != 200:
-        raise ValueError(f"show answered {shown.status_code}")
-    visuals = from_plain(
-        from_plain(loads(shown.content), dict[str, object])["visuals"],
-        list[dict[str, object]],
-    )
-    chat = next(v for v in visuals if v["type"] == "trax.chat")
-    return uuid.UUID(from_plain(chat["id"], str))
-
-
 def _agent(key_id: uuid.UUID, *, user_id: uuid.UUID, email: str, role: Role) -> None:
     """Act as an agent holding one API key."""
     install_identity(
-        make_test_identity(
-            user_id=user_id,
-            api_key_id=key_id,
-            email=email,
-            role=role,
+        _signed_in(
+            make_test_identity(
+                user_id=user_id,
+                api_key_id=key_id,
+                email=email,
+                role=role,
+            ),
         ),
+    )
+
+
+def _signed_in(identity: AuthIdentity) -> AuthIdentity:
+    """Give ``identity`` the hd claim Google gives its login."""
+    domain = identity.email.lower().rpartition("@")[2]
+    return replace(
+        identity,
+        hosted_domain=None if domain in CONSUMER_DOMAINS else domain,
     )

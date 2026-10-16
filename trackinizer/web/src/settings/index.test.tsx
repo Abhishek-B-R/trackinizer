@@ -1,7 +1,10 @@
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import noAuth from "../../test/testdata/me/getProfile.json";
+import type { OrgMode, Profile } from "../api/me";
 import { LOGIN_URL } from "../app/session";
+import { DEFAULT_PREFERENCES, receivePreferences, sendWaiting } from "../preferences";
+import { startTrail } from "../router/trail";
 import { chooseTheme, installTheme } from "../theme";
 import { SettingsView } from ".";
 import { FAST, profile, renderScreen, serveAccount } from "./testing";
@@ -12,12 +15,14 @@ beforeEach(() => {
   localStorage.clear();
 });
 
-afterEach(() => {
+afterEach(async () => {
   cleanup();
+  // The page's theme is the module's, which outlives a test: each starts on the
+  // default, once the test's own sends have been answered.
+  await sendWaiting();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  // The page's theme is the module's, which outlives a test: each starts on the default.
-  chooseTheme("dark");
+  receivePreferences(DEFAULT_PREFERENCES);
 });
 
 test("the page shows the profile, refetched on open, and every section", async () => {
@@ -33,20 +38,42 @@ test("the page shows the profile, refetched on open, and every section", async (
     "Profile",
     "Names that mean you",
     "Appearance",
+    "Preferences document",
     "Agent workspace",
     "Chat partner",
     "API tokens",
-    "This browser",
     "Session",
   ]);
   await waitFor(() => expect(server.reads("/api/me/profile")).toBe(1), FAST);
+});
+
+test("Close goes back to the last page before Settings, or to the graph when there was none", async () => {
+  serveAccount(ADA);
+  const close = () => screen.getByRole("link", { name: "Close settings" }).getAttribute("href");
+  history.replaceState(null, "", "#/settings");
+  let stop = startTrail();
+  renderScreen(<SettingsView assign={vi.fn()} />, ADA);
+  expect(close()).toBe("#/graph");
+  cleanup();
+  stop();
+  history.replaceState(null, "", "#/list/Paper");
+  stop = startTrail();
+  for (const hash of ["#/admin", "#/settings"]) {
+    location.hash = hash;
+    await waitFor(() => expect(location.hash).toBe(hash));
+    window.dispatchEvent(new HashChangeEvent("hashchange"));
+  }
+  renderScreen(<SettingsView assign={vi.fn()} />, ADA);
+  expect(close()).toBe("#/list/Paper");
+  stop();
+  history.replaceState(null, "", "#/");
 });
 
 test("agent workspace opt-in updates the account preference", async () => {
   const server = serveAccount(ADA);
   renderScreen(<SettingsView assign={vi.fn()} />, ADA);
   const workspace = within(screen.getByRole("region", { name: "Agent workspace" }));
-  const toggle = workspace.getByRole("checkbox", { name: "Enable agent-guided canvas" });
+  const toggle = workspace.getByRole("checkbox", { name: "Enable agent-guided workbench" });
   expect((toggle as HTMLInputElement).checked).toBe(false);
   fireEvent.click(toggle);
   await waitFor(() => expect(server.writes()).toContainEqual({
@@ -55,27 +82,47 @@ test("agent workspace opt-in updates the account preference", async () => {
   await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(true), FAST);
 });
 
-test("the switch for highlighting what the assistant mentions is on, and turns off at once, kept in this browser", () => {
-  serveAccount(ADA);
+/** The preference changes sent to the server, in order. */
+const preferenceWrites = (server: ReturnType<typeof serveAccount>) =>
+  server.sent.filter((request) => request.path === "/api/me/preferences").map((request) => [request.method, request.body]);
+
+test("the switch for highlighting what the assistant mentions is on, and turns off at once, kept in the user's preferences", async () => {
+  const server = serveAccount(ADA);
   renderScreen(<SettingsView assign={vi.fn()} />, ADA);
   const workspace = within(screen.getByRole("region", { name: "Agent workspace" }));
   const toggle = workspace.getByRole("checkbox", { name: "Highlight rows the assistant mentions" }) as HTMLInputElement;
   expect(toggle.checked).toBe(true);
   fireEvent.click(toggle);
   expect(toggle.checked).toBe(false);
-  expect(localStorage.getItem(`trackinizer.v2.highlight-mentions.${ADA.email}`)).toBe("off");
   fireEvent.click(toggle);
   expect(toggle.checked).toBe(true);
+  await waitFor(() => expect(preferenceWrites(server)).toEqual([
+    ["PATCH", { highlight_mentions: false }],
+    ["PATCH", { highlight_mentions: true }],
+  ]));
   expect(localStorage.getItem(`trackinizer.v2.highlight-mentions.${ADA.email}`)).toBeNull();
 });
 
-test("appearance choice persists and updates the page immediately", () => {
-  serveAccount(ADA);
+test("a theme chosen updates the page at once and is kept in the user's preferences", async () => {
+  const server = serveAccount(ADA);
   renderScreen(<SettingsView assign={vi.fn()} />, ADA);
   const appearance = within(screen.getByRole("region", { name: "Appearance" }));
   fireEvent.change(appearance.getByRole("combobox", { name: "Theme" }), { target: { value: "light" } });
   expect(document.documentElement.dataset.theme).toBe("light");
-  expect(localStorage.getItem("trackinizer.theme")).toBe("light");
+  await waitFor(() => expect(preferenceWrites(server)).toEqual([["PATCH", { theme: "light" }]]));
+  expect(localStorage.getItem("trackinizer.theme")).toBeNull();
+});
+
+test("Chat style is Default until Terminal is picked, which marks the page and is kept in the user's preferences", async () => {
+  const server = serveAccount(ADA);
+  renderScreen(<SettingsView assign={vi.fn()} />, ADA);
+  const style = within(screen.getByRole("region", { name: "Appearance" })).getByRole<HTMLSelectElement>("combobox", { name: "Chat style" });
+  expect(style.value).toBe("default");
+  expect(Array.from(style.options, (option) => option.textContent)).toEqual(["Default", "Terminal"]);
+  fireEvent.change(style, { target: { value: "terminal" } });
+  expect(style.value).toBe("terminal");
+  expect(document.documentElement.dataset.chatStyle).toBe("terminal");
+  await waitFor(() => expect(preferenceWrites(server)).toEqual([["PATCH", { chat_style: "terminal" }]]));
 });
 
 test("the theme picked elsewhere, as by the sidebar's button, shows in Appearance at once", () => {
@@ -87,15 +134,12 @@ test("the theme picked elsewhere, as by the sidebar's button, shows in Appearanc
   expect((theme as HTMLSelectElement).value).toBe("light");
 });
 
-test("a theme chosen while the browser refuses to store it holds, in Appearance too, and the OS's appearance leaves it be", () => {
+test("a theme chosen holds, in Appearance too, and the OS's appearance leaves it be", () => {
   const os = { matches: false, changed: () => {}, addEventListener: (_: string, listener: () => void) => (os.changed = listener) };
   vi.stubGlobal("matchMedia", () => os);
+  serveAccount(ADA);
   installTheme();
   chooseTheme("system");
-  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-    throw new DOMException("Full", "QuotaExceededError");
-  });
-  serveAccount(ADA);
   renderScreen(<SettingsView assign={vi.fn()} />, ADA);
   const theme = within(screen.getByRole("region", { name: "Appearance" })).getByRole<HTMLSelectElement>("combobox", { name: "Theme" });
   expect(theme.value).toBe("system");
@@ -131,8 +175,15 @@ test("Sign out posts to /auth/logout, then loads the login page", async () => {
 });
 
 test("under --no-auth, where nobody signs in, the page offers no sign out", () => {
-  // The fixture is the profile a server run with --no-auth answers.
-  const everyone = { ...noAuth.response.body };
+  // The fixture is the profile a server run with --no-auth answers; a JSON import
+  // widens its preferences' and org mode's words to `string`, where they are the
+  // server's own.
+  const body = noAuth.response.body;
+  const everyone: Profile = {
+    ...body,
+    preferences: body.preferences as Profile["preferences"],
+    org_mode: body.org_mode as OrgMode,
+  };
   serveAccount(everyone);
   renderScreen(<SettingsView assign={vi.fn()} />, everyone);
   expect(screen.getByRole("region", { name: "Profile" })).toBeTruthy();

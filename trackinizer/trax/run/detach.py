@@ -40,7 +40,8 @@ import socket
 import sys
 import time
 
-from trackinizer.lib.codec import from_plain, loads, to_plain
+from treekle import json_loads, to_plain
+
 from trackinizer.lib.posix.attach import attach, stop, submit
 from trackinizer.lib.posix.host import HostSpec
 from trackinizer.lib.posix.terminal import write_all
@@ -473,7 +474,7 @@ def _read_record(paths: Path) -> HostRecord | None:
     """Return the host's record, or None when it has none (or none readable)."""
     try:
         text = (paths / "host.json").read_text()
-        return from_plain(from_plain(loads(text), dict[str, object]), HostRecord)
+        return json_loads(text, HostRecord)
     except (OSError, ValueError, TypeError):
         return None
 

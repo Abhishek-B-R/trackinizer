@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from functools import partial
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Final
 
 import asyncio
 import json
 import uuid
 
 from fastapi import Request
+from treekle import from_plain, json_loads
 
 import pytest
 
 from trackinizer.lib.agent.types.sessions import AgentToAgentMessage
-from trackinizer.lib.codec import from_plain, loads
-from trackinizer.server.api import workspace_routes
+from trackinizer.server.api import science_chat_routes, workspace_routes
 from trackinizer.server.api.app import app
 from trackinizer.server.api.canvas_test_support import (
     ASSISTANT,
@@ -33,8 +36,8 @@ from trackinizer.server.api.canvas_test_support import (
     browser,
     conversation_of,
     drain,
-    open_canvas,
     open_science_chat,
+    open_workspace,
     revision_of,
     seed_accounts,
     seed_science_chat,
@@ -48,23 +51,38 @@ from trackinizer.server.api.conftest import (
     install_identity,
     make_test_identity,
 )
+from trackinizer.server.chat_hub import ChatHub, WorkspaceFrame
 from trackinizer.server.inbound import InboundQueue
 from trackinizer.server.route_iter import iter_routes
+from trackinizer.server.visuals.chat_forks import (
+    ChatClosedError,
+    ChatRefusedError,
+    ForeignChatError,
+)
+from trackinizer.server.visuals.chat_shares import UnboundStation
+from trackinizer.server.visuals.workspaces import WorkspaceState
+from trackinizer.types.errors import ChatDeletedError
 from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.wire.wire_science_chat import (
     CHAT_HELPER_CLI,
     SCIENCE_CHAT_LABEL,
+    ChatSent,
     chat_session_id,
 )
 from trackinizer.wire.wire_session_ir import ManifestBody, RecordBody
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Sequence
+
+    from fastapi.testclient import TestClient
 
     import httpx2
 
+    from trackinizer.conftest import FakeEngine
+    from trackinizer.server.auth import AuthIdentity
     from trackinizer.server.store.core import Store
+    from trackinizer.wire.wire_science_chat import ChatSend
 
 
 type _Client = tuple[httpx2.AsyncClient, Store]
@@ -81,14 +99,11 @@ async def _canvas(
     client: httpx2.AsyncClient,
     *,
     other: bool = False,
-) -> tuple[
-    uuid.UUID,
-    uuid.UUID,
-]:
-    """Open a user's canvas with its Chat visual; return both ids."""
+) -> uuid.UUID:
+    """Open a user's canvas; return its id."""
     if other:
-        return await open_canvas(client, user_id=OTHER_USER_ID, email=OTHER_EMAIL)
-    return await open_canvas(client)
+        return await open_workspace(client, user_id=OTHER_USER_ID, email=OTHER_EMAIL)
+    return await open_workspace(client)
 
 
 async def _drained(
@@ -101,7 +116,7 @@ async def _drained(
     response = await drain(client, session_id=session_id)
     assert response.status_code == 200
     return from_plain(
-        from_plain(loads(response.content), dict[str, object])["messages"],
+        json_loads(response.content, dict[str, object])["messages"],
         list[dict[str, object]],
     )
 
@@ -116,22 +131,25 @@ async def test_a_writer_starts_a_conversation_and_the_assistant_hears_the_line(
     await seed_accounts(store)
     act_as_assistant()
     kb = await start_session(client, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     key = uuid.uuid4()
 
     sent = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="what do we know about tails?",
         key=key,
     )
 
     assert sent.status_code == 200
-    receipt = from_plain(loads(sent.content), dict[str, object])
+    receipt = json_loads(sent.content, dict[str, object])
     # A new conversation is named by its key, and has no session until the
     # assistant opens it.
-    assert receipt == {"conversation_id": str(key), "session_id": None}
+    assert receipt == {
+        "conversation_id": str(key),
+        "session_id": None,
+        "workspace_id": str(workspace_id),
+    }
     [heard] = await _drained(client, session_id=kb)
     assert heard["text"] == "what do we know about tails?"
     assert (heard["source"], heard["source_role"]) == (TEST_USER_EMAIL, "writer")
@@ -151,13 +169,12 @@ async def test_a_viewer_cannot_post_and_nothing_is_queued(
     await seed_accounts(store)
     act_as_assistant()
     kb = await start_session(client, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
 
     install_identity(make_test_identity(api_key_id=None, role="viewer"))
     refused = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="let me in",
     )
 
@@ -175,13 +192,12 @@ async def test_a_key_cannot_post_through_a_canvas(
     await seed_accounts(store)
     act_as_assistant()
     kb = await start_session(client, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
 
     act_as_user_agent("writer")
     refused = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="as a key",
     )
 
@@ -198,7 +214,7 @@ async def test_the_poster_is_the_identity_and_the_body_cannot_name_one(
     await seed_accounts(store)
     act_as_assistant()
     kb = await start_session(client, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     browser()
 
     forged = await client.post(
@@ -206,7 +222,6 @@ async def test_the_poster_is_the_identity_and_the_body_cannot_name_one(
         json={
             "workspace_id": str(workspace_id),
             "text": "hi",
-            "chat_instance_id": str(chat_id),
             "source": "ceo@example.com",
         },
         headers={"Idempotency-Key": str(uuid.uuid4())},
@@ -214,7 +229,6 @@ async def test_the_poster_is_the_identity_and_the_body_cannot_name_one(
     honest = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="hi",
     )
 
@@ -233,20 +247,18 @@ async def test_a_retry_under_one_key_queues_the_line_once(
     await seed_accounts(store)
     act_as_assistant()
     kb = await start_session(client, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     key = uuid.uuid4()
 
     first = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="once",
         key=key,
     )
     retry = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="once",
         key=key,
     )
@@ -265,19 +277,17 @@ async def test_a_key_reused_for_another_line_is_refused_and_queues_nothing(
     await seed_accounts(store)
     act_as_assistant()
     kb = await start_session(client, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     key = uuid.uuid4()
     first = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="first",
         key=key,
     )
     other = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="a different line",
         key=key,
     )
@@ -293,12 +303,11 @@ async def test_a_post_with_no_assistant_running_is_refused(
 ) -> None:
     client, store = pglite_route_client
     await seed_accounts(store)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
 
     refused = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="anyone there",
     )
 
@@ -315,12 +324,11 @@ async def test_a_second_writer_posts_into_the_first_ones_open_chat(
     await seed_accounts(store)
     act_as_assistant()
     kb = await start_session(client, actor=KB_ACTOR)
-    first_canvas, first_chat = await _canvas(client)
+    first_canvas = await _canvas(client)
     started = conversation_of(
         await send_chat(
             client,
             workspace_id=first_canvas,
-            chat_id=first_chat,
             text="hello from ada",
         ),
     )
@@ -330,19 +338,19 @@ async def test_a_second_writer_posts_into_the_first_ones_open_chat(
     ]
 
     browser(OTHER_USER_ID, email=OTHER_EMAIL)
-    second_canvas, second_chat = await _canvas(client, other=True)
+    second_canvas = await _canvas(client, other=True)
     joined = await send_chat(
         client,
         workspace_id=second_canvas,
-        chat_id=second_chat,
         text="and from grace",
         conversation_id=started,
     )
 
     assert joined.status_code == 200
-    assert from_plain(loads(joined.content), dict[str, object]) == {
+    assert json_loads(joined.content, dict[str, object]) == {
         "conversation_id": str(started),
         "session_id": str(chat),
+        "workspace_id": str(second_canvas),
     }
     assert await _drained(client, session_id=kb) == []
     [heard] = await _drained(client, session_id=chat)
@@ -361,9 +369,9 @@ async def test_a_chat_the_assistant_closed_is_reopened_through_its_service_sessi
     client, store = pglite_route_client
     await seed_accounts(store)
     kb = await seed_session(store, ASSISTANT, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     started = conversation_of(
-        await send_chat(client, workspace_id=workspace_id, chat_id=chat_id, text="a"),
+        await send_chat(client, workspace_id=workspace_id, text="a"),
     )
     chat = await seed_science_chat(store, conversation_id=started)
     act_as_assistant("writer")
@@ -375,13 +383,12 @@ async def test_a_chat_the_assistant_closed_is_reopened_through_its_service_sessi
     again = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="b",
         conversation_id=started,
     )
 
     assert again.status_code == 200
-    assert from_plain(loads(again.content), dict[str, object])["session_id"] is None
+    assert json_loads(again.content, dict[str, object])["session_id"] is None
     [heard] = await _drained(client, session_id=kb)
     assert heard["text"] == "b"
     context = from_plain(heard["context"], dict[str, object])
@@ -397,9 +404,9 @@ async def test_lines_still_queued_when_a_chat_is_closed_go_to_the_assistants_ser
     client, store = pglite_route_client
     await seed_accounts(store)
     kb = await seed_session(store, ASSISTANT, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     started = conversation_of(
-        await send_chat(client, workspace_id=workspace_id, chat_id=chat_id, text="a"),
+        await send_chat(client, workspace_id=workspace_id, text="a"),
     )
     chat = await seed_science_chat(store, conversation_id=started)
     await _drained(client, session_id=kb)
@@ -407,11 +414,10 @@ async def test_lines_still_queued_when_a_chat_is_closed_go_to_the_assistants_ser
     joined = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="b",
         conversation_id=started,
     )
-    assert from_plain(loads(joined.content), dict[str, object])["session_id"] == str(
+    assert json_loads(joined.content, dict[str, object])["session_id"] == str(
         chat,
     )
 
@@ -432,14 +438,13 @@ async def test_a_foreign_canvas_is_not_found(pglite_route_client: _Client) -> No
     await seed_accounts(store)
     act_as_assistant()
     await start_session(client, actor=KB_ACTOR)
-    _, chat_id = await _canvas(client)
-    foreign, _ = await _canvas(client, other=True)
+    _ = await _canvas(client)
+    foreign = await _canvas(client, other=True)
 
     browser()
     refused = await send_chat(
         client,
         workspace_id=foreign,
-        chat_id=chat_id,
         text="in your canvas",
     )
 
@@ -468,14 +473,14 @@ async def test_a_conversation_is_found_by_its_id_once_the_assistant_opened_it(
             role="viewer",
         ),
     )
-    found = from_plain(loads((await client.get(path)).content), dict[str, object])
+    found = json_loads((await client.get(path)).content, dict[str, object])
     assert found["session_id"] == str(chat)
     assert (found["account"], found["live"]) == (TEST_USER_EMAIL, True)
 
     act_as_assistant("writer")
     await client.post(f"/api/sessions/{chat}/end", json={"status": "completed"})
     browser()
-    closed = from_plain(loads((await client.get(path)).content), dict[str, object])
+    closed = json_loads((await client.get(path)).content, dict[str, object])
     assert closed["live"] is False
 
 
@@ -502,56 +507,6 @@ async def test_a_session_that_only_carries_the_id_is_not_the_conversation(
     browser()
 
     assert (await client.get(f"/api/chats/{conversation}")).status_code == 404
-    listed = await client.get("/api/chats")
-    assert from_plain(loads(listed.content), list[object]) == []
-
-
-@pytest.mark.db_pglite
-@pytest.mark.asyncio(loop_scope="session")
-async def test_the_history_is_the_chats_i_started_or_posted_in(
-    pglite_route_client: _Client,
-) -> None:
-    client, store = pglite_route_client
-    await seed_accounts(store)
-    mine, joined, theirs = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    mine_session = await open_science_chat(client, store, conversation_id=mine)
-    joined_session = await open_science_chat(
-        client,
-        store,
-        conversation_id=joined,
-        account=OTHER_EMAIL,
-        posters=(TEST_USER_EMAIL,),
-    )
-    await open_science_chat(
-        client,
-        store,
-        conversation_id=theirs,
-        account=OTHER_EMAIL,
-    )
-    act_as_assistant("writer")
-    other = await start_session(client, actor="not-a-chat")
-    assert other
-
-    browser()
-    mine_list = from_plain(
-        loads((await client.get("/api/chats")).content),
-        list[dict[str, object]],
-    )
-    assert {each["conversation_id"] for each in mine_list} == {str(mine), str(joined)}
-    by_id = {each["conversation_id"]: each for each in mine_list}
-    assert by_id[str(mine)]["session_id"] == str(mine_session)
-    assert by_id[str(joined)]["session_id"] == str(joined_session)
-    assert by_id[str(joined)]["account"] == OTHER_EMAIL
-
-    browser(OTHER_USER_ID, email=OTHER_EMAIL)
-    others_list = from_plain(
-        loads((await client.get("/api/chats")).content),
-        list[dict[str, object]],
-    )
-    assert {each["conversation_id"] for each in others_list} == {
-        str(joined),
-        str(theirs),
-    }
 
 
 @pytest.mark.db_pglite
@@ -597,18 +552,11 @@ async def test_a_rotated_assistant_key_leaves_one_chat_read_from_its_newest_sess
     browser()
 
     assert reopened != old
-    head = from_plain(
-        loads((await client.get(f"/api/chats/{conversation}")).content),
+    head = json_loads(
+        (await client.get(f"/api/chats/{conversation}")).content,
         dict[str, object],
     )
     assert (head["session_id"], head["live"]) == (str(reopened), True)
-    listed = from_plain(
-        loads((await client.get("/api/chats")).content),
-        list[dict[str, object]],
-    )
-    assert [(each["conversation_id"], each["session_id"]) for each in listed] == [
-        (str(conversation), str(reopened)),
-    ]
 
 
 @pytest.mark.db_pglite
@@ -632,8 +580,8 @@ async def test_the_listing_a_restart_reads_selects_the_assistants_own_recent_cha
             squatter,
         )
     act_as_assistant("writer")
-    profile = from_plain(
-        loads((await client.get("/api/me/profile")).content),
+    profile = json_loads(
+        (await client.get("/api/me/profile")).content,
         dict[str, object],
     )
     key = from_plain(profile["api_key_id"], str)
@@ -662,7 +610,7 @@ async def test_the_listing_a_restart_reads_selects_the_assistants_own_recent_cha
         assert found.status_code == 200, found.text
         return [
             from_plain(row["id"], str)
-            for row in from_plain(loads(found.content), list[dict[str, object]])
+            for row in json_loads(found.content, list[dict[str, object]])
         ]
 
     assert await listed(datetime.now(UTC) - timedelta(days=7)) == [str(own)]
@@ -682,24 +630,146 @@ async def test_without_an_assistant_there_are_no_chats(
     monkeypatch.setattr(app.state, "config", None, raising=False)
     browser()
 
-    assert (
-        from_plain(loads((await client.get("/api/chats")).content), list[object]) == []
-    )
     assert (await client.get(f"/api/chats/{conversation}")).status_code == 404
 
 
-def test_no_route_deletes_or_edits_a_chat() -> None:
-    """Science chat is public and permanent: the routes only read and post."""
+def test_no_route_edits_a_chat_but_posting_sharing_and_deleting_it_whole() -> None:
+    """A chat's lines are its posters': no route rewrites one."""
     chat_routes = [
         (path, methods)
         for path, methods in iter_routes(app)
         if path.startswith("/api/chats")
     ]
     assert sorted((path, sorted(methods)) for path, methods in chat_routes) == [
-        ("/api/chats", ["GET"]),
         ("/api/chats", ["POST"]),
+        ("/api/chats/{conversation_id}", ["DELETE"]),
         ("/api/chats/{conversation_id}", ["GET"]),
+        ("/api/chats/{conversation_id}/shares/{email}", ["DELETE"]),
+        ("/api/chats/{conversation_id}/shares/{email}", ["PUT"]),
     ]
+
+
+class TestShareAndDeleteAnswers:
+    """What the share and delete routes answer, with the store beneath them faked."""
+
+    def test_a_refused_line_answers_a_code_the_web_acts_on(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client, _store, _engine = route_client
+        install_identity(make_test_identity(api_key_id=None))
+        monkeypatch.setattr(science_chat_routes, "send_chat_line", _refuse_the_line)
+
+        refused = [
+            client.post(
+                "/api/chats",
+                json={"workspace_id": str(uuid.uuid4()), "text": text},
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
+            for text in ("may I?", "again?")
+        ]
+
+        assert [(r.status_code, json_loads(r.content)) for r in refused] == [
+            (403, {"detail": {"code": "chat_not_shared", "message": "not yours"}}),
+            (410, {"detail": {"code": "chat_deleted", "message": "deleted"}}),
+        ]
+
+    def test_a_share_answers_the_list_and_a_refusal_its_code(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client, _store, _engine = route_client
+        install_identity(make_test_identity(api_key_id=None))
+        monkeypatch.setattr(science_chat_routes, "set_share", _set_share_as_told)
+        chat = uuid.uuid4()
+
+        answers = [
+            client.put(f"/api/chats/{chat}/shares/Ada@Example.com"),
+            client.delete(f"/api/chats/{chat}/shares/ada@example.com"),
+            client.put(f"/api/chats/{chat}/shares/{_REFUSED}"),
+            client.delete(f"/api/chats/{chat}/shares/{_UNKNOWN}"),
+            client.put(f"/api/chats/{chat}/shares/{_NOT_STAFF}"),
+            client.put(f"/api/chats/{chat}/shares/not-an-email"),
+        ]
+
+        assert [r.status_code for r in answers] == [200, 200, 403, 404, 409, 422]
+        assert [json_loads(r.content) for r in answers[:5]] == [
+            [f"Ada@Example.com shared in {chat}"],
+            [f"ada@example.com unshared in {chat}"],
+            {"detail": {"code": "chat_not_starter"}},
+            {"detail": "Conversation not found"},
+            {"detail": {"code": "chat_staff_only"}},
+        ]
+
+    def test_a_delete_answers_204_and_tells_each_station_it_unbound(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client, _store, _engine = route_client
+        install_identity(make_test_identity(api_key_id=None))
+        hub = ChatHub()
+        locked: list[list[uuid.UUID]] = []
+        monkeypatch.setattr(app.state, "hub", hub, raising=False)
+        monkeypatch.setattr(science_chat_routes, "read_conversation", _one_session)
+        monkeypatch.setattr(
+            science_chat_routes,
+            "require_unlocked",
+            partial(_record_lock, locked),
+        )
+        monkeypatch.setattr(science_chat_routes, "delete_chat", _delete_as_told)
+        monkeypatch.setattr(science_chat_routes, "read_workspace", _station_state)
+
+        with hub.subscribe(_STATION) as tab:
+            deleted = client.delete(f"/api/chats/{_DELETED}")
+            frame = tab.queue.get_nowait()
+        refused = client.delete(f"/api/chats/{uuid.uuid4()}")
+        unknown = client.delete(f"/api/chats/{_UNKNOWN_CHAT}")
+
+        assert (deleted.status_code, deleted.content) == (204, b"")
+        assert isinstance(frame, WorkspaceFrame)
+        assert (frame.state.id, frame.state.revision) == (_STATION, 7)
+        assert refused.status_code == 403
+        assert json_loads(refused.content) == {
+            "detail": {"code": "chat_has_other_posters"},
+        }
+        assert (unknown.status_code, json_loads(unknown.content)) == (
+            404,
+            {"detail": "Conversation not found"},
+        )
+        assert locked == [[_SESSION]] * 3
+
+    def test_an_agents_key_shares_nothing_and_deletes_only_what_it_opened(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client, _store, _engine = route_client
+        monkeypatch.setattr(science_chat_routes, "set_share", _set_share_as_told)
+        monkeypatch.setattr(science_chat_routes, "delete_chat", _delete_as_told)
+        monkeypatch.setattr(science_chat_routes, "read_workspace", _station_state)
+        monkeypatch.setattr(
+            science_chat_routes,
+            "require_unlocked",
+            partial(_record_lock, []),
+        )
+
+        monkeypatch.setattr(science_chat_routes, "read_conversation", _one_session)
+        share = client.put(f"/api/chats/{_DELETED}/shares/ada@example.com")
+        foreign = client.delete(f"/api/chats/{_DELETED}")
+        monkeypatch.setattr(
+            science_chat_routes,
+            "read_conversation",
+            partial(_one_session, opened=True),
+        )
+        opened = client.delete(f"/api/chats/{_DELETED}")
+
+        assert [(r.status_code, json_loads(r.content)) for r in (share, foreign)] == [
+            (403, {"detail": "Browser session required"}),
+        ] * 2
+        assert opened.status_code == 204
 
 
 class _Stream:
@@ -722,12 +792,23 @@ class _Stream:
 
     async def has_frame(self, kind: str, *, id: str) -> bool:
         """Read frames until a ``kind`` frame for ``id`` arrives; False after 5 s."""
+        return bool(await self.ids_until(kind, id=id))
+
+    async def ids_until(self, kind: str, *, id: str) -> list[object]:
+        """Read ``kind`` frames until one for ``id`` arrives; return their ids.
+
+        The frames come in the order of the changes, so an id not returned did not
+        precede ``id``. The list is empty when none for ``id`` arrives in 5 s.
+        """
         deadline = asyncio.get_running_loop().time() + 5.0
+        ids: list[object] = []
         while (left := deadline - asyncio.get_running_loop().time()) > 0:
             frame = await self._frame(timeout_sec=left)
-            if frame is not None and (frame["type"], frame.get("id")) == (kind, id):
-                return True
-        return False
+            if frame is not None and frame["type"] == kind:
+                ids.append(frame.get("id"))
+                if ids[-1] == id:
+                    return ids
+        return []
 
     async def _frame(self, *, timeout_sec: float) -> dict[str, object] | None:
         """Return the next data frame, or None when none arrives in time."""
@@ -741,10 +822,7 @@ class _Stream:
             self._next = None
             text = chunk if isinstance(chunk, str) else bytes(chunk).decode()
             if text.startswith("data: "):
-                return from_plain(
-                    loads(text.removeprefix("data: ")),
-                    dict[str, object],
-                )
+                return json_loads(text.removeprefix("data: "), dict[str, object])
 
     async def close(self) -> None:
         """Stop reading."""
@@ -758,13 +836,17 @@ async def _opened_stream(
     *,
     user_id: uuid.UUID,
     email: str,
+    audiences: frozenset[str] = frozenset({"open"}),
 ) -> _Stream:
-    """Open a user's events route and read past its opening frames."""
+    """Open a user's events route, as a reader of ``audiences``, past its opening frames."""
     request = Request({"type": "http", "app": app, "headers": [], "method": "GET"})
     response = await workspace_routes.workspace_events_route(
         workspace_id,
         request,
-        make_test_identity(user_id=user_id, api_key_id=None, email=email),
+        replace(
+            make_test_identity(user_id=user_id, api_key_id=None, email=email),
+            read_audiences=audiences,
+        ),
     )
     stream = _Stream(aiter(response.body_iterator))
     await stream.opened()
@@ -779,8 +861,8 @@ async def test_a_record_appended_to_a_chat_reaches_every_viewers_stream(
     """The change is the session's id, on the stream of each user's canvas."""
     client, store = pglite_route_client
     await seed_accounts(store)
-    first_canvas, _ = await _canvas(client)
-    second_canvas, _ = await _canvas(client, other=True)
+    first_canvas = await _canvas(client)
+    second_canvas = await _canvas(client, other=True)
     chat = await seed_science_chat(store, conversation_id=uuid.uuid4())
     first = await _opened_stream(
         first_canvas,
@@ -808,6 +890,60 @@ async def test_a_record_appended_to_a_chat_reaches_every_viewers_stream(
     for stream in (first, second):
         assert await stream.has_frame("changed", id=str(chat))
         await stream.close()
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+async def test_a_record_appended_to_a_staff_chat_reaches_only_a_viewer_who_reads_staff(
+    pglite_route_client: _Client,
+) -> None:
+    """A viewer of open hears of the open chat's line, and of nothing the staff chat got."""
+    client, store = pglite_route_client
+    await seed_accounts(store)
+    first_canvas = await _canvas(client)
+    second_canvas = await _canvas(client, other=True)
+    staff_chat = await seed_science_chat(store, conversation_id=uuid.uuid4())
+    open_chat = await seed_science_chat(store, conversation_id=uuid.uuid4())
+    async with store.engine.acquire() as conn:
+        await conn.execute(
+            "UPDATE inquiries SET agentsession_audience = 'staff' WHERE id = $1",
+            staff_chat,
+        )
+    staff_reader = await _opened_stream(
+        first_canvas,
+        user_id=TEST_USER_ID,
+        email=TEST_USER_EMAIL,
+        audiences=frozenset({"open", "staff"}),
+    )
+    open_reader = await _opened_stream(
+        second_canvas,
+        user_id=OTHER_USER_ID,
+        email=OTHER_EMAIL,
+    )
+
+    # The open chat's line comes last, so a ping for the staff chat that reached the
+    # open reader would be among the frames that arrive before the open chat's own.
+    act_as_assistant("writer")
+    for chat in (staff_chat, open_chat):
+        appended = await client.post(
+            f"/api/sessions/{chat}/records",
+            json=_append(
+                AgentToAgentMessage(
+                    sender=OTHER_EMAIL,
+                    content="a line",
+                    timestamp=datetime.now(UTC).isoformat(),
+                ),
+            ),
+        )
+        assert appended.status_code == 200, appended.text
+
+    staff_heard = await staff_reader.ids_until("changed", id=str(open_chat))
+    open_heard = await open_reader.ids_until("changed", id=str(open_chat))
+    for stream in (staff_reader, open_reader):
+        await stream.close()
+
+    assert str(staff_chat) in staff_heard
+    assert open_heard == [str(open_chat)]
 
 
 async def _seed_screen_records(store: Store) -> tuple[uuid.UUID, uuid.UUID]:
@@ -838,7 +974,7 @@ async def test_a_line_carries_the_records_of_the_page_trail_and_visuals(
     kb = await start_session(client, actor=KB_ACTOR)
     experiment_id, issue_id = await _seed_screen_records(store)
     missing = uuid.uuid4()
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     shown = await client.post(
         f"/api/workspaces/{workspace_id}/operations",
         json={
@@ -863,7 +999,6 @@ async def test_a_line_carries_the_records_of_the_page_trail_and_visuals(
     sent = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="what about this experiment in context?",
         screen={"page": "#/ref/Experiment/987654", "trail": trail},
     )
@@ -893,7 +1028,7 @@ async def test_a_line_carries_the_records_of_the_page_trail_and_visuals(
         ).get("record")
         for item in from_plain(context["visible_visuals"], list[object])
     }
-    assert (visuals["trax.chat"], visuals["trax.subgraph"]) == (None, experiment)
+    assert (visuals["trax.browse"], visuals["trax.subgraph"]) == (None, experiment)
 
 
 @pytest.mark.db_pglite
@@ -915,12 +1050,11 @@ async def test_a_line_with_a_bad_route_or_a_long_trail_is_refused(
     await seed_accounts(store)
     act_as_assistant()
     kb = await start_session(client, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
 
     refused = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="hi",
         screen=screen,
     )
@@ -940,7 +1074,7 @@ async def _state(
 ) -> dict[str, object]:
     response = await client.get(f"/api/workspaces/{workspace_id}")
     assert response.status_code == 200
-    return from_plain(loads(response.content), dict[str, object])
+    return json_loads(response.content, dict[str, object])
 
 
 async def _choose(
@@ -968,8 +1102,8 @@ async def _drained_by_helper(
     """Drain a session as the owner's own key, which opened it; return its messages."""
     act_as_user_agent()
     return from_plain(
-        from_plain(
-            loads((await drain(client, session_id=session_id)).content),
+        json_loads(
+            (await drain(client, session_id=session_id)).content,
             dict[str, object],
         )["messages"],
         list[dict[str, object]],
@@ -986,7 +1120,7 @@ async def test_a_local_choice_makes_the_owners_helper_the_partner(
     await seed_accounts(store)
     scout = await seed_session(store, ASSISTANT, actor=KB_ACTOR)
     helper = await seed_session(store, USER_AGENT, actor="helper", cli=CHAT_HELPER_CLI)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     shared = await _state(client, workspace_id=workspace_id)
     assert shared["partner_choice"] == "shared"
     assert _partner(shared)["session_id"] == str(scout)
@@ -994,7 +1128,7 @@ async def test_a_local_choice_makes_the_owners_helper_the_partner(
 
     chosen = await _choose(client, workspace_id=workspace_id, choice="local")
     assert chosen.status_code == 200
-    assert _partner(from_plain(loads(chosen.content), dict[str, object])) == {
+    assert _partner(json_loads(chosen.content, dict[str, object])) == {
         "session_id": str(helper),
         "actor": "helper",
         "cli": CHAT_HELPER_CLI,
@@ -1008,10 +1142,9 @@ async def test_a_local_choice_makes_the_owners_helper_the_partner(
     sent = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="hello",
     )
-    assert from_plain(loads(sent.content), dict[str, object])["session_id"] is None
+    assert json_loads(sent.content, dict[str, object])["session_id"] is None
     [heard] = await _drained_by_helper(client, session_id=helper)
     assert (heard["text"], heard["source"]) == ("hello", TEST_USER_EMAIL)
     assert await _drained(client, session_id=scout) == []
@@ -1027,11 +1160,21 @@ async def test_a_chat_the_helper_opened_is_read_through_the_owners_key_and_not_t
     await seed_accounts(store)
     await seed_session(store, ASSISTANT, actor=KB_ACTOR)
     helper = await seed_session(store, USER_AGENT, actor="helper", cli=CHAT_HELPER_CLI)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     assert (
         await _choose(client, workspace_id=workspace_id, choice="local")
     ).status_code == 200
     conversation = uuid.uuid4()
+    first = await send_chat(
+        client,
+        workspace_id=workspace_id,
+        text="first",
+        conversation_id=conversation,
+    )
+    assert first.status_code == 200
+    assert [m["text"] for m in await _drained_by_helper(client, session_id=helper)] == [
+        "first",
+    ]
 
     # The helper opens the chat; the owner's key now passes, the assistant's does not.
     chat = await seed_helper_chat(store, conversation_id=conversation)
@@ -1041,25 +1184,18 @@ async def test_a_chat_the_helper_opened_is_read_through_the_owners_key_and_not_t
     assert (await client.get(f"/api/workspaces/{workspace_id}")).status_code == 404
 
     # Its next line still goes to the helper's service session, which is what the
-    # helper drains; its history finds the chat.
+    # helper drains; the link finds the chat.
     browser()
     joined = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="and then?",
         conversation_id=conversation,
     )
-    assert from_plain(loads(joined.content), dict[str, object])["session_id"] is None
+    assert json_loads(joined.content, dict[str, object])["session_id"] is None
     [again] = await _drained_by_helper(client, session_id=helper)
     assert again["text"] == "and then?"
     assert await _drained_by_owner(client, session_id=chat) == []
-    listed = from_plain(loads((await client.get("/api/chats")).content), list[object])
-    assert [
-        from_plain(each, dict[str, object])["conversation_id"] for each in listed
-    ] == [
-        str(conversation),
-    ]
     head = await client.get(f"/api/chats/{conversation}")
     assert head.status_code == 200
 
@@ -1096,7 +1232,10 @@ async def start_unpolled(
     )
     assert started.status_code == 201, started.text
     return uuid.UUID(
-        from_plain(from_plain(loads(started.content), dict[str, object])["id"], str),
+        from_plain(
+            json_loads(started.content, dict[str, object])["id"],
+            str,
+        ),
     )
 
 
@@ -1170,7 +1309,7 @@ async def _drained_by_owner(
     response = await drain(client, session_id=session_id)
     assert response.status_code == 200
     return from_plain(
-        from_plain(loads(response.content), dict[str, object])["messages"],
+        json_loads(response.content, dict[str, object])["messages"],
         list[dict[str, object]],
     )
 
@@ -1188,12 +1327,12 @@ async def test_another_writer_cannot_poll_a_helper_chat_to_divert_the_owners_lin
     client, store = pglite_route_client
     await seed_accounts(store)
     helper = await seed_session(store, USER_AGENT, actor="helper", cli=CHAT_HELPER_CLI)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     assert (
         await _choose(client, workspace_id=workspace_id, choice="local")
     ).status_code == 200
     conversation = conversation_of(
-        await send_chat(client, workspace_id=workspace_id, chat_id=chat_id, text="1"),
+        await send_chat(client, workspace_id=workspace_id, text="1"),
     )
     chat = await seed_helper_chat(store, conversation_id=conversation)
     assert [m["text"] for m in await _drained_by_owner(client, session_id=helper)] == [
@@ -1208,12 +1347,11 @@ async def test_another_writer_cannot_poll_a_helper_chat_to_divert_the_owners_lin
     second = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="2",
         conversation_id=conversation,
     )
 
-    assert from_plain(loads(second.content), dict[str, object])["session_id"] is None
+    assert json_loads(second.content, dict[str, object])["session_id"] is None
     act_as_other_agent("writer")
     assert (await drain(client, session_id=chat)).status_code == 403
     assert [m["text"] for m in await _drained_by_owner(client, session_id=helper)] == [
@@ -1235,9 +1373,9 @@ async def test_a_local_canvas_cannot_post_into_a_chat_the_assistant_holds(
     await seed_accounts(store)
     _ = await seed_session(store, ASSISTANT, actor=KB_ACTOR)
     helper = await seed_session(store, USER_AGENT, actor="helper", cli=CHAT_HELPER_CLI)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     started = conversation_of(
-        await send_chat(client, workspace_id=workspace_id, chat_id=chat_id, text="a"),
+        await send_chat(client, workspace_id=workspace_id, text="a"),
     )
     _ = await seed_science_chat(store, conversation_id=started)
     browser()
@@ -1248,7 +1386,6 @@ async def test_a_local_canvas_cannot_post_into_a_chat_the_assistant_holds(
     refused = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="b",
         conversation_id=started,
     )
@@ -1256,12 +1393,14 @@ async def test_a_local_canvas_cannot_post_into_a_chat_the_assistant_holds(
     assert refused.status_code == 409
     assert "shared assistant" in refused.text
     assert await _drained_by_owner(client, session_id=helper) == []
-    # A conversation of its own is still the helper's.
-    browser()
+    # A station of its own, with a conversation of its own, is still the helper's.
+    fresh_id = await open_workspace(client, new=True)
+    assert (
+        await _choose(client, workspace_id=fresh_id, choice="local")
+    ).status_code == 200
     fresh = await send_chat(
         client,
-        workspace_id=workspace_id,
-        chat_id=chat_id,
+        workspace_id=fresh_id,
         text="c",
     )
     assert fresh.status_code == 200
@@ -1280,11 +1419,11 @@ async def test_a_local_choice_with_no_helper_running_refuses_a_post(
     await seed_accounts(store)
     act_as_assistant()
     kb = await start_session(client, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
 
     chosen = await _choose(client, workspace_id=workspace_id, choice="local")
     assert chosen.status_code == 200
-    assert _partner(from_plain(loads(chosen.content), dict[str, object])) == {
+    assert _partner(json_loads(chosen.content, dict[str, object])) == {
         "session_id": None,
         "actor": None,
         "cli": None,
@@ -1294,7 +1433,6 @@ async def test_a_local_choice_with_no_helper_running_refuses_a_post(
     refused = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="anyone?",
     )
     assert refused.status_code == 409
@@ -1317,7 +1455,7 @@ async def test_another_users_helper_never_becomes_this_owners_partner(
         actor="helper",
         cli=CHAT_HELPER_CLI,
     )
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     await _choose(client, workspace_id=workspace_id, choice="local")
     state = await _state(client, workspace_id=workspace_id)
     assert state["partner_choice"] == "local"
@@ -1328,13 +1466,12 @@ async def test_another_users_helper_never_becomes_this_owners_partner(
     refused = await send_chat(
         client,
         workspace_id=workspace_id,
-        chat_id=chat_id,
         text="hello",
     )
     assert refused.status_code == 409
     act_as_other_agent()
     drained = await drain(client, session_id=foreign)
-    assert from_plain(loads(drained.content), dict[str, object])["messages"] == []
+    assert json_loads(drained.content, dict[str, object])["messages"] == []
     assert await _drained(client, session_id=scout) == []
 
 
@@ -1347,9 +1484,9 @@ async def test_a_shared_canvas_still_refuses_its_owners_own_key(
     client, store = pglite_route_client
     await seed_accounts(store)
     await seed_session(store, ASSISTANT, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     started = conversation_of(
-        await send_chat(client, workspace_id=workspace_id, chat_id=chat_id, text="a"),
+        await send_chat(client, workspace_id=workspace_id, text="a"),
     )
     _ = await seed_science_chat(store, conversation_id=started)
     act_as_user_agent()
@@ -1372,9 +1509,9 @@ async def test_only_the_owners_browser_chooses_the_partner(
     client, store = pglite_route_client
     await seed_accounts(store)
     await seed_session(store, ASSISTANT, actor=KB_ACTOR)
-    workspace_id, chat_id = await _canvas(client)
+    workspace_id = await _canvas(client)
     started = conversation_of(
-        await send_chat(client, workspace_id=workspace_id, chat_id=chat_id, text="a"),
+        await send_chat(client, workspace_id=workspace_id, text="a"),
     )
     _ = await seed_science_chat(store, conversation_id=started)
     act_as_assistant()
@@ -1386,6 +1523,125 @@ async def test_only_the_owners_browser_chooses_the_partner(
     assert (await _state(client, workspace_id=workspace_id))[
         "partner_choice"
     ] == "shared"
+
+
+_REFUSED: Final = "no@example.com"
+_UNKNOWN: Final = "gone@example.com"
+_NOT_STAFF: Final = "bob@example.com"
+_DELETED: Final = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000001")
+_UNKNOWN_CHAT: Final = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000002")
+_STATION: Final = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000003")
+_SESSION: Final = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000004")
+_OWNER: Final = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000005")
+
+
+async def _refuse_the_line(
+    engine: object,
+    *,
+    body: ChatSend,
+    **line: object,
+) -> ChatSent:
+    """Refuse a line as an unshared chat does, or one asking again as a deleted one."""
+    del engine, line
+    if body.text == "again?":
+        raise ChatDeletedError("deleted")
+    raise ForeignChatError("not yours")
+
+
+async def _set_share_as_told(
+    engine: object,
+    *,
+    assistant: object,
+    caller: AuthIdentity,
+    conversation_id: uuid.UUID,
+    email: str,
+    shared: bool,
+    staff: Sequence[str],
+) -> list[str] | None:
+    """Share or unshare as the email says: refuse two, find no chat for another."""
+    _check_served(engine, assistant=assistant, caller=caller)
+    assert staff == ()
+    if email == _REFUSED:
+        raise ChatRefusedError("chat_not_starter")
+    if email == _NOT_STAFF:
+        raise ChatClosedError("chat_staff_only")
+    done = "shared" if shared else "unshared"
+    return None if email == _UNKNOWN else [f"{email} {done} in {conversation_id}"]
+
+
+async def _one_session(
+    conn: object,
+    *,
+    assistant: object,
+    caller: AuthIdentity,
+    conversation_id: uuid.UUID,
+    opened: bool = False,
+) -> SimpleNamespace:
+    """Find a chat of one session, whatever is asked."""
+    del conversation_id
+    _check_served(conn, assistant=assistant, caller=caller)
+    return SimpleNamespace(sessions=[_SESSION], opened=opened)
+
+
+async def _record_lock(
+    locked: list[list[uuid.UUID]],
+    request: object,
+    identity: AuthIdentity,
+    row_ids: list[uuid.UUID],
+    *,
+    include_peers: bool,
+) -> None:
+    """Note the rows a delete asks to be unlocked, with their peers."""
+    assert request is not None
+    assert include_peers
+    assert identity.email == TEST_USER_EMAIL
+    locked.append(list(row_ids))
+
+
+async def _delete_as_told(
+    store: object,
+    *,
+    assistant: object,
+    caller: AuthIdentity,
+    conversation_id: uuid.UUID,
+    inbound: object,
+) -> list[UnboundStation] | None:
+    """Delete one chat, find no other, and refuse the rest."""
+    _check_served(store, assistant=assistant, caller=caller)
+    assert isinstance(inbound, InboundQueue)
+    if conversation_id == _UNKNOWN_CHAT:
+        return None
+    if conversation_id != _DELETED:
+        raise ChatRefusedError("chat_has_other_posters")
+    return [UnboundStation(workspace_id=_STATION, user_id=_OWNER)]
+
+
+async def _station_state(
+    engine: object,
+    *,
+    user_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    inbound: object,
+    assistant: object,
+) -> WorkspaceState:
+    """Read a station, for its owner, as it stands after its chat was deleted."""
+    assert engine is not None
+    assert isinstance(inbound, InboundQueue)
+    assert (user_id, assistant) == (_OWNER, ASSISTANT_CONFIG.assistant)
+    return WorkspaceState(
+        id=workspace_id,
+        revision=7,
+        name="unnamed-workstream#1",
+        conversation_id=None,
+        page=None,
+        visuals=[],
+    )
+
+
+def _check_served(source: object, *, assistant: object, caller: AuthIdentity) -> None:
+    """Fail unless a fake got the database, the configured assistant and the caller."""
+    assert source is not None
+    assert (assistant, caller.email) == (ASSISTANT_CONFIG.assistant, TEST_USER_EMAIL)
 
 
 def _append(record: AgentToAgentMessage) -> dict[str, object]:
@@ -1408,6 +1664,6 @@ def _append(record: AgentToAgentMessage) -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

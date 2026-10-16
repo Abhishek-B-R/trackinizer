@@ -58,12 +58,14 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from treekle import from_plain
+from treekle.absent import ABSENT
 
-from trackinizer.lib.absent import ABSENT
-from trackinizer.lib.codec import from_plain
-from trackinizer.server.api._deps import get_store, tag_row
+from trackinizer.server.api._deps import get_assistant, get_store, tag_row
 from trackinizer.server.api._regex_guard import regex_failures_as_400
 from trackinizer.server.api._routes_shared import parse_fields
+from trackinizer.server.api.session_access import session_reader
+from trackinizer.server.audience import TranscriptPings
 from trackinizer.server.auth import (
     AuthIdentity,
     current_user,
@@ -75,7 +77,11 @@ from trackinizer.server.notify import iter_sse_events, tx
 from trackinizer.server.regex_timeout import apply_regex_statement_timeout
 from trackinizer.server.semantic_mapper_footprint import FootprintMapper
 from trackinizer.server.store.graph_focus import read_neighbourhood
-from trackinizer.server.store.session_feed import WHOLE_FEED, FeedScope
+from trackinizer.server.store.session_feed import (
+    WHOLE_FEED,
+    FeedScope,
+    StationAgents,
+)
 from trackinizer.server.store.session_search import (
     SessionSearchHit,
     search_session_records,
@@ -90,6 +96,7 @@ from trackinizer.wire.wire_sessions import (
     FeedFacetsResponse,
     FeedHistogramResponse,
     FeedResponse,
+    FeedWhose,
 )
 
 
@@ -220,6 +227,8 @@ async def web_search_sessions(
     limit: int = 20,
     model: str = "",
     dim: int | None = None,
+    whose: FeedWhose | None = None,
+    hidden: bool = False,
 ) -> WebView:
     """Hybrid session search: embeddings + scoped tsvector, RRF-merged.
 
@@ -242,14 +251,19 @@ async def web_search_sessions(
         be swept). Unknown names are a 400. Empty uses the process default.
       dim: Optional dim override paired with ``model`` (a Matryoshka model
         accepts any dim in its range); must agree with any ``@dim`` in ``model``.
+      whose: Whose sessions to search, as the feed's ``whose`` says. Unnamed, a
+        person searches their own, as the console opens on them, and the
+        configured assistant every one it reads, since it holds none of the
+        sessions it is asked about.
+      hidden: Search the ``private`` sessions the caller reads too.
 
     Returns:
       body: ``{"hits": [...], "semantic": bool, "degraded": bool}`` -- each hit
         carries ``session_id``/``part``/``idx`` (where the console opens),
-        ``title``, ``field``/``chunk``, ``score``, ``source``, ``snippet``.
+        ``title``, ``field``/``chunk``, ``score``, ``source``, ``snippet``. A session
+        whose transcript the caller does not read has no hit.
 
     """
-    del identity
     if limit < 1 or limit > _SESSION_SEARCH_MAX_LIMIT:
         raise HTTPException(
             status_code=400,
@@ -271,6 +285,12 @@ async def web_search_sessions(
         # skipped; 1 is a valid placeholder the query never reaches.
         dim=embedder.dim if embedder is not None else 1,
         limit=limit,
+        scope=feed_scope(
+            request,
+            identity,
+            whose=whose or _searched_by_default(request, identity),
+            hidden=hidden,
+        ),
     )
     return {
         "hits": [_session_hit_to_dict(hit) for hit in hits],
@@ -508,11 +528,10 @@ async def web_subscribe(
     Forwards every ``NOTIFY_CHANNEL`` payload as ``{"id": "<uuid>"}``
     via :func:`iter_sse_events` -- shared with ``/api/change_log/stream``
     so both routes emit one wire shape. Gated at ``viewer`` like every
-    read route (see the Auth section of ``docs/design.md``). The stream
-    is unfiltered: every subscriber sees every mutated id and the SPA
-    decides what to fetch. Per-subscriber server-side filtering is a
-    future refinement, not a security boundary -- authz already gates
-    who may open the stream at all.
+    read route (see the Auth section of ``docs/design.md``). Every subscriber
+    sees every mutated id and the SPA decides what to fetch, except that a
+    record written to a session's transcript is relayed only to a subscriber
+    who reads that session.
 
     Args:
       request: FastAPI request object for middleware access.
@@ -522,9 +541,17 @@ async def web_subscribe(
       stream: Server-sent events of mutated node ids.
 
     """
-    del identity
     engine = _state(request).engine
-    return StreamingResponse(iter_sse_events(engine), media_type="text/event-stream")
+    return StreamingResponse(
+        iter_sse_events(
+            engine,
+            hears=TranscriptPings(
+                engine=engine,
+                reader=session_reader(request, identity),
+            ).hears,
+        ),
+        media_type="text/event-stream",
+    )
 
 
 _PROBE_MAX_SEC: Final = 600.0
@@ -595,21 +622,39 @@ async def web_subscribe_probe(
 
 
 def feed_scope(
+    request: Request,
+    identity: Annotated[AuthIdentity, Depends(require_role("viewer"))],
+    *,
     actor: Annotated[list[str] | None, Query(max_length=MAX_LIST_LIMIT)] = None,
     room: Annotated[list[str] | None, Query(max_length=MAX_LIST_LIMIT)] = None,
     cli: Annotated[list[str] | None, Query(max_length=MAX_LIST_LIMIT)] = None,
     kind: Annotated[list[str] | None, Query(max_length=MAX_LIST_LIMIT)] = None,
+    station: UUID | None = None,
+    whose: FeedWhose = "everyone",
+    hidden: bool = False,
 ) -> FeedScope:
     """Read the feed's filters: each repeatable, any of its values, all of them.
 
     Args:
+      request: The request, which carries the configuration.
+      identity: Authenticated user, whose station ``station`` must be, and who
+        reads.
       actor: Sessions by routing name.
       room: Sessions by a room they joined.
       cli: Sessions by the CLI they wrap.
       kind: Records by kind.
+      station: Only the agents of this station of the caller: the sessions below
+        its chat's by ``produced_by`` edges, to depth 4 and 500 sessions, never the
+        chat's own. A station that is not the caller's, or holds no chat, keeps
+        nothing.
+      whose: ``mine``, the sessions held under the caller's account; ``campaigns``,
+        those of the campaigns the caller launched; ``everyone``, every session the
+        caller reads.
+      hidden: Keep the ``private`` sessions the caller reads; they are left out
+        otherwise.
 
     Returns:
-      scope: The records the filters keep.
+      scope: The records the filters keep, read as the caller.
 
     """
     return FeedScope(
@@ -617,6 +662,14 @@ def feed_scope(
         rooms=tuple(room or ()),
         clis=tuple(cli or ()),
         kinds=tuple(kind or ()),
+        station=(
+            None
+            if station is None
+            else StationAgents(workspace_id=station, user_id=identity.user_id)
+        ),
+        account=identity.email if whose == "mine" else "",
+        asker=identity.email if whose == "campaigns" else "",
+        reader=session_reader(request, identity, hidden=hidden),
     )
 
 
@@ -630,6 +683,10 @@ async def web_feed(
     after_session: UUID | None = None,
     after_part: int | None = None,
     after_seq: int | None = None,
+    before_created: UtcDatetime | None = None,
+    before_session: UUID | None = None,
+    before_part: int | None = None,
+    before_seq: int | None = None,
     since: UtcDatetime | None = None,
     until: UtcDatetime | None = None,
     conversation: bool = False,
@@ -646,13 +703,18 @@ async def web_feed(
     required; the order key is composite so a bare ``created`` resume would
     skip same-instant ties, and ``part`` joined it when the feed moved to IR
     records -- position restarts within each source file). ``since`` / ``until``
-    bound a fixed historical window; ``actor`` / ``room`` / ``cli`` / ``kind``
-    filter (:func:`feed_scope`), and ``conversation=true`` keeps only what the
-    facets count as conversation. ``tail=true`` returns the
+    bound a fixed historical window; ``actor`` / ``room`` / ``cli`` / ``kind`` /
+    ``whose`` filter and ``hidden`` keeps ``private`` sessions (:func:`feed_scope`),
+    and ``conversation=true`` keeps only what the facets count as conversation.
+    ``tail=true`` returns the
     newest page (the live console's first load) so a backlog does not force a
     replay from the beginning. The response carries ``next_after`` (a composite
     cursor) for the next poll; an empty page echoes the supplied cursor so the
     tail does not rewind.
+
+    ``before_created`` / ``before_session`` / ``before_part`` / ``before_seq``
+    form an exclusive upper cursor in the same order. With ``tail=true`` they
+    read the preceding page without repeating a same-instant boundary.
 
     Args:
       request: FastAPI request object for middleware access.
@@ -662,6 +724,10 @@ async def web_feed(
       after_session: Resume cursor: session id of last-seen turn.
       after_part: Resume cursor: part index within the session.
       after_seq: Resume cursor: sequence number within the part.
+      before_created: Upper cursor: creation timestamp of the oldest turn held.
+      before_session: Upper cursor: session id of the oldest turn held.
+      before_part: Upper cursor: part index within the session.
+      before_seq: Upper cursor: sequence number within the part.
       since: Absolute window start (inclusive).
       until: Absolute window end (inclusive).
       conversation: Keep only conversation, what a person or agent said.
@@ -669,16 +735,30 @@ async def web_feed(
       tail: Return newest page first (true) or oldest available (false).
 
     Returns:
-      feed: Turns across all sessions, pagination cursor for next poll.
+      feed: Turns across the sessions the caller reads, pagination cursor for next
+        poll. A session whose transcript the caller does not read has no turn here.
 
     """
     del identity
     if limit < 1 or limit > 1000:
         raise HTTPException(status_code=400, detail="limit must be in [1, 1000]")
     _check_window(since, until)
-    after = _feed_cursor(after_created, after_session, after_part, after_seq)
+    after = _feed_cursor(
+        after_created,
+        session_id=after_session,
+        part=after_part,
+        seq=after_seq,
+    )
+    before = _feed_cursor(
+        before_created,
+        session_id=before_session,
+        part=before_part,
+        seq=before_seq,
+        direction="before",
+    )
     events = await get_store(request).read_feed(
         after=after,
+        before=before,
         since=since,
         until=until,
         scope=scope,
@@ -729,11 +809,12 @@ async def web_feed_facets(
       until: Window end (inclusive); unset counts to the last.
 
     Returns:
-      facets: Per session, room and record kind, what the window holds.
+      facets: Per session, room and record kind, what the window holds of the
+        sessions the caller reads.
 
     """
-    del identity
     _check_window(since, until)
+    del identity
     return await get_store(request).read_feed_facets(
         since=since,
         until=until,
@@ -768,7 +849,8 @@ async def web_feed_histogram(
       buckets: Most buckets to return, 2 to 1000.
 
     Returns:
-      histogram: The grid and each bucket's record count, oldest first.
+      histogram: The grid and each bucket's record count, oldest first, of the
+        sessions the caller reads.
 
     Raises:
       HTTPException: 400 for ``buckets`` outside 2 to 1000, an ``until`` before
@@ -1033,14 +1115,26 @@ def _feed_cursor(
     session_id: UUID | None,
     part: int | None,
     seq: int | None,
+    *,
+    direction: Literal["after", "before"] = "after",
 ) -> tuple[datetime, UUID, int, int] | None:
     """Assemble the composite feed cursor, or ``None`` when unset."""
     if created is None and session_id is None and seq is None and part is None:
         return None
-    if created is None or session_id is None or seq is None:
+    if (
+        created is None
+        or session_id is None
+        or seq is None
+        or (direction == "before" and part is None)
+    ):
         raise HTTPException(
             status_code=400,
-            detail="after_created, after_session, after_seq must be given together",
+            detail=(
+                "before_created, before_session, before_part, before_seq must "
+                "be given together"
+                if direction == "before"
+                else "after_created, after_session, after_seq must be given together"
+            ),
         )
     return (created, session_id, 0 if part is None else part, seq)
 
@@ -1431,6 +1525,14 @@ def _search_embedder(
     if model:
         return _override_embedder(request, model, dim)
     return _session_embedder(request)
+
+
+def _searched_by_default(request: Request, identity: AuthIdentity) -> FeedWhose:
+    """Return whose sessions a search that names none reads: see the route."""
+    assistant = get_assistant(request)
+    if assistant is not None and identity.email.lower() == assistant.email.lower():
+        return "everyone"
+    return "mine"
 
 
 async def _probe_frames(

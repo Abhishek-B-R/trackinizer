@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 
 from pydantic import ValidationError
@@ -17,46 +18,102 @@ from trackinizer.server.visuals.catalog import (
 )
 from trackinizer.server.visuals.workspaces import (
     ApplyWorkspaceOperation,
+    CampaignSetup,
     HideVisual,
     Placement,
     PlaceVisual,
     ShowVisual,
+    StationLayout,
+    TabVisual,
     WorkspaceData,
     apply_operation,
     initial_data,
+    refuse_params,
     refuse_record,
+    restore_page,
 )
 
 
-def test_a_new_canvas_has_chat_beside_its_default_visual() -> None:
-    """Chat is there with no setup: the default visual in main, Chat at the side."""
+def _with_graph(catalog: VisualCatalogBody) -> WorkspaceData:
+    """Return a new canvas with a context graph shown on it."""
+    return apply_operation(
+        initial_data(catalog),
+        ShowVisual(kind="show", visual_type="trax.subgraph", record_id=uuid.uuid4()),
+        catalog,
+    )
+
+
+def test_a_new_canvas_holds_only_its_default_visual() -> None:
+    """Chat is a column of its own, so the canvas starts with the page alone."""
     data = initial_data(default_catalog())
-    assert [(v.type, v.placement) for v in data.visuals] == [
-        ("trax.browse", "main"),
-        ("trax.chat", "side"),
-    ]
+    assert [(v.type, v.placement) for v in data.visuals] == [("trax.browse", "main")]
     assert data.focused_instance is None
 
 
-def test_a_visual_is_placed_at_either_side_of_the_page_and_nowhere_unnamed() -> None:
-    """Chat moves to the column left of the page and back; another name is refused."""
+def test_chat_is_no_visual_so_showing_it_is_refused_like_any_unknown_type() -> None:
+    """The catalog does not offer it, and a show of it is an unknown type."""
     catalog = default_catalog()
-    data = initial_data(catalog)
-    chat = data.visuals[1].id
+    assert "trax.chat" not in {visual.type for visual in catalog.visuals}
+    with pytest.raises(ValueError, match=r"Unknown visual type 'trax\.chat'"):
+        apply_operation(
+            initial_data(catalog),
+            ShowVisual(kind="show", visual_type="trax.chat"),
+            catalog,
+        )
+
+
+def test_a_stored_canvas_that_holds_chat_reads_without_it() -> None:
+    """A canvas saved when Chat was a visual drops it on read, and its focus with it."""
+    page, chat, graph = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+
+    def stored(focused: uuid.UUID) -> WorkspaceData:
+        return WorkspaceData.model_validate(
+            {
+                "visuals": [
+                    {"id": str(page), "type": "trax.browse", "version": 1},
+                    {
+                        "id": str(chat),
+                        "type": "trax.chat",
+                        "version": 1,
+                        "placement": "side",
+                        "record_id": str(uuid.uuid4()),
+                    },
+                    {
+                        "id": str(graph),
+                        "type": "trax.subgraph",
+                        "version": 1,
+                        "record_id": str(uuid.uuid4()),
+                    },
+                ],
+                "focused_instance": str(focused),
+            },
+        )
+
+    on_chat = stored(chat)
+    assert [v.type for v in on_chat.visuals] == ["trax.browse", "trax.subgraph"]
+    assert on_chat.focused_instance is None
+    assert stored(graph).focused_instance == graph
+
+
+def test_a_visual_is_placed_at_either_side_of_the_page_and_nowhere_unnamed() -> None:
+    """A visual moves to the column left of the page and back; another name is refused."""
+    catalog = default_catalog()
+    data = _with_graph(catalog)
+    graph = data.visuals[1].id
     sides: tuple[Placement, ...] = ("left", "side")
     for placement in sides:
         data = apply_operation(
             data,
-            PlaceVisual(kind="place", instance_id=chat, placement=placement),
+            PlaceVisual(kind="place", instance_id=graph, placement=placement),
             catalog,
         )
         assert [(v.type, v.placement) for v in data.visuals] == [
             ("trax.browse", "main"),
-            ("trax.chat", placement),
+            ("trax.subgraph", placement),
         ]
     with pytest.raises(ValidationError):
         PlaceVisual.model_validate(
-            {"kind": "place", "instance_id": str(chat), "placement": "right"},
+            {"kind": "place", "instance_id": str(graph), "placement": "right"},
         )
 
 
@@ -64,7 +121,7 @@ def test_timeline_is_off_in_a_new_canvas_and_recentres_when_shown_again() -> Non
     """The merged view opens only on request; a second show moves it, not duplicates."""
     catalog = default_catalog()
     fresh = initial_data(catalog)
-    assert [visual.type for visual in fresh.visuals] == ["trax.browse", "trax.chat"]
+    assert [visual.type for visual in fresh.visuals] == ["trax.browse"]
     first, second = uuid.uuid4(), uuid.uuid4()
     opened = apply_operation(
         fresh,
@@ -82,24 +139,20 @@ def test_timeline_is_off_in_a_new_canvas_and_recentres_when_shown_again() -> Non
 
 
 def test_show_reuses_visual_type_and_updates_its_context() -> None:
-    """Reopening Chat updates its target without orphaning a duplicate tile."""
+    """Reopening a visual updates its target without orphaning a duplicate tile."""
     catalog = default_catalog()
-    original = apply_operation(
-        initial_data(catalog),
-        ShowVisual(kind="show", visual_type="trax.chat"),
-        catalog,
-    )
-    chat_id = original.visuals[1].id
+    original = _with_graph(catalog)
+    graph_id = original.visuals[1].id
     record_id = uuid.uuid4()
     reopened = apply_operation(
         original,
-        ShowVisual(kind="show", visual_type="trax.chat", record_id=record_id),
+        ShowVisual(kind="show", visual_type="trax.subgraph", record_id=record_id),
         catalog,
     )
     assert len(reopened.visuals) == 2
-    assert reopened.visuals[1].id == chat_id
+    assert reopened.visuals[1].id == graph_id
     assert reopened.visuals[1].record_id == record_id
-    assert reopened.focused_instance == chat_id
+    assert reopened.focused_instance == graph_id
 
 
 def test_recentring_the_context_graph_keeps_its_reach_and_highlight() -> None:
@@ -126,6 +179,68 @@ def test_recentring_the_context_graph_keeps_its_reach_and_highlight() -> None:
         second,
         {"hops": 3, "highlight": str(second)},
     )
+
+
+_NARROWED: dict[str, str | int | bool] = {
+    "path": "loop/foo/",
+    "changed": True,
+    "file": "bar.py",
+}
+
+
+def _files(data: WorkspaceData) -> tuple[uuid.UUID | None, dict[str, str | int | bool]]:
+    [files] = [visual for visual in data.visuals if visual.type == "trax.files"]
+    return files.record_id, files.params
+
+
+def test_showing_files_on_a_new_record_keeps_its_narrowing() -> None:
+    """A show naming only a new record moves the files view; its params stay."""
+    catalog = default_catalog()
+    first, second = uuid.uuid4(), uuid.uuid4()
+    shown = apply_operation(
+        initial_data(catalog),
+        ShowVisual(
+            kind="show",
+            visual_type="trax.files",
+            record_id=first,
+            params=_NARROWED,
+        ),
+        catalog,
+    )
+    moved = apply_operation(
+        shown,
+        ShowVisual(kind="show", visual_type="trax.files", record_id=second),
+        catalog,
+    )
+    assert _files(shown) == (first, _NARROWED)
+    assert _files(moved) == (second, _NARROWED)
+
+
+def test_any_param_sets_the_files_narrowing_anew() -> None:
+    """Each param a show leaves out goes back to its default."""
+    catalog = default_catalog()
+    record = uuid.uuid4()
+    shown = apply_operation(
+        initial_data(catalog),
+        ShowVisual(
+            kind="show",
+            visual_type="trax.files",
+            record_id=record,
+            params=_NARROWED,
+        ),
+        catalog,
+    )
+    again = apply_operation(
+        shown,
+        ShowVisual(
+            kind="show",
+            visual_type="trax.files",
+            record_id=record,
+            params={"file": "baz.py"},
+        ),
+        catalog,
+    )
+    assert _files(again) == (record, {"path": "", "changed": False, "file": "baz.py"})
 
 
 def test_show_uses_bounded_catalog_defaults_and_requires_record() -> None:
@@ -209,29 +324,9 @@ def test_operation_rejects_misspelled_record_context() -> None:
                 "revision": 0,
                 "operation": {
                     "kind": "show",
-                    "visual_type": "trax.chat",
+                    "visual_type": "trax.subgraph",
                     "recordId": str(uuid.uuid4()),
                 },
-            },
-        )
-
-
-def test_chat_artifact_uses_the_same_record_target() -> None:
-    """Chat uses the Artifact ID as its sole target and rejects a second shape."""
-    artifact_id = uuid.uuid4()
-    shown = apply_operation(
-        initial_data(default_catalog()),
-        ShowVisual(kind="show", visual_type="trax.chat", record_id=artifact_id),
-        default_catalog(),
-    )
-    assert shown.visuals[-1].record_id == artifact_id
-    with pytest.raises(ValidationError):
-        ShowVisual.model_validate(
-            {
-                "kind": "show",
-                "visual_type": "trax.chat",
-                "record_id": str(artifact_id),
-                "report_target": {"artifact_id": str(artifact_id)},
             },
         )
 
@@ -292,6 +387,33 @@ def test_navigate_route_may_be_512_characters_and_no_more() -> None:
         )
 
 
+@pytest.mark.parametrize("hidden", [True, False])
+def test_chat_hides_or_shows_the_window_and_changes_nothing(hidden: bool) -> None:
+    """A chat operation names the flag, and applying it is a no-op."""
+    catalog = default_catalog()
+    data = initial_data(catalog)
+    operation = ApplyWorkspaceOperation.model_validate(
+        {"revision": 0, "operation": {"kind": "chat", "hidden": hidden}},
+    )
+    assert apply_operation(data, operation.operation, catalog) == data
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        {"kind": "chat"},
+        {"kind": "chat", "hidden": "maybe"},
+        {"kind": "chat", "hidden": True, "x": 1},
+    ],
+)
+def test_chat_needs_a_boolean_flag_and_nothing_else(
+    operation: dict[str, object],
+) -> None:
+    """A missing or non-boolean flag, or an extra field, is refused."""
+    with pytest.raises(ValidationError):
+        ApplyWorkspaceOperation.model_validate({"revision": 0, "operation": operation})
+
+
 def test_highlight_takes_up_to_fifty_uuids_and_changes_nothing() -> None:
     """An empty list clears, 50 ids is the bound, and applying it is a no-op."""
     catalog = default_catalog()
@@ -321,23 +443,43 @@ def test_highlight_refuses_too_many_ids_and_non_uuids(ids: object) -> None:
         )
 
 
-def test_the_default_visual_is_the_page_and_cannot_be_hidden() -> None:
-    """Chat can be hidden; browse, the page itself, cannot."""
+def test_the_page_can_be_hidden_like_any_other_visual() -> None:
+    """Browse is the visual a canvas opens with, not one it must keep."""
     catalog = default_catalog()
-    data = initial_data(catalog)
-    browse, chat = data.visuals
-    with pytest.raises(ValueError, match="cannot be hidden"):
-        apply_operation(
-            data,
-            HideVisual(kind="hide", instance_id=browse.id),
-            catalog,
-        )
+    data = _with_graph(catalog)
+    browse, graph = data.visuals
     hidden = apply_operation(
         data,
-        HideVisual(kind="hide", instance_id=chat.id),
+        HideVisual(kind="hide", instance_id=browse.id),
+        catalog,
+    )
+    assert [visual.type for visual in hidden.visuals] == ["trax.subgraph"]
+    hidden = apply_operation(
+        data,
+        HideVisual(kind="hide", instance_id=graph.id),
         catalog,
     )
     assert [visual.type for visual in hidden.visuals] == ["trax.browse"]
+
+
+def test_restoring_the_page_shows_it_in_main_and_focuses_it() -> None:
+    """A canvas that holds no page gets it back; one that holds it is unchanged."""
+    catalog = default_catalog()
+    data = _with_graph(catalog)
+    browse, graph = data.visuals
+    assert restore_page(data, catalog=catalog) == data
+    without = apply_operation(
+        data,
+        HideVisual(kind="hide", instance_id=browse.id),
+        catalog,
+    )
+    restored = restore_page(without, catalog=catalog)
+    assert [(v.type, v.placement) for v in restored.visuals] == [
+        ("trax.subgraph", "main"),
+        ("trax.browse", "main"),
+    ]
+    assert restored.focused_instance == restored.visuals[-1].id
+    assert restored.visuals[0].id == graph.id
 
 
 def test_a_visual_that_takes_no_record_refuses_one() -> None:
@@ -349,10 +491,6 @@ def test_a_visual_that_takes_no_record_refuses_one() -> None:
             ShowVisual(kind="show", visual_type="trax.browse", record_id=uuid.uuid4()),
             catalog,
         )
-
-
-def _show(visual: str, *, record: uuid.UUID | None) -> ShowVisual:
-    return ShowVisual(kind="show", visual_type=visual, record_id=record)
 
 
 def _entry(visual: str) -> VisualDescription:
@@ -371,7 +509,6 @@ def _entry(visual: str) -> VisualDescription:
         ("trax.artifact", "Issue", True),
         ("trax.subgraph", "Paper", False),
         ("trax.subgraph", None, False),
-        ("trax.chat", "Belief", False),
         ("trax.browse", "Issue", True),
         ("trax.browse", None, True),
     ],
@@ -383,7 +520,7 @@ def test_refuse_record_applies_the_catalogs_kinds(
 ) -> None:
     """One rule, callable without a database: a reason, or None."""
     reason = refuse_record(
-        _show(visual, record=uuid.uuid4()),
+        ShowVisual(kind="show", visual_type=visual, record_id=uuid.uuid4()),
         descriptor=_entry(visual),
         kind=kind,
     )
@@ -393,7 +530,7 @@ def test_refuse_record_applies_the_catalogs_kinds(
 def test_refuse_record_names_the_kinds_and_what_it_found() -> None:
     """The sentence a refused caller reads says what the visual shows."""
     reason = refuse_record(
-        _show("trax.artifact", record=uuid.uuid4()),
+        ShowVisual(kind="show", visual_type="trax.artifact", record_id=uuid.uuid4()),
         descriptor=_entry("trax.artifact"),
         kind="Belief",
     )
@@ -403,14 +540,18 @@ def test_refuse_record_names_the_kinds_and_what_it_found() -> None:
     )
     assert (
         refuse_record(
-            _show("trax.artifact", record=uuid.uuid4()),
+            ShowVisual(
+                kind="show",
+                visual_type="trax.artifact",
+                record_id=uuid.uuid4(),
+            ),
             descriptor=two,
             kind="Belief",
         )
         == "Artifact shows Paper or Issue records, not Belief."
     )
     unknown = refuse_record(
-        _show("trax.artifact", record=uuid.uuid4()),
+        ShowVisual(kind="show", visual_type="trax.artifact", record_id=uuid.uuid4()),
         descriptor=_entry("trax.artifact"),
         kind=None,
     )
@@ -418,7 +559,7 @@ def test_refuse_record_names_the_kinds_and_what_it_found() -> None:
     assert unknown.endswith("not an unknown record.")
     assert (
         refuse_record(
-            _show("trax.browse", record=uuid.uuid4()),
+            ShowVisual(kind="show", visual_type="trax.browse", record_id=uuid.uuid4()),
             descriptor=_entry("trax.browse"),
             kind=None,
         )
@@ -426,11 +567,78 @@ def test_refuse_record_names_the_kinds_and_what_it_found() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("visual", "params", "reason"),
+    [
+        (
+            "trax.files",
+            {"path": "", "depth": 1},
+            "Visual parameters do not match the catalog schema.",
+        ),
+        ("trax.files", {"path": 1}, "Parameter 'path' must be a string."),
+        ("trax.files", {"file": True}, "Parameter 'file' must be a string."),
+        (
+            "trax.files",
+            {"path": "x" * 513},
+            "Parameter 'path' exceeds maximum length of 512.",
+        ),
+        (
+            "trax.files",
+            {"file": "x" * 513},
+            "Parameter 'file' exceeds maximum length of 512.",
+        ),
+        ("trax.files", {"changed": "true"}, "Parameter 'changed' must be a boolean."),
+        ("trax.files", {"changed": 1}, "Parameter 'changed' must be a boolean."),
+        ("trax.subgraph", {"hops": "2"}, "Parameter 'hops' must be an integer."),
+        ("trax.subgraph", {"hops": True}, "Parameter 'hops' must be an integer."),
+        ("trax.subgraph", {"hops": 0}, "Parameter 'hops' is below its minimum of 1."),
+        ("trax.subgraph", {"hops": 4}, "Parameter 'hops' is above its maximum of 3."),
+    ],
+)
+def test_refuse_params_names_the_rule_a_show_breaks(
+    visual: str,
+    params: dict[str, str | int | bool],
+    reason: str,
+) -> None:
+    """The sentence names the param and the bound; the server raises the same."""
+    assert refuse_params(params, descriptor=_entry(visual)) == reason
+    catalog = default_catalog()
+    with pytest.raises(ValueError, match=re.escape(reason)):
+        apply_operation(
+            initial_data(catalog),
+            ShowVisual(
+                kind="show",
+                visual_type=visual,
+                record_id=uuid.uuid4(),
+                params=params,
+            ),
+            catalog,
+        )
+
+
+@pytest.mark.parametrize(
+    ("visual", "params"),
+    [
+        ("trax.files", {}),
+        ("trax.files", {"path": "x" * 512, "changed": True, "file": "x" * 512}),
+        ("trax.files", {"path": "**/*.py", "changed": False, "file": ""}),
+        ("trax.subgraph", {"hops": 1, "highlight": ""}),
+        ("trax.subgraph", {"hops": 3}),
+    ],
+)
+def test_refuse_params_accepts_params_within_bounds(
+    visual: str,
+    params: dict[str, str | int | bool],
+) -> None:
+    """A param at its bound is taken; one left out takes its default."""
+    assert refuse_params(params, descriptor=_entry(visual)) is None
+
+
 def test_a_show_without_a_record_is_never_refused_for_one() -> None:
     """Whether a record is required is another rule."""
     assert (
         refuse_record(
-            _show("trax.browse", record=None),
+            ShowVisual(kind="show", visual_type="trax.browse", record_id=None),
             descriptor=_entry("trax.browse"),
             kind=None,
         )
@@ -438,7 +646,7 @@ def test_a_show_without_a_record_is_never_refused_for_one() -> None:
     )
     assert (
         refuse_record(
-            _show("trax.timeline", record=None),
+            ShowVisual(kind="show", visual_type="trax.timeline", record_id=None),
             descriptor=_entry("trax.timeline"),
             kind=None,
         )
@@ -446,7 +654,101 @@ def test_a_show_without_a_record_is_never_refused_for_one() -> None:
     )
 
 
+def test_a_campaign_setup_validates_a_partial_subset_with_a_nested_lead() -> None:
+    setup = CampaignSetup.model_validate(
+        {"hours": 2, "scientists": 3, "lead": {"model": "gpt-6.1-sol"}},
+    )
+
+    assert setup.hours == 2.0
+    assert setup.scientists == 3
+    assert setup.lead is not None
+    assert setup.lead.model == "gpt-6.1-sol"
+    assert (setup.budget_usd, setup.staffing, setup.repo) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ({"hours": 0}, "greater than 0"),
+        ({"hours": float("inf")}, "finite"),
+        ({"budget_usd": -5}, "greater than 0"),
+        ({"scientists": 9}, "less than or equal to 8"),
+        ({"scientists": 0}, "greater than or equal to 1"),
+        ({"staffing": "gpt-6.1-sol:high"}, "MODEL:EFFORT:COUNT"),
+        ({"staffing": ""}, "at least 1"),
+        ({"repo": "loop"}, "owner/name"),
+        ({"extra": 1}, "Extra inputs"),
+    ],
+)
+def test_a_campaign_setup_refuses_a_misshapen_field_with_a_plain_line(
+    payload: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValidationError) as caught:
+        CampaignSetup.model_validate(payload)
+
+    assert message in str(caught.value)
+
+
+def test_a_canvas_tab_keeps_its_page_visuals_and_sizes() -> None:
+    """A tab not open holds what it shows, so opening it again can show it."""
+    record_id = uuid.uuid4()
+    layout = StationLayout.model_validate(
+        {
+            "tab": "b",
+            "tabs": [
+                {"id": "a", "name": "Tab 1"},
+                {
+                    "id": "b",
+                    "name": "Review",
+                    "page": "#/ref/Issue/7",
+                    "visuals": [
+                        {"type": "trax.browse"},
+                        {
+                            "type": "trax.subgraph",
+                            "placement": "side",
+                            "record_id": str(record_id),
+                            "params": {"hops": 2},
+                        },
+                    ],
+                    "columns": {"side": 0.3},
+                    "share": {"trax.browse": 1.5},
+                },
+            ],
+        },
+    )
+    assert layout.tabs is not None
+    first, second = layout.tabs
+    assert (first.page, first.visuals) == (None, [])
+    assert second.visuals[1] == TabVisual(
+        type="trax.subgraph",
+        placement="side",
+        record_id=record_id,
+        params={"hops": 2},
+    )
+    assert layout.model_dump(mode="json", exclude_none=True)["tab"] == "b"
+
+
+@pytest.mark.parametrize(
+    "tabs",
+    [
+        [{"id": "a", "name": "One"}, {"id": "a", "name": "Two"}],
+        [{"id": "a", "name": ""}],
+        [{"id": "a", "name": "x" * 61}],
+        [{"id": "a", "name": "One", "page": "#/has space"}],
+        [{"id": "a", "name": "One", "visuals": [{"type": "trax.browse"}] * 13}],
+        [{"id": "a", "name": "One", "visuals": [{"type": "x", "where": "main"}]}],
+        [{"id": "a", "name": "One", "columns": {"side": 420}}],
+        [{"id": str(n), "name": "Tab"} for n in range(13)],
+    ],
+)
+def test_canvas_tabs_out_of_bounds_are_refused(tabs: list[dict[str, object]]) -> None:
+    """Tabs keep distinct ids, short names, clean pages, and bounded visuals."""
+    with pytest.raises(ValidationError):
+        StationLayout.model_validate({"tabs": tabs})
+
+
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

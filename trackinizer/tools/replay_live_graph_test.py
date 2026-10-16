@@ -16,9 +16,10 @@ if TYPE_CHECKING:
 
     from trackinizer.types.inquiries import Inquiry
 
+from treekle import from_plain
+
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.codec import from_plain
 from trackinizer.tools import replay_live_graph
 
 
@@ -212,6 +213,6 @@ def test_seed_rejects_ignored_options(
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

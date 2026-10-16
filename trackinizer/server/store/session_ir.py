@@ -22,7 +22,8 @@ from uuid import UUID
 
 import json
 
-from trackinizer.lib.codec import PlainTree, immutable, loads, mutable
+from treekle import MutablePlainTree, PlainTree, immutable, json_loads, mutable
+
 from trackinizer.server.notify import notify_after_commit, tx
 from trackinizer.server.store.cascade import _CascadeAuditMixin
 from trackinizer.server.store.session_bodies import decode_body, spliced_payload
@@ -113,9 +114,12 @@ class _SessionIRMixin(_CascadeAuditMixin):
 
     Built on the cascade mixin for ``_buffer_notification``: a stored record
     wakes the same ``/api/web/subscribe`` fanout every other session mutation
-    does, so a live viewer follows a capture as it lands.
+    does, so a live viewer follows a capture as it lands. The wake names the
+    session's audience, so a viewer who does not read it is not woken.
     """
 
+    # Audience: gated -- audience_audit_test requires every server caller to call
+    # require_session_access first.
     async def append_session_records(
         self,
         session_id: UUID,
@@ -143,6 +147,9 @@ class _SessionIRMixin(_CascadeAuditMixin):
         records -- they carry no ``idx`` and the server assigns their ``seq``,
         because a sink counter restarts at 0 on a resumed run and would
         collide.
+
+        Every NUL this writes, in a column or inside a payload, is stored as
+        U+FFFD: Postgres text cannot hold one (see :func:`_nul_free`).
 
         Args:
           session_id: The owning AgentSession.
@@ -187,7 +194,7 @@ class _SessionIRMixin(_CascadeAuditMixin):
             # the last batch is always written while the session is still
             # live.
             session = await conn.fetchrow(
-                "SELECT kind, agentsession_ended FROM inquiries "
+                "SELECT kind, agentsession_ended, agentsession_audience FROM inquiries "
                 "WHERE id = $1 FOR UPDATE",
                 session_id,
             )
@@ -218,12 +225,15 @@ class _SessionIRMixin(_CascadeAuditMixin):
                         [row.session_id for row in rows],
                         [row.part for row in rows],
                         [row.idx for row in rows],
-                        [row.kind for row in rows],
+                        [_nul_free(row.kind) for row in rows],
                         [row.context_id for row in rows],
                         [row.timestamp for row in rows],
-                        [row.model for row in rows],
+                        [
+                            None if row.model is None else _nul_free(row.model)
+                            for row in rows
+                        ],
                         [_encoded_payload(row.payload) for row in rows],
-                        [row.text for row in rows],
+                        [_nul_free(row.text) for row in rows],
                     )
                     if rows
                     else []
@@ -247,7 +257,12 @@ class _SessionIRMixin(_CascadeAuditMixin):
                 )
             stored = await self._append_slash_commands(conn, session_id, slash_commands)
             if written or stored:
-                self._buffer_notification(session_id)
+                # The ping names the session's audience, which a live stream holds
+                # back from a viewer who does not read it: the session's own row is
+                # open, but when it receives a record is part of its transcript.
+                audience = session["agentsession_audience"]
+                assert isinstance(audience, str)
+                self._buffer_notification(session_id, audience=audience)
         return (len(written), len(rows) - len(written), stored)
 
     # Server-assigned rather than client-counted: a resumed run's sink restarts at 0, so
@@ -257,6 +272,7 @@ class _SessionIRMixin(_CascadeAuditMixin):
     # Runs on the caller's connection so it shares the record transaction -- a command
     # sits BETWEEN the turns around it, and storing one half of that is a transcript
     # that never happened.
+    # Audience: gated -- append_session_records is gated.
     @classmethod
     async def _append_slash_commands(
         cls,
@@ -283,11 +299,13 @@ class _SessionIRMixin(_CascadeAuditMixin):
             "RETURNING seq",
             session_id,
             [row.timestamp for row in commands],
-            [row.command for row in commands],
-            [row.args for row in commands],
+            [_nul_free(row.command) for row in commands],
+            [_nul_free(row.args) for row in commands],
         )
         return len(stored)
 
+    # Audience: internal -- no route calls it; audience_audit_test requires a server
+    # caller to call require_session_access first.
     async def read_session_slash_commands(
         self,
         session_id: UUID,
@@ -320,6 +338,8 @@ class _SessionIRMixin(_CascadeAuditMixin):
             )
         return result
 
+    # Audience: gated -- audience_audit_test requires every server caller to call
+    # require_session_access first.
     async def read_session_records(
         self,
         session_id: UUID,
@@ -469,6 +489,8 @@ class _SessionIRMixin(_CascadeAuditMixin):
             )
         return result
 
+    # Audience: gated -- audience_audit_test requires every server caller to call
+    # require_session_access first.
     async def read_recent_session_turns(
         self,
         session_id: UUID,
@@ -515,6 +537,8 @@ class _SessionIRMixin(_CascadeAuditMixin):
             )
         return result
 
+    # Audience: gated -- audience_audit_test requires every server caller to call
+    # require_session_access first.
     async def upsert_session_manifest(
         self,
         session_id: UUID,
@@ -606,6 +630,8 @@ class _SessionIRMixin(_CascadeAuditMixin):
                 raise NotFoundError(f"session {session_id} not found") from exc
         return part
 
+    # Audience: gated -- audience_audit_test requires every server caller to call
+    # require_session_access first.
     async def read_session_manifests(self, session_id: UUID) -> list[SessionManifest]:
         """Every part of one session, in ``part`` order.
 
@@ -655,8 +681,33 @@ class _SessionIRMixin(_CascadeAuditMixin):
 # ``separators`` drops the whitespace ``json.dumps`` adds by default -- the text is
 # stored verbatim, so the padding would be too.
 def _encoded_payload(payload: Mapping[str, PlainTree]) -> str:
-    """One record's payload as JSON text, key order intact."""
-    return json.dumps(mutable(payload), separators=(",", ":"))
+    """One record's payload as NUL-free JSON text, key order intact."""
+    encoded = json.dumps(mutable(payload), separators=(",", ":"))
+    # ``json.dumps`` writes every NUL as the escape ``\u0000``, so a payload whose
+    # text lacks it holds none, and the common path skips the walk.
+    if "\\u0000" not in encoded:
+        return encoded
+    return json.dumps(_nul_free_tree(mutable(payload)), separators=(",", ":"))
+
+
+# Postgres text cannot hold NUL, and ``->>`` cannot extract one escaped inside a
+# ``json`` payload, which fails the feed for every reader of that record. A tool's
+# output can carry one, and refusing it fails the whole batch, which the capturing
+# client then re-sends forever. U+FFFD keeps the spot visible.
+def _nul_free(text: str) -> str:
+    """Return ``text`` with each NUL replaced by U+FFFD."""
+    return text.replace("\x00", "\ufffd")
+
+
+def _nul_free_tree(tree: MutablePlainTree) -> MutablePlainTree:
+    """Return ``tree`` with each NUL in a key or string replaced by U+FFFD."""
+    if isinstance(tree, str):
+        return _nul_free(tree)
+    if isinstance(tree, dict):
+        return {_nul_free(key): _nul_free_tree(value) for key, value in tree.items()}
+    if isinstance(tree, list):
+        return [_nul_free_tree(item) for item in tree]
+    return tree
 
 
 # Parsed, never decoded: ``from_plain`` lets a codec tag decide even under ``object``,
@@ -664,7 +715,7 @@ def _encoded_payload(payload: Mapping[str, PlainTree]) -> str:
 # the plain objects they are stored as, for the record decoder and the web client.
 def _decoded_payload(raw: str) -> Mapping[str, PlainTree]:
     """Return the stored payload text back as frozen JSON, key order intact."""
-    payload = loads(raw)
+    payload = json_loads(raw)
     if not isinstance(payload, dict):
         raise TypeError(f"stored payload is not a JSON object: {raw[:80]!r}")
     return immutable(payload)

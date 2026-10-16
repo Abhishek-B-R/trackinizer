@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import json
 
-from trackinizer.lib.codec import from_plain, loads
+from treekle import from_plain, json_loads
 
 
 if TYPE_CHECKING:
@@ -65,6 +65,12 @@ def render_inbound(
         prefix += f"[{scope}] "
     if sender := source or "":
         prefix += f"{sender}: "
+    if context is not None and context.relay is not None:
+        # Told to agents, not asked of this one: no canvas to move, nothing to run.
+        return (
+            f"{prefix}[Console relay: told to these agents directly, not a question "
+            f"for you; do not contradict it] {context.relay.line()}"
+        )
     rendered = f"{prefix}{text}"
     if context is not None:
         rendered += (
@@ -72,7 +78,7 @@ def render_inbound(
         )
         workspace = f"trax workspace {context.workspace_id}"
         on_screen = None if context.page is None else context.page.record
-        record = context.record_id or (on_screen.id if on_screen else "RECORD_UUID")
+        record = on_screen.id if on_screen else "RECORD_UUID"
         rendered += (
             "\nCanvas: run these commands; describing them does nothing."
             f"\n  Show a record: {workspace} navigate '#/lookup/{record}'"
@@ -81,18 +87,16 @@ def render_inbound(
             f"\n  Show its timeline: {workspace} show trax.timeline --record {record}"
             f"\n  Show an artifact: {workspace} show trax.artifact --record {record}"
             " --placement main"
+            f"\n  Show its files and diffs: {workspace} show trax.files --record {record}"
+            " (narrow: --param path=DIR/ or a glob, --param changed=true, --param file=NAME)"
             f"\n  Point at records: {workspace} highlight UUID[,UUID...]"
             " (highlight '' clears)"
             f"\n  Go to a view: {workspace} navigate '#/list/Issue' (or '#/graph',"
             " '#/activity', '#/console', '#/search/TEXT' with TEXT percent-encoded)"
+            f"\n  Hide your Chat window so they look at the page: {workspace} hide chat"
+            " (show chat brings it back)"
             f"\n  Hide a visual: {workspace} hide INSTANCE_UUID (never the page)"
         )
-        if context.artifact_content is not None:
-            artifact = context.artifact_content.artifact_id
-            rendered += (
-                f"\nThe open artifact: trax artifact {artifact}; full content: "
-                f"GET /api/artifacts/{artifact}/content"
-            )
     return rendered
 
 
@@ -132,7 +136,7 @@ def render_fork_lines(rendered: str, *, lines: Sequence[ForkLine]) -> str:
 def _envelope_agent_message(text: str) -> str | None:
     """Return the ``agent_message`` line of a change envelope, or None if not one."""
     try:
-        payload = loads(text)
+        payload = json_loads(text)
     except json.JSONDecodeError:
         return None
     if not isinstance(payload, dict):

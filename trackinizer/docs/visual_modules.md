@@ -5,8 +5,9 @@ their trusted configgle `Fig` configurations into a `Workspace`. A deployment
 supplies its own `Workspace`; the default is `default_workspace()`. Every
 route reads that one catalog and returns safe descriptions through
 `GET /api/visuals`. The default visual must not require a record. The
-browser selects a renderer by visual type and version. It loads the Chat chunk
-only when Chat is visible.
+browser selects a renderer by visual type and version. It loads a renderer's
+chunk only when its visual is shown. Chat is not a visual: it is a column of its
+own beside the canvas.
 
 ## Add a visual
 
@@ -26,7 +27,11 @@ only when Chat is visible.
    pass browser JSON to configgle `deserialize()`.
 4. Register a renderer for the type and version in the web client, loaded with
    a dynamic import. An unavailable renderer produces an error inside its
-   tile.
+   tile. The renderer draws rows: its record is the app's anchor row, it
+   gathers the app's other rows by labels and edges, and it reads what only
+   the app knows from each row's `app.<app>`, which the app's writers keep in
+   the shape it draws. A visual serves no data of its own: to change what it
+   shows, an agent writes the rows, and moves only attention on the canvas.
 5. Regenerate the client's catalog preview and the OpenAPI schema from the
    backend catalog so the snapshot tests and the client type check agree with
    it.
@@ -59,7 +64,15 @@ Authorization: Bearer <user-token>
 Idempotency-Key: 4d5a0dc1-a916-4d4b-9c23-a58b654c4376
 Content-Type: application/json
 
-{"revision":1,"operation":{"kind":"show","visual_type":"trax.chat","placement":"side"}}
+{
+  "revision": 1,
+  "operation": {
+    "kind": "show",
+    "visual_type": "trax.subgraph",
+    "record_id": "<record-id>",
+    "placement": "side"
+  }
+}
 ```
 
 The response is the full workspace at revision 2. The caller may retry that
@@ -81,22 +94,18 @@ server's shared assistant; `WorkspaceState.partner_choice` can instead be
 operation sets. A partner that is not `live` disables the composer. A server with
 no assistant of its own can run `trax helper claude --as ACTOR` as one.
 
-The canvas's one `Chat` button shows `trax.chat`; on a record's page it puts
-the record UUID in `record_id`, and elsewhere it clears it. To
-send, the browser calls `POST /api/chats` with
-the persisted Chat instance UUID and a fresh `Idempotency-Key`:
+Chat is a column beside the canvas, on the left by default; the browser keeps
+its side and width, and a key hides it. It is no visual, so a canvas has no Chat
+instance and a line pins no record. To send, the browser calls `POST /api/chats`
+with a fresh `Idempotency-Key`:
 
 ```json
-{"kind":"science","workspace_id":"<workspace-id>","text":"What led to this experiment?","chat_instance_id":"<chat-instance-id>","expected_record_id":"<record-id>"}
+{"kind":"science","workspace_id":"<workspace-id>","text":"What led to this experiment?"}
 ```
 
-The server checks the signed-in writer, a live assistant, and the Chat
-instance, and that its record still matches `expected_record_id`. A changed
-record returns 409 before queueing. The server adds the persisted record UUID,
-workspace UUID, and visible visual identities to a typed inbound context.
-When the record exists in this server's graph, the context also includes its
-kind, sequence, and bounded title. A record resolved through a separate read
-profile carries its UUID without invented metadata. The browser also sends
+The server checks the signed-in writer and a live assistant. It adds the
+workspace UUID and the visible visual identities to a typed inbound context.
+The browser also sends
 `page`, the `#/...` address it is on, and `trail`, the addresses before it,
 oldest first and at most 8; a malformed address, or a longer trail, returns
 422. The server resolves them: `#/lookup/<id>`, `#/inquiry/<id>`,
@@ -104,21 +113,20 @@ oldest first and at most 8; a malformed address, or a longer trail, returns
 carries each as a page with its route and, when it exists, that record.
 Any other address, or a record that does not exist, keeps its route and has
 no record. Each visible visual carries the record it shows the same way, so
-"this" means what the sender sees. The agent receives the
+"this" means what the sender sees, and its `params` as the canvas holds them,
+so an agent sees a narrowing the reader set in a pane. The agent receives the
 context beside the message and reads the cited graph rows through trax.
 The receipt names the conversation, and the session once the assistant has it
 open; it does not claim the agent answered. Retry the same draft with the
-same key. When the canvas has no persisted visuals, send null for both
-`chat_instance_id` and `expected_record_id`; Chat remains the fallback view.
+same key.
 
 A conversation is an AgentSession (label `science-chat`). Chat reads its
 records and refreshes when the canvas event stream says the session changed;
-a line by another poster shows its sender. History lists the chats the user
-started or posted in; Clear chat starts a new one and deletes nothing, and the
-composer says chats are public to every user and cannot be deleted. A science
+a line by another poster shows its sender. The station menu lists the user's stations, each holding one chat; the
+composer says a chat is read by its members alone. A science
 chat's session in the Console or on its detail page offers Continue in Chat.
-Subgraph, timeline, and Artifact visuals use the same catalog and operation
-path.
+Subgraph, timeline, Artifact and files visuals use the same catalog and
+operation path.
 
 ## Lineage and timeline
 
@@ -140,24 +148,99 @@ that Issue becomes its nearest lead; with no such Issue it is shown alone.
 Leads are the anchor's `narrows` ancestors, at most three (`_LEAD_LEVELS` in
 `server/visuals/timeline.py`), one indexed lookup per level.
 
-## Save and reopen a workflow
+## Campaign summary
 
-The signed-in browser can save the current canvas with
-`POST /api/workspace-presets`. Supply the workspace UUID and revision, a name,
-optional agent instructions and continuation record UUID, and rectangles for
-floating panes. The server snapshots the persisted visual instances only if
-the revision still matches. Supply an `Idempotency-Key` UUID and reuse it when
-retrying the same save. A stale save returns 409 with the current canvas.
+`trax.summary` shows what a campaign did to readers who may not read its
+transcripts. Open it on the campaign's brief Issue or on any of its AgentSessions
+(`record_kinds` is those two). It reads the Artifacts the summary service files:
+`GET /api/inquiries` for kind Artifact filtered by label, `summary:issue:<id>`
+from an Issue, or `summary:session:<id>` then `summary:lead:<id>` from a session.
+Each Artifact's description is a plain-JSON document that the service writes. The
+page keeps only rows filed by `summary_accounts` in `GET /api/me/profile`, the staff
+setting's service accounts, since any writer can put these labels on a row.
+Sessions lists the campaign's sessions by start, with no spawn tree or cost, which
+are how it was run. Session shows one with its steps, phases and beliefs, and
+Corpus groups the efforts and claims they share.
+A running campaign's summary is read again every minute.
 
-`GET /api/workspace-presets` lists up to 100 saved views for the account. To
-continue on another device, open the default canvas and call
-`POST /api/workspace-presets/<preset-id>/open` with that canvas UUID, revision,
-and an `Idempotency-Key` UUID. Reuse the key when retrying the same open.
-Opening restores visuals, placement, floating rectangles, and the
-workflow context at a new revision. The next message carries saved guidance
-and the continuation record in its typed context.
-Presets never store session credentials. Existing browser-only saved inquiry
-queries remain a separate feature.
+The documents carry no transcript text, only item numbers and where each item is
+stored. A reader whose profile lists the `staff` audience also gets the
+transcript beside the steps (`/api/sessions/<id>/records`) and the numbers open
+it; the page only chooses what to show, and the server refuses the transcript to
+anyone else (`session_audience`).
+
+## Files
+
+`trax.files` shows a record's files and what changed in them, each change with
+its diff. It takes a record of any kind and reads the newest files document filed
+for it. No route reads a work tree or a file: the document is an Artifact, and the
+page opens and downloads nothing.
+
+The document is the Artifact's description, one compact JSON object
+(`wire/files_doc.py`, `FilesDoc`, `dump_files`, `load_files`):
+
+| Key | Meaning |
+|---|---|
+| `kind`, `version` | `"files"` and `1`; a reader drops any other version. |
+| `base` | What `changed` is measured against (`origin/main`, a sha); `""` when unknown. |
+| `files`, `more_files` | The tree's paths, sorted and possibly capped; whether more exist. |
+| `changed`, `more_changes` | Each file that differs from `base`, sorted by path; whether more exist. |
+| `changed[].change` | `added`, `modified` or `deleted`; a deleted file is never in `files`. |
+| `changed[].diff`, `note` | Git's diff of the one path, or `""` when `note` is `withheld` or `omitted`; `clipped` cuts it at a line end. |
+| `hidden` | Paths the source withheld from both lists by its own rule. |
+
+It holds no file content beyond diffs and no time, so an unchanged tree writes the
+same text. A producer labels the Artifact `files` and `files:of:<record id>` for
+each record it describes, may add labels of its own, and files a `produced_by`
+edge to each record so the document shows among its relations. A `files:of:` label
+is a link, never a row key: every source of a record's files writes it, so a
+producer that refreshes its row in place finds it by a label only it writes (the
+campaign summary service keys `files:campaign:<lead id>`), or it would overwrite
+another source's document. The shape names no source, so a campaign's work tree, a
+branch or a pull request is filed alike.
+
+The page reads `GET /api/inquiries` for kind Artifact with the labels `files` and
+`files:of:<record id>`, and keeps a row only when it was filed by one of the
+`summary_accounts` in `GET /api/me/profile` (the operator's service accounts) or
+by the account the record itself is filed under, read with
+`GET /api/inquiries/<record id>` only when some row is filed by another account.
+Any writer can put these labels on a row, so a third party's document on someone
+else's record is dropped, while a person's own source (a work tree they file on
+their own session or Issue) shows with no change to the page. Of those kept, the
+newest by `modified` shows, with a count when there are several. The list route
+applies the reader's audiences to every row, so a reader sees a document only
+where they may read that Artifact.
+
+Three bounded params narrow it, applied in order:
+
+- `path` (string, at most 512): `""` shows everything; with `*` or `?` it is a
+  glob over the whole path (`**/` zero or more directories, `*` any run without
+  `/`, `?` one character but `/`); otherwise a prefix (`src/foo/` is that
+  directory). Case is ignored. It narrows the tree and the changes.
+- `changed` (boolean): `true` hides the tree; only the changed files show.
+- `file` (string, at most 512): opens the diff of the changed file at that path,
+  else of every changed file ending in `/<file>`, among only those `path`
+  leaves; it never narrows the list.
+
+As with `trax.subgraph`, a show naming only a new record keeps the params, and a
+show with any param sets all three. The server refuses a param outside its bound
+with the sentence `refuse_params` (`server/visuals/workspaces.py`) writes, which the
+Chat assistant's `ShowFiles` also checks before it asks. `trax.campaign` embeds
+the same panel under the campaign's lineage, reading the brief's document with
+the extra label `campaign:<slug>`.
+
+## Stations
+
+A canvas is a station: a named canvas that holds at most one science chat. The
+signed-in browser lists its stations with `GET /api/workspaces`, makes one with
+`POST /api/workspaces/new`, renames it with `PATCH /api/workspaces/<id>`, and
+returns to it with `POST /api/workspaces/<id>/open`; `POST /api/workspaces` opens
+the one used last. A station keeps its visual instances, agent instructions and
+continuation record as its canvas state, and the page it was last on
+(`PUT /api/workspaces/<id>/page`). The next chat message carries the station's
+guidance and continuation record in its typed context. A station never stores
+session credentials. Existing browser-only saved inquiry queries remain a separate
+feature.
 
 ## Publish shared Artifact content
 
@@ -208,7 +291,6 @@ Any signed-in teammate can read the exact revision at
 `/app/#/lookup/<artifact-id>` or through
 `GET /api/artifacts/<artifact-id>/content`. An agent can show it on a canvas
 with `visual_type: "trax.artifact"` and `record_id` set to the Artifact ID.
-The renderer loads only when shown. `Chat` on its page uses the same `record_id`;
-the agent receives frozen citations and a link to the full content. Custom HTML
+The renderer loads only when shown. Custom HTML
 runs in an opaque-origin iframe with a restrictive content security policy;
 it cannot read the app's session.

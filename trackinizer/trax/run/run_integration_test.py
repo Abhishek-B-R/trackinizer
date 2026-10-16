@@ -44,6 +44,7 @@ import uuid
 
 from fastapi import FastAPI
 from starlette.responses import Response
+from treekle import from_plain
 
 import httpx2
 import pytest
@@ -53,7 +54,6 @@ from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.lib.agent.types.sessions import SessionRecord, UserMessage
-from trackinizer.lib.codec import from_plain
 from trackinizer.lib.posix.relay import ThreadedRelay
 from trackinizer.lib.postgres import PGliteEngine
 from trackinizer.lib.userdirs import state_dir
@@ -75,11 +75,12 @@ from trackinizer.wire.wire_sessions import SessionStart, SessionStartResponse
 
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Awaitable, Callable, Iterator, Sequence
     from datetime import datetime
 
     from starlette.requests import Request
 
+    from trackinizer.lib.agent.types.sessions import FileEditResult
     from trackinizer.trax.run.custom_types import Event
     from trackinizer.trax.run.slash import SlashCommand
     from trackinizer.types.streams import TraxRecord
@@ -1255,6 +1256,10 @@ class _StubSessionSink(Sink):
         del command, at
 
     @override
+    def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+        del records
+
+    @override
     def flush(self) -> None:
         pass
 
@@ -1282,6 +1287,6 @@ def test_server_fixture_boots(server: str) -> None:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

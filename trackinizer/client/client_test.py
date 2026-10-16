@@ -13,16 +13,18 @@ import json
 import logging
 import uuid
 
+from treekle import PlainTree, from_plain, json_loads
+
 import httpx2
 import pytest
 
 from trackinizer.client.client import (
+    ArtifactRevision,
     Client,
     EdgeWrite,
     server_url,
 )
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.codec import PlainTree, from_plain, loads
 from trackinizer.trax import cli, profile
 from trackinizer.trax.conftest import FakeClient
 from trackinizer.trax.grammar import parse_kind, parse_ref
@@ -31,6 +33,7 @@ from trackinizer.wire.filters import Filter
 from trackinizer.wire.refs import SeqRef, UuidRef
 from trackinizer.wire.routes import DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT
 from trackinizer.wire.seq_ranges import SeqRange
+from trackinizer.wire.wire_code import CODE_BLOBS_PATH, CODE_MISSING_PATH
 from trackinizer.wire.wire_export import EXPORT_API_PATH
 from trackinizer.wire.wire_machine_host import (
     ENROLL_PATH,
@@ -436,6 +439,23 @@ class TestRequests:
                 client.post(f"/api/edges/{src}/requires/{dst}")
         assert exc_info.value.status_code == 409
         assert exc_info.value.code == "conflict"
+
+    def test_http_error_carries_the_code_a_detail_nests(self) -> None:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            del request
+            return httpx2.Response(
+                410,
+                json={"detail": {"code": "chat_deleted", "message": "gone"}},
+            )
+
+        with Client("http://server") as client:
+            _install_mock_transport(client, handler)
+            with pytest.raises(ClientError) as exc_info:
+                client.get("/api/chats/x")
+        assert (exc_info.value.status_code, exc_info.value.code) == (
+            410,
+            "chat_deleted",
+        )
 
     def test_wraps_connection_errors(self) -> None:
         def connect_error(request: httpx2.Request) -> httpx2.Response:
@@ -959,6 +979,19 @@ class TestClientMethods:
         )
         assert captured["r"].url.params.get_list("seq_range") == ["222..260", "279.."]
 
+    def test_list_kind_names_the_fields_to_send_or_none_for_whole_rows(self) -> None:
+        seen: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request)
+            return httpx2.Response(200, json=[])
+
+        client = Client("http://server")
+        _install_mock_transport(client, handler)
+        client.list_kind("Issue", fields=("id", "labels"))
+        client.list_kind("Issue")
+        assert [r.url.params.get_list("fields") for r in seen] == [["id", "labels"], []]
+
     def test_list_kind_all_pages_past_the_cap(self) -> None:
         """``list_kind_all`` concatenates every page until a short one.
 
@@ -1209,6 +1242,33 @@ class TestClientMethods:
             ),
         ]
 
+    def test_transition_app_dispatches_the_whole_expected_object(self) -> None:
+        """A row's ``app`` is compared and set whole, on the base fields' route."""
+        target_id = uuid.uuid4()
+        client = _ClientSpy(post_result={"ok": True})
+
+        client.transition_app(
+            target_id,
+            expected_from={"tracker": {"verdict": "works"}},
+            to={"tracker": {"verdict": "works", "patch": "p"}},
+            actor="meter",
+            reason="code change",
+        )
+
+        assert client.request_calls == [
+            (
+                "PUT",
+                f"/api/inquiries/{target_id}/app",
+                {
+                    "actor": "meter",
+                    "value": {"tracker": {"verdict": "works", "patch": "p"}},
+                    "mode": "cas",
+                    "expected": {"tracker": {"verdict": "works"}},
+                    "reason": "code change",
+                },
+            ),
+        ]
+
     def test_annotate_edge_is_best_effort_in_fixed_field_order(self) -> None:
         """``annotate_edge`` is documented best-effort: deterministic order, partial on failure.
 
@@ -1317,13 +1377,15 @@ class TestClientMethods:
 # raw HTTP verbs. The fake bypasses HTTP entirely, so these would be dead
 # on the fake. The variable and machine methods are driven through stub clients in
 # ``trax/variables_test.py`` and ``trax/machines_test.py``, so the shared fake does
-# not carry them.
+# not carry them. No ``trax`` command files code, so the fake carries no code-store
+# method either.
 _FAKE_EXEMPT: frozenset[str] = frozenset(
     {"flags", "from_args", "get", "post", "put", "patch", "delete"}
     | {"list_variables", "put_variable", "delete_variable"}
     | {"list_machines", "get_machine", "put_machine"}
     | {"change_machine_labels", "delete_machine"}
-    | {"enroll_machine", "join_machine", "heartbeat_machine", "revoke_machine"},
+    | {"enroll_machine", "join_machine", "heartbeat_machine", "revoke_machine"}
+    | {"code_missing", "code_put_blobs", "code_put_snapshot", "code_snapshot"},
 )
 
 
@@ -1493,7 +1555,7 @@ def test_a_stale_workspace_operation_is_retried_once_on_the_live_revision() -> N
                 json={"id": str(workspace), "revision": next(revisions)},
             )
         revision = from_plain(
-            from_plain(loads(request.content), dict[str, object])["revision"],
+            json_loads(request.content, dict[str, object])["revision"],
             int,
         )
         sent.append((revision, request.headers["Idempotency-Key"]))
@@ -1537,7 +1599,7 @@ def test_a_navigation_reads_no_revision_and_names_the_route() -> None:
             (
                 request.method,
                 request.url.path,
-                from_plain(loads(request.content), dict[str, object]),
+                json_loads(request.content, dict[str, object]),
             ),
         )
         return httpx2.Response(200, json={"id": str(workspace), "revision": 4})
@@ -1566,7 +1628,7 @@ def test_a_highlight_reads_no_revision_and_names_the_ids() -> None:
             (
                 request.method,
                 request.url.path,
-                from_plain(loads(request.content), dict[str, object]),
+                json_loads(request.content, dict[str, object]),
             ),
         )
         return httpx2.Response(200, json={"id": str(workspace), "revision": 4})
@@ -1583,6 +1645,71 @@ def test_a_highlight_reads_no_revision_and_names_the_ids() -> None:
             {
                 "revision": 0,
                 "operation": {"kind": "highlight", "ids": [str(i) for i in ids]},
+            },
+        ),
+    ]
+
+
+def test_a_chat_window_reads_no_revision_and_names_the_flag() -> None:
+    workspace = uuid.uuid4()
+    seen: list[tuple[str, str, dict[str, object]]] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(
+            (
+                request.method,
+                request.url.path,
+                json_loads(request.content, dict[str, object]),
+            ),
+        )
+        return httpx2.Response(200, json={"id": str(workspace), "revision": 4})
+
+    with Client("http://server") as client:
+        _install_mock_transport(client, handler)
+        state = client.chat_window(workspace, hidden=True)
+
+    assert state["revision"] == 4
+    assert seen == [
+        (
+            "POST",
+            f"/api/workspaces/{workspace}/operations",
+            {"revision": 0, "operation": {"kind": "chat", "hidden": True}},
+        ),
+    ]
+
+
+def test_a_preferences_change_reads_no_revision_and_sends_the_keys() -> None:
+    workspace = uuid.uuid4()
+    seen: list[tuple[str, str, dict[str, object]]] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(
+            (
+                request.method,
+                request.url.path,
+                json_loads(request.content, dict[str, object]),
+            ),
+        )
+        return httpx2.Response(200, json={"id": str(workspace), "revision": 4})
+
+    with Client("http://server") as client:
+        _install_mock_transport(client, handler)
+        state = client.set_preferences(
+            workspace,
+            change={"theme": "light", "chat_side": None},
+        )
+
+    assert state["revision"] == 4
+    assert seen == [
+        (
+            "POST",
+            f"/api/workspaces/{workspace}/operations",
+            {
+                "revision": 0,
+                "operation": {
+                    "kind": "preferences",
+                    "change": {"theme": "light", "chat_side": None},
+                },
             },
         ),
     ]
@@ -1649,7 +1776,7 @@ def test_append_records_with_no_arguments_sends_a_bare_slash_command_free_body()
     sent: list[dict[str, object]] = []
 
     def handler(request: httpx2.Request) -> httpx2.Response:
-        sent.append(from_plain(loads(request.content), dict[str, object]))
+        sent.append(json_loads(request.content, dict[str, object]))
         return httpx2.Response(200, json={"part": None, "written": 0, "skipped": 0})
 
     with Client("http://server") as client:
@@ -1676,7 +1803,7 @@ def test_append_records_posts_the_file_its_manifest_records_and_flags() -> None:
             (
                 request.method,
                 request.url.path,
-                from_plain(loads(request.content), dict[str, object]),
+                json_loads(request.content, dict[str, object]),
             ),
         )
         return httpx2.Response(200, json={"part": 2, "written": 1, "skipped": 0})
@@ -1776,6 +1903,43 @@ def _edge_post(
         return {"change_id": change_id, "created": created}
 
     return fake_post
+
+
+@pytest.mark.parametrize("previous", [None, uuid.uuid4()])
+def test_publish_artifact_content_posts_html_and_reads_the_revision(
+    monkeypatch: pytest.MonkeyPatch,
+    previous: uuid.UUID | None,
+) -> None:
+    """The route gets an HTML body; ``previous_id`` is sent only when given."""
+    client = Client("http://example.com")
+    issue_id, artifact_id = uuid.uuid4(), uuid.uuid4()
+    posted: list[tuple[str, object]] = []
+
+    def fake_post(path: str, *, body: object = None) -> Mapping[str, object]:
+        posted.append((path, body))
+        return {"artifact_id": str(artifact_id), "revision": 2, "title": "Mock"}
+
+    monkeypatch.setattr(client, "post", fake_post)
+
+    result = client.publish_artifact_content(
+        issue_id,
+        title="Mock",
+        summary="Edges first.",
+        html="<!doctype html><p>x</p>",
+        previous_id=previous,
+    )
+
+    assert result == ArtifactRevision(artifact_id=artifact_id, revision=2)
+    expected: dict[str, object] = {
+        "issue_id": str(issue_id),
+        "title": "Mock",
+        "summary": "Edges first.",
+        "format": "html",
+        "html": "<!doctype html><p>x</p>",
+    }
+    if previous is not None:
+        expected["previous_artifact_id"] = str(previous)
+    assert posted == [("/api/artifacts/content", expected)]
 
 
 def test_add_edge_reports_created(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2046,17 +2210,19 @@ class TestSessionMethods:
                             "source": "viewer@example.com",
                             "context": {
                                 "workspace_id": str(workspace_id),
-                                "record_id": str(record_id),
                                 "agent_instructions": "Trace the evidence.",
                                 "continuation_record_id": str(record_id),
-                                "record": {
-                                    "id": str(record_id),
-                                    "kind": "Issue",
-                                    "seq": 21_706,
-                                    "title": "ARC3 effort",
+                                "page": {
+                                    "route": f"#/lookup/{record_id}",
+                                    "record": {
+                                        "id": str(record_id),
+                                        "kind": "Issue",
+                                        "seq": 21_706,
+                                        "title": "ARC3 effort",
+                                    },
                                 },
                                 "visible_visuals": [
-                                    {"id": str(visual_id), "type": "trax.chat"},
+                                    {"id": str(visual_id), "type": "trax.browse"},
                                 ],
                             },
                         },
@@ -2074,24 +2240,58 @@ class TestSessionMethods:
         assert context is not None
         assert context.model_dump(mode="json") == {
             "workspace_id": str(workspace_id),
-            "record_id": str(record_id),
             "agent_instructions": "Trace the evidence.",
             "continuation_record_id": str(record_id),
-            "record": {
-                "id": str(record_id),
-                "kind": "Issue",
-                "seq": 21_706,
-                "title": "ARC3 effort",
-            },
-            "artifact_content": None,
             "visible_visuals": [
-                {"id": str(visual_id), "type": "trax.chat", "record": None},
+                # A server from before params sends none; the drain must still read
+                # the visual, as one with no narrowing, not drop the whole context.
+                {
+                    "id": str(visual_id),
+                    "type": "trax.browse",
+                    "record": None,
+                    "params": {},
+                },
             ],
             "conversation_id": None,
             "fork": None,
-            "page": None,
+            "page": {
+                "route": f"#/lookup/{record_id}",
+                "record": {
+                    "id": str(record_id),
+                    "kind": "Issue",
+                    "seq": 21_706,
+                    "title": "ARC3 effort",
+                },
+            },
             "trail": [],
+            "relay": None,
         }
+
+    def test_inbound_drain_preserves_a_console_relay(self) -> None:
+        session_id = uuid.uuid4()
+        relay = {
+            "targets": [{"actor": "lead-2", "room": None}],
+            "text": "rerun the suite",
+        }
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            del request
+            context: dict[str, object] = {
+                "workspace_id": str(uuid.uuid4()),
+                "visible_visuals": [],
+                "relay": relay,
+            }
+            message: dict[str, object] = {"text": "rerun the suite", "context": context}
+            return httpx2.Response(200, json={"messages": [message]})
+
+        with Client("http://server") as client:
+            _install_mock_transport(client, handler)
+            ((_text, _source, _room, context),) = client.drain_inbound(session_id)
+
+        assert context is not None
+        assert context.relay is not None
+        assert context.relay.model_dump(mode="json") == relay
+        assert context.relay.line() == "→ lead-2: rerun the suite"
 
     @pytest.mark.parametrize("wait_sec", [0.0, 30.0])
     def test_inbound_drain_read_timeout_outlasts_the_hold(
@@ -2123,6 +2323,37 @@ class TestSessionMethods:
             _ = client.get("/api/x", timeout=42.0)
 
         assert reads == [42.0]
+
+    def test_send_message_sends_the_body_an_older_server_accepts(self) -> None:
+        """A server that predates ``asker`` forbids a field it does not know."""
+        bodies: list[object] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            bodies.append(json_loads(request.content))
+            return httpx2.Response(200, json={"delivered": []})
+
+        with Client("http://server") as client:
+            _install_mock_transport(client, handler)
+            _ = client.send_message("lead", "hi")
+            _ = client.send_message("lead", "hi", room="ops")
+
+        assert bodies == [
+            {"actor": "lead", "room": None, "text": "hi"},
+            {"actor": "lead", "room": "ops", "text": "hi"},
+        ]
+
+    def test_enqueue_inbound_sends_the_body_an_older_server_accepts(self) -> None:
+        bodies: list[object] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            bodies.append(json_loads(request.content))
+            return httpx2.Response(200, json={"queued": 1})
+
+        with Client("http://server") as client:
+            _install_mock_transport(client, handler)
+            _ = client.enqueue_inbound(uuid.uuid4(), "hi")
+
+        assert bodies == [{"text": "hi"}]
 
 
 class TestExport:
@@ -2225,7 +2456,7 @@ class TestVariableMethods:
 
         [request] = seen
         assert (request.method, request.url.path) == ("PUT", "/api/variables/TOKEN")
-        assert loads(request.content) == {"value": "s3", "secret": True}
+        assert json_loads(request.content) == {"value": "s3", "secret": True}
 
     def test_put_variable_escapes_the_name_in_the_path(self) -> None:
         seen: list[httpx2.Request] = []
@@ -2264,6 +2495,143 @@ class TestVariableMethods:
             ("DELETE", "/api/variables/REGION"),
         ] * 2
         assert err.value.status_code == 404
+
+
+_CODE_SHA = "ab" * 32
+_CODE_HEAD = {
+    "parent_record_id": None,
+    "private": False,
+    "file_count": 1,
+    "total_bytes": 3,
+    "partial": "",
+    "updated_at": "2026-10-15T12:00:00Z",
+}
+
+
+class TestCodeMethods:
+    """The code-store methods build the right requests and parse the answers."""
+
+    def test_code_missing_asks_under_the_lowercase_owner(self) -> None:
+        seen: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request)
+            return httpx2.Response(200, json={"missing": [_CODE_SHA]})
+
+        with Client("https://server") as client:
+            _install_mock_transport(client, handler)
+            missing = client.code_missing("Ada@X.Y", hashes=[_CODE_SHA])
+
+        [request] = seen
+        assert (request.method, request.url.path) == ("POST", CODE_MISSING_PATH)
+        assert json_loads(request.content) == {
+            "owner": "ada@x.y",
+            "sha256": [_CODE_SHA],
+        }
+        assert missing == [_CODE_SHA]
+
+    def test_code_put_blobs_sends_each_hash_with_its_text(self) -> None:
+        seen: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request)
+            return httpx2.Response(200, json={"stored": 1})
+
+        with Client("https://server") as client:
+            _install_mock_transport(client, handler)
+            stored = client.code_put_blobs("a@x.y", blobs={_CODE_SHA: "abc"})
+
+        [request] = seen
+        assert (request.method, request.url.path) == ("POST", CODE_BLOBS_PATH)
+        assert json_loads(request.content) == {
+            "owner": "a@x.y",
+            "blobs": [{"sha256": _CODE_SHA, "text": "abc"}],
+        }
+        assert stored == 1
+
+    def test_code_put_snapshot_puts_it_under_the_record_and_parses_the_head(
+        self,
+    ) -> None:
+        record, parent = uuid.uuid4(), uuid.uuid4()
+        seen: list[httpx2.Request] = []
+
+        head = {**_CODE_HEAD, "record_id": str(record)}
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            seen.append(request)
+            return httpx2.Response(200, json=head)
+
+        with Client("https://server") as client:
+            _install_mock_transport(client, handler)
+            head = client.code_put_snapshot(
+                record,
+                owner="a@x.y",
+                private=True,
+                parent_record_id=parent,
+                files={"a.py": _CODE_SHA},
+            )
+
+        [request] = seen
+        assert (request.method, request.url.path) == (
+            "PUT",
+            f"/api/code/records/{record}/snapshot",
+        )
+        assert json_loads(request.content) == {
+            "owner": "a@x.y",
+            "private": True,
+            "parent_record_id": str(parent),
+            "files": {"a.py": _CODE_SHA},
+            "partial": "",
+        }
+        assert (head.record_id, head.file_count) == (record, 1)
+
+    def test_code_snapshot_is_none_on_404_and_raises_on_any_other_refusal(
+        self,
+    ) -> None:
+        record = uuid.uuid4()
+        answers = iter(
+            (
+                httpx2.Response(
+                    200,
+                    json={
+                        **_CODE_HEAD,
+                        "record_id": str(record),
+                        "files": [{"path": "a.py", "sha256": _CODE_SHA, "size": 3}],
+                    },
+                ),
+                httpx2.Response(404, json={"detail": "No code snapshot"}),
+                httpx2.Response(403, json={"detail": "role too low"}),
+            ),
+        )
+
+        path = f"/api/code/records/{record}/snapshot"
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            assert (request.method, request.url.path) == ("GET", path)
+            return next(answers)
+
+        with Client("https://server") as client:
+            _install_mock_transport(client, handler)
+            snapshot = client.code_snapshot(record)
+            absent = client.code_snapshot(record)
+            with pytest.raises(ClientError) as err:
+                client.code_snapshot(record)
+
+        assert snapshot is not None
+        assert [(f.path, f.size) for f in snapshot.files] == [("a.py", 3)]
+        assert absent is None
+        assert err.value.status_code == 403
+
+    def test_a_malformed_hash_is_refused_before_sending(self) -> None:
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            raise AssertionError(f"sent {request.url}")
+
+        with Client("https://server") as client:
+            _install_mock_transport(client, handler)
+            with pytest.raises(ClientError, match="sha256") as err:
+                client.code_missing("a@x.y", hashes=["not-a-hash"])
+
+        assert err.value.status_code is None
 
 
 _MACHINE_ROW = {
@@ -2346,7 +2714,7 @@ class TestMachineMethods:
         assert [(r.method, r.url.path) for r in seen] == [
             ("PUT", "/api/machines/gpu-box"),
         ] * 3
-        assert [loads(r.content) for r in seen] == [
+        assert [json_loads(r.content) for r in seen] == [
             {"role": "dev"},
             {"how": ""},
             {"role": "", "how": "ssh gpu-box"},
@@ -2408,7 +2776,7 @@ class TestMachineMethods:
         assert [(r.method, r.url.path) for r in seen] == [
             ("PATCH", "/api/machines/gpu-box/labels"),
         ] * 2
-        assert [loads(r.content) for r in seen] == [
+        assert [json_loads(r.content) for r in seen] == [
             {"add": ["gpu"], "remove": []},
             {"add": [], "remove": ["a100"]},
         ]
@@ -2457,7 +2825,7 @@ class TestMachineHostMethods:
             enrolled = client.enroll_machine("gpu-box")
 
         assert [(r.method, r.url.path) for r in seen] == [("POST", ENROLL_PATH)]
-        assert loads(seen[0].content) == {"name": "gpu-box"}
+        assert json_loads(seen[0].content) == {"name": "gpu-box"}
         assert enrolled.token == _ENROLLMENT_TOKEN
 
     def test_join_machine_sends_once_and_parses_the_credential(self) -> None:
@@ -2487,7 +2855,7 @@ class TestMachineHostMethods:
         assert len(seen) == 1
         assert err.value.status_code == 503
         assert [(r.method, r.url.path) for r in seen] == [("POST", JOIN_PATH)]
-        assert loads(seen[0].content) == {
+        assert json_loads(seen[0].content) == {
             "name": "gpu-box",
             "token": _ENROLLMENT_TOKEN,
             "instance": str(_INSTANCE),
@@ -2581,7 +2949,7 @@ class TestMachineHostMethods:
             ("POST", HEARTBEAT_PATH.format(machine_id=_MACHINE_ID)),
         ] * 2
         assert seen[0].headers["Authorization"] == f"Bearer {_CREDENTIAL}"
-        assert [loads(r.content) for r in seen] == [
+        assert [json_loads(r.content) for r in seen] == [
             {"instance": str(_INSTANCE), "host_version": "0.1"},
             {"instance": str(_INSTANCE), "host_version": "0.1", "facts": {"cpus": 4}},
         ]
@@ -2637,7 +3005,55 @@ class TestMachineHostMethods:
         assert err.value.status_code == 404
 
 
+class TestMetricQueries:
+    def test_query_metrics_sends_offset(self) -> None:
+        """The query route pages by ``offset``; the client must carry it."""
+        sent: list[dict[str, object]] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(json_loads(request.content, dict[str, object]))
+            return httpx2.Response(200, json={"points": []})
+
+        with Client("https://server") as client:
+            _install_mock_transport(client, handler)
+            client.query_metrics(
+                uuid.uuid4(),
+                masks=[],
+                sort="asc",
+                limit=1,
+                offset=1,
+            )
+        assert [(body["sort"], body["limit"], body["offset"]) for body in sent] == [
+            ("asc", 1, 1),
+        ]
+
+    @pytest.mark.parametrize(
+        "experiments",
+        [
+            [],
+            [uuid.uuid4(), Filter(field="labels", op="is", value="x")],
+        ],
+        ids=["empty", "ids-and-filters"],
+    )
+    def test_rank_metrics_refuses_a_bad_selection_as_a_client_error(
+        self,
+        experiments: list[uuid.UUID] | list[Filter],
+    ) -> None:
+        """Nothing to rank, or two selections at once, is refused before sending."""
+        sent: list[httpx2.Request] = []
+
+        def handler(request: httpx2.Request) -> httpx2.Response:
+            sent.append(request)
+            return httpx2.Response(200, json={"rows": []})
+
+        with Client("https://server") as client:
+            _install_mock_transport(client, handler)
+            with pytest.raises(ClientError, match="metric rank"):
+                client.rank_metrics(experiments, masks=[])
+        assert sent == []
+
+
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

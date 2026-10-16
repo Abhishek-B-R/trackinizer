@@ -6,57 +6,77 @@ import { formatRoute, type Route } from "../router/route";
 import { useRouter } from "../router/router";
 import { chooseTheme, useTheme } from "../theme";
 import { Icon, Logo } from "../ui/icons";
+import { useOnline } from "../ui/bars";
 import { KindIcon, kindLook } from "../ui/kinds";
 import { type Panel, type PanelSpec, PanelToggle } from "../ui/panel";
+import { useToast } from "../ui/toast";
 import { useMeta, useProfile } from "./boot";
-
+import { NO_AUTH_EMAIL, useSignOut } from "./signOut";
+import { useWorkbenchPresent, WorkbenchSlot } from "./workbenchSlot";
 /**
- * The sidebar as a panel, collapsed by ⌘B (Ctrl+B), as VS Code's primary side
- * bar is: `[` and `]` are each view's own panels'.
+ * The sidebar as a panel, pinned open or collapsed by ⌘B (Ctrl+B), as VS
+ * Code's primary side bar is: `[` and `]` are each view's own panels'. It
+ * starts as a rail, which hovering opens over the workbench. It stands at the
+ * left of the canvas, whichever side Chat is on.
  */
-export const SIDEBAR: PanelSpec = { id: "app.sidebar", name: "sidebar", side: "left", keys: ["$mod+b"] };
+export const SIDEBAR: PanelSpec = { id: "app.sidebar", name: "sidebar", side: "left", keys: ["$mod+b"], startsCollapsed: true };
 
 /** The sidebar's element id, which its collapse and expand button controls. */
 const SIDEBAR_ID = "app-sidebar";
 
 /**
- * The sidebar: the logo, search, New, Graph (the home view), Console,
- * Activity, one Browse entry per kind, Settings (with Admin for admins only),
- * and the signed-in user. The mock's other entries (Starred, Notifications,
- * Views, Later) belong to later phases and stay out until those ship. The
- * button beside New collapses it (`panel`) to a rail, as VS Code's activity bar
- * is: the button that expands it on top, then search, New and every entry's
- * icon, each named and titled by its label, and the user's avatar. On a phone
- * it is the drawer, whole, collapsed or not (styles.css).
+ * The sidebar: the logo, Search, New, Graph (the home view), Console,
+ * Activity, one Browse entry per kind, the Workbench section (the canvas's
+ * visuals and Artifact link, while a canvas is mounted, folded at first), and at
+ * its foot Your settings, Admin (for admins only), the theme, Sign out (unless
+ * the server runs with `--no-auth`) and the signed-in user. Each icon stands where the rail has it, opened or not. The mock's other
+ * entries (Starred, Notifications, Views, Later) belong to later phases and
+ * stay out until those ship. The button beside the logo, at the sidebar's
+ * outer edge, collapses it (`panel`) to a rail, as VS Code's activity bar is:
+ * that button on top, then Search, New and every entry's icon, each named and
+ * titled by its label, and the user's avatar. At the outer edge the button
+ * stays where it is as the rail opens and folds. On a phone it is the drawer,
+ * whole, collapsed or not (styles.css).
  */
-export function Sidebar({ onNavigate, panel }: { onNavigate: () => void; panel: Panel }) {
+export function Sidebar({ onNavigate, onWorkbench, panel }: {
+  readonly onNavigate: () => void;
+  /** The rail's Workbench icon was pressed: open the sidebar on that section. */
+  readonly onWorkbench: () => void;
+  readonly panel: Panel;
+}) {
   const { kinds } = useMeta();
   const profile = useProfile();
   const { route } = useRouter();
   const palette = usePalette();
   const currentKind = route.name === "list" || route.name === "ref" ? route.kind : null;
   const compact = panel.collapsed;
+  const workbench = useWorkbenchPresent();
+  // Folded at first: the visual toggles are there when wanted, and the rail's icon unfolds them.
+  const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const toggle = <PanelToggle panel={panel} controls={SIDEBAR_ID} />;
   return (
     <nav id={SIDEBAR_ID} className="sidebar" aria-label="Sidebar">
       <div className="ws-row">
-        {/* On top in the rail, last beside New: placed here, not by CSS `order`, so Tab meets it where the eye does. */}
-        {compact ? toggle : null}
+        {/* At the outer edge, the left: placed first, so Tab meets it where the eye does. The rail hides the logo. */}
+        {toggle}
         <a className="ws-switch" href={formatRoute({ name: "graph" })} onClick={onNavigate}>
           <Logo />
           Trackinizer
         </a>
+      </div>
+      <div className="sidebar-tools">
         <button
           type="button"
-          className="icon-btn"
+          className="sidebar-search"
           onClick={() => palette.show()}
           title={`Search and commands (${keyCaps("$mod+k").join(" ")})`}
           aria-label="Search"
         >
           <Icon name="search" />
+          <span className="label">Search</span>
+          <kbd>{keyCaps("$mod+k").join(" ")}</kbd>
         </button>
         <ComposeButton onNavigate={onNavigate} />
-        {compact ? null : toggle}
       </div>
       <NavItem
         route={{ name: "graph" }}
@@ -95,7 +115,24 @@ export function Sidebar({ onNavigate, panel }: { onNavigate: () => void; panel: 
           />
         ))}
       </NavSection>
-      <NavSection title="Settings">
+      {/* Its body is where the canvas draws its controls; in the rail only the icon stands, which opens the sidebar on them. */}
+      <NavSection title="Workbench" hidden={!workbench} open={workbenchOpen} onOpen={setWorkbenchOpen}>
+        <button
+          type="button"
+          className="nav-item workbench-rail"
+          aria-label="Workbench"
+          title="Workbench"
+          onClick={() => {
+            setWorkbenchOpen(true);
+            onWorkbench();
+          }}
+        >
+          <Icon name="sliders" />
+        </button>
+        <WorkbenchSlot />
+      </NavSection>
+      {/* The foot, a row each: Settings, Admin, the theme, Sign out and the user, in the rail as opened. */}
+      <div className="sidebar-foot">
         <NavItem
           route={{ name: "settings" }}
           current={route.name === "settings"}
@@ -114,17 +151,14 @@ export function Sidebar({ onNavigate, panel }: { onNavigate: () => void; panel: 
             onNavigate={onNavigate}
           />
         ) : null}
-      </NavSection>
-      <div className="sidebar-foot">
-        <div className="foot-row">
-          <div className="me-row" role="group" aria-label="Signed in" title={compact ? `${profile.email} (${profile.role})` : undefined}>
-            <span className="avatar" aria-hidden="true">
-              {profile.email.charAt(0).toUpperCase()}
-            </span>
-            <span className="me-email">{profile.email}</span>
-            <span className="role-chip">{profile.role}</span>
-          </div>
-          <ThemeButton />
+        <ThemeButton />
+        {profile.email === NO_AUTH_EMAIL ? null : <SignOutButton />}
+        <div className="me-row" role="group" aria-label="Signed in" title={compact ? `${profile.email} (${profile.role})` : undefined}>
+          <span className="avatar" aria-hidden="true">
+            {profile.email.charAt(0).toUpperCase()}
+          </span>
+          <span className="me-email">{profile.email}</span>
+          <span className="role-chip">{profile.role}</span>
         </div>
       </div>
     </nav>
@@ -133,24 +167,61 @@ export function Sidebar({ onNavigate, panel }: { onNavigate: () => void; panel: 
 
 /**
  * Switches the theme shown, dark to light or light to dark, as a browser
- * choice; Settings keeps System as well. It shows the theme it switches to.
+ * choice; Settings keeps System as well. A row of the foot, it shows the theme
+ * it switches to.
  */
 function ThemeButton() {
   const { shown } = useTheme();
   const next = shown === "dark" ? "light" : "dark";
   const label = `Switch to ${next} theme`;
   return (
-    <button type="button" className="icon-btn theme-btn" aria-label={label} title={label} onClick={() => chooseTheme(next)}>
+    <button type="button" className="nav-item theme-btn" aria-label={label} title={label} onClick={() => chooseTheme(next)}>
       <Icon name={next === "light" ? "sun" : "moon"} />
+      <span className="label">{next === "light" ? "Light theme" : "Dark theme"}</span>
     </button>
   );
 }
 
-/** A titled group of entries that its title collapses and opens. */
-function NavSection({ title, children }: { title: string; children: ReactNode }) {
-  const [open, setOpen] = useState(true);
+/** Sign out, as Settings does; a failure shows as a toast, which the rail has room for. */
+function SignOutButton() {
+  const online = useOnline();
+  const toast = useToast();
+  const { pending, leave } = useSignOut({ failed: ({ message, error }) => toast(`Could not sign out. ${message}`, { failed: true, error }) });
   return (
-    <div className={open ? "nav-section" : "nav-section is-collapsed"}>
+    <button
+      type="button"
+      className="nav-item sign-out"
+      aria-label="Sign out"
+      title="Sign out"
+      disabled={!online}
+      aria-disabled={pending || undefined}
+      onClick={() => void leave()}
+    >
+      <Icon name="logOut" />
+      <span className="label">Sign out</span>
+    </button>
+  );
+}
+
+/** A titled group of entries that its title collapses and opens: open at first, unless its owner holds `open`. */
+function NavSection({
+  title,
+  hidden = false,
+  open: held,
+  onOpen,
+  children,
+}: {
+  title: string;
+  hidden?: boolean;
+  open?: boolean;
+  onOpen?: (open: boolean) => void;
+  children: ReactNode;
+}) {
+  const [own, setOwn] = useState(true);
+  const open = held ?? own;
+  const setOpen = onOpen ?? setOwn;
+  return (
+    <div className={open ? "nav-section" : "nav-section is-collapsed"} hidden={hidden}>
       <button type="button" className="nav-section-h" aria-expanded={open} onClick={() => setOpen(!open)}>
         {title}
         <Icon name="chevD" size={12} />

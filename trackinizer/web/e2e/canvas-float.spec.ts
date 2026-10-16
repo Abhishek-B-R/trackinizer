@@ -1,6 +1,6 @@
 import { mkdirSync } from "node:fs";
 import type { APIRequestContext, Locator, Page } from "@playwright/test";
-import { expect, test } from "./fixtures";
+import { expect, setPreferences, test } from "./fixtures";
 import { resetCanvas } from "./canvasState";
 
 // A floating tile (the context graph, floated) moves by its whole top bar and
@@ -8,8 +8,8 @@ import { resetCanvas } from "./canvasState";
 // when its bar is dragged out. A click on the bar focuses the tile, its fold
 // button folds it to the bar, and where it stands and whether it is folded
 // survive a reload. It resizes by any edge or corner, and docked tiles trade
-// room by the divider between them. Chat is docked, and floats only while it stands aside
-// (canvas-chat-aside.spec.ts), so it is not the tile here.
+// room by the divider between them. Chat is a column of its own beside the
+// canvas (chat-column.spec.ts), so it is not a tile here.
 
 test.use({ canvas: true });
 
@@ -19,8 +19,8 @@ test.afterEach(async ({ request }) => {
 
 const SHOTS = "/opt/scratch/artifacts/trax-hosted/ui/chatwindow";
 
-/** A canvas holding the page and the context graph of a fresh Issue floating over it. */
-async function floatGraph(request: APIRequestContext): Promise<void> {
+/** A canvas holding the page and the context graph of a fresh Issue floating over it; the canvas's id and the Issue's. */
+async function floatGraph(request: APIRequestContext): Promise<{ readonly workspace: string; readonly issue: string }> {
   const ok = async <T>(response: { ok(): boolean; text(): Promise<string>; json(): Promise<unknown> }) => {
     expect(response.ok(), await response.text()).toBe(true);
     return (await response.json()) as T;
@@ -37,17 +37,13 @@ async function floatGraph(request: APIRequestContext): Promise<void> {
   }));
   for (const visual of state.visuals.filter((held) => held.type !== "trax.browse")) await apply({ kind: "hide", instance_id: visual.id });
   await apply({ kind: "show", visual_type: "trax.subgraph", placement: "floating", record_id: ids[0] });
+  return { workspace: state.id, issue: ids[0]! };
 }
 
 async function open(page: Page, theme: "dark" | "light" = "dark"): Promise<{ tile: Locator; bar: Locator }> {
-  await page.addInitScript((choice) => {
-    try {
-      localStorage.setItem("trackinizer.theme", choice);
-    } catch {
-      // about:blank has no storage.
-    }
-  }, theme);
-  await page.setViewportSize({ width: 1280, height: 800 });
+  await setPreferences(page.request, { theme });
+  // Wide enough that the stage, beside the sidebar and the Chat column, is as wide as the specs assume.
+  await page.setViewportSize({ width: 1600, height: 900 });
   await page.goto("/app/#/list/Issue");
   const tile = page.locator(".visual-tile-floating");
   await expect(tile.getByRole("region", { name: "Context graph" })).toBeVisible();
@@ -247,7 +243,7 @@ test("a drag cut off by the tile leaving the page does not freeze every tile", a
   await page.mouse.down();
   await page.mouse.move(title.x + 50, title.y + 10, { steps: 4 });
   // The tile is hidden under the pointer (an agent or another tab does the same), so no release reaches its bar.
-  await page.evaluate(() => document.querySelector<HTMLElement>("[title='Dismiss visual']")!.click());
+  await page.evaluate(() => document.querySelector<HTMLElement>(".visual-tile-floating [title='Dismiss visual']")!.click());
   await expect(page.locator(".visual-tile-floating")).toHaveCount(0);
   await page.mouse.up();
   await floatGraph(request);
@@ -265,10 +261,10 @@ test("a tile a narrow window pushed in returns to its saved place when the windo
   await dragBy(page, bar.locator("span"), -200, 0);
   const placed = await box(tile);
   await page.setViewportSize({ width: 390, height: 800 });
-  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.setViewportSize({ width: 1600, height: 900 });
   await expect.poll(async () => Math.round((await box(tile)).x)).toBe(Math.round(placed.x));
   await page.setViewportSize({ width: 1000, height: 700 });
-  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.setViewportSize({ width: 1600, height: 900 });
   await expect.poll(async () => Math.round((await box(tile)).x)).toBe(Math.round(placed.x));
 });
 
@@ -282,6 +278,55 @@ test("a smaller window holds a saved place inside the page", async ({ page, requ
     const held = await box(tile);
     return held.x + held.width <= stage.x + stage.width + 1;
   }).toBe(true);
+});
+
+test("a phone shows a floating tile as a full-width header and keeps its desktop geometry", async ({ page, request }) => {
+  await floatGraph(request);
+  const { tile, bar } = await open(page);
+  // At 760 px and below the app shows Chat alone and hides the workbench.
+  await page.setViewportSize({ width: 800, height: 844 });
+  const unsizedStage = await box(page.locator(".visual-stage"));
+  const unsized = await box(tile);
+  expect(Math.abs(unsized.x - unsizedStage.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(unsized.width - unsizedStage.width)).toBeLessThanOrEqual(1);
+  expect(unsized.height).toBe(34);
+
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await dragBy(page, bar.locator("span"), -300, 80);
+  const edge = tile.locator(".visual-window-edge-e");
+  const edgeBox = await box(edge);
+  await page.mouse.move(edgeBox.x + edgeBox.width / 2, edgeBox.y + edgeBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(edgeBox.x + edgeBox.width / 2 + 40, edgeBox.y + edgeBox.height / 2, { steps: 5 });
+  await page.mouse.up();
+  const saved = await box(tile);
+  await page.setViewportSize({ width: 800, height: 844 });
+  const stage = await box(page.locator(".visual-stage"));
+  const phone = await box(tile);
+  expect(Math.abs(phone.x - stage.x)).toBeLessThanOrEqual(1);
+  expect(Math.abs(phone.width - stage.width)).toBeLessThanOrEqual(1);
+  expect(phone.x).toBeGreaterThanOrEqual(0);
+  expect(phone.x + phone.width).toBeLessThanOrEqual(800);
+  expect(phone.height).toBe(34);
+
+  await bar.getByRole("button", { name: "Expand" }).click();
+  await expect(tile).toHaveClass(/visual-tile-mobile-expanded/);
+  const expanded = await box(tile);
+  expect(expanded.height).toBeGreaterThan(34);
+  await bar.getByRole("button", { name: "Collapse" }).click();
+  const collapsed = await box(tile);
+  expect(collapsed.height).toBe(34);
+
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await expect.poll(async () => {
+    const restored = await box(tile);
+    return [restored.x, restored.y, restored.width, restored.height].map(Math.round);
+  }).toEqual([saved.x, saved.y, saved.width, saved.height].map(Math.round));
+  const restored = await box(tile);
+  test.info().annotations.push({
+    type: "mobile-canvas-geometry",
+    description: JSON.stringify({ viewport: 800, unsizedStage, unsized, stage, phone, expanded, collapsed, saved, restored }),
+  });
 });
 
 test("dropped at an edge of the stage the tile docks there, and dragged out by its bar it floats again", async ({ page, request }) => {
@@ -307,14 +352,14 @@ test("dropped at an edge of the stage the tile docks there, and dragged out by i
 
   // Out by its bar: the tile stays in its column while a card follows the pointer, then floats where it is dropped.
   await press(graph.locator(".visual-tile-toolbar span"));
-  await page.mouse.move(stage.x + 500, stage.y + 200, { steps: 8 });
+  await page.mouse.move(stage.x + 300, stage.y + 200, { steps: 8 });
   await expect(page.locator(".visual-drag-ghost")).toBeVisible();
   await expect(graph).toHaveClass(/visual-tile-left/);
   await page.mouse.up();
   await expect(tile).toBeVisible();
   await expect(page.locator(".visual-drag-ghost")).toBeHidden();
   const floated = await box(tile);
-  expect(Math.round(floated.x - stage.x)).toBe(440);
+  expect(Math.round(floated.x - stage.x)).toBe(240);
   expect(Math.round(floated.y - stage.y)).toBe(184);
 
   // To the top edge: it joins the page's strip.
@@ -370,7 +415,7 @@ test("the window resizes by every edge and corner, down to its least size, and k
 });
 
 test("docked tiles trade room by the divider between them: across the page's strip, and down a column", async ({ page, request }) => {
-  await floatGraph(request);
+  const { workspace, issue } = await floatGraph(request);
   const { bar } = await open(page);
   const stage = await box(page.locator(".visual-stage"));
   const graph = page.locator(".visual-tile", { has: page.getByRole("region", { name: "Context graph" }) });
@@ -399,13 +444,19 @@ test("docked tiles trade room by the divider between them: across the page's str
   await expect(graph).toBeVisible();
   expect(Math.abs((await box(browse)).width - pageNow.width)).toBeLessThan(2);
 
-  // Down a column: the graph over Chat, at the right.
-  await page.locator(".visual-toolbar-actions").getByRole("button", { name: "Chat", exact: true }).click();
-  const chat = page.locator(".visual-tile:has(.chat-panel)");
-  await expect(chat).toBeVisible();
+  // Down a column: the graph over the timeline, at the right.
+  const current = await request.get(`/api/workspaces/${workspace}`);
+  expect(current.ok(), await current.text()).toBe(true);
+  const shown = await request.post(`/api/workspaces/${workspace}/operations`, {
+    headers: { "Idempotency-Key": crypto.randomUUID() },
+    data: { revision: ((await current.json()) as { revision: number }).revision, operation: { kind: "show", visual_type: "trax.timeline", placement: "side", record_id: issue } },
+  });
+  expect(shown.ok(), await shown.text()).toBe(true);
+  const timeline = page.locator(".visual-tile", { has: page.getByRole("region", { name: "Lineage and timeline" }) });
+  await expect(timeline).toBeVisible();
   await graph.getByRole("button", { name: "Dock Context graph at the right" }).click();
   await expect(graph).toHaveClass(/visual-tile-side/);
-  const [upper, lower] = (await box(graph)).y < (await box(chat)).y ? [graph, chat] : [chat, graph];
+  const [upper, lower] = (await box(graph)).y < (await box(timeline)).y ? [graph, timeline] : [timeline, graph];
   const [upperWas, lowerWas] = [await box(upper), await box(lower)];
   await slide(page.locator(".visual-side-column > .visual-divider"), 0, 50);
   expect(Math.round((await box(upper)).height - upperWas.height)).toBe(50);

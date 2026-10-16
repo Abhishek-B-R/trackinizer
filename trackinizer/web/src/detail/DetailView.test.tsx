@@ -113,7 +113,7 @@ test("a detail draws its page in a render after the one its inquiry lands in, wh
 });
 
 test("an Artifact lookup link shows its published content", async () => {
-  const artifact = row("Artifact", 7);
+  const artifact = { ...row("Artifact", 7), id: uuid(70) };
   stubFetch((request) => {
     const path = new URL(request.url).pathname;
     if (path === `/api/web/get/${artifact.id}`) return Response.json(detail(artifact));
@@ -701,6 +701,29 @@ test("Purge shows in the danger style in the inquiry's ⋯ menu", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Issue#1 actions" }));
   expect(screen.getByRole("option", { name: "Purge…" }).classList.contains("danger")).toBe(true);
   expect(screen.getByRole("option", { name: /^Add relation…/ }).classList.contains("danger")).toBe(false);
+});
+
+async function openActions(account: string, role: "writer" | "admin" = "writer") {
+  stubLayout();
+  serveDetails([detail(row("Issue", 1, { account }))]);
+  renderDetail({ kind: "Issue", seq: 1 }, undefined, { profile: { ...PROFILE, role } });
+  await screen.findByRole("heading", { level: 1 });
+  await userEvent.click(screen.getByRole("button", { name: "Issue#1 actions" }));
+}
+
+test("Purge is not offered to a writer who is not the row's account", async () => {
+  await openActions("bob@example.com");
+  expect(screen.queryByRole("option", { name: "Purge…" })).toBeNull();
+});
+
+test("Purge is offered to the row's account, whatever the case of the address", async () => {
+  await openActions("ADA@example.com");
+  expect(screen.getByRole("option", { name: "Purge…" })).toBeTruthy();
+});
+
+test("Purge is offered to an admin on another account's row", async () => {
+  await openActions("bob@example.com", "admin");
+  expect(screen.getByRole("option", { name: "Purge…" })).toBeTruthy();
 });
 
 test("a locked inquiry wears a Locked badge, and an unlocked one does not", async () => {

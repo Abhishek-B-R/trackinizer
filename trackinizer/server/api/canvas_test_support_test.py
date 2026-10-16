@@ -8,11 +8,12 @@ from typing import TYPE_CHECKING
 import asyncio
 import uuid
 
+from treekle import json_loads
+
 import httpx2
 import pytest
 
 from trackinizer.conftest import make_store
-from trackinizer.lib.codec import from_plain, loads
 from trackinizer.server.api import canvas_test_support
 from trackinizer.server.api.canvas_test_support import (
     KB_EMAIL,
@@ -33,7 +34,6 @@ from trackinizer.server.api.canvas_test_support import (
     revision_of,
     seed_accounts,
     send_chat,
-    show_chat,
     start_session,
 )
 from trackinizer.server.api.conftest import (
@@ -66,12 +66,14 @@ def test_a_browser_acts_with_no_key(installed: list[AuthIdentity]) -> None:
             api_key_id=None,
             email=TEST_USER_EMAIL,
             role="writer",
+            hosted_domain="example.com",
         ),
         AuthIdentity(
             user_id=OTHER_USER_ID,
             api_key_id=None,
             email=OTHER_EMAIL,
             role="writer",
+            hosted_domain="example.com",
         ),
     ]
 
@@ -91,30 +93,35 @@ def test_each_agent_acts_through_its_own_key_as_a_viewer_unless_told(
             api_key_id=TEST_API_KEY_ID,
             email=TEST_USER_EMAIL,
             role="viewer",
+            hosted_domain="example.com",
         ),
         AuthIdentity(
             user_id=OTHER_USER_ID,
             api_key_id=OTHER_KEY_ID,
             email=OTHER_EMAIL,
             role="viewer",
+            hosted_domain="example.com",
         ),
         AuthIdentity(
             user_id=OTHER_USER_ID,
             api_key_id=OTHER_KEY_ID,
             email=OTHER_EMAIL,
             role="writer",
+            hosted_domain="example.com",
         ),
         AuthIdentity(
             user_id=KB_USER_ID,
             api_key_id=KB_KEY_ID,
             email=KB_EMAIL,
             role="viewer",
+            hosted_domain="example.com",
         ),
         AuthIdentity(
             user_id=KB_USER_ID,
             api_key_id=KB_KEY_ID,
             email=KB_EMAIL,
             role="admin",
+            hosted_domain="example.com",
         ),
     ]
 
@@ -157,13 +164,13 @@ def test_a_started_session_is_polled_once_so_it_is_live() -> None:
     assert _run(server, call=start_session) == session_id
 
     started, polled, started_bare, _ = server.asked
-    assert loads(started.content) == {
+    assert json_loads(started.content) == {
         "cli": "codex",
         "actor": "scout",
         "cli_session_id": None,
         "account": None,
     }
-    assert loads(started_bare.content) == {
+    assert json_loads(started_bare.content) == {
         "cli": "codex",
         "actor": None,
         "cli_session_id": None,
@@ -220,6 +227,7 @@ def test_a_canvas_is_opened_by_its_user_as_a_browser(
             api_key_id=None,
             email=OTHER_EMAIL,
             role="writer",
+            hosted_domain="example.com",
         ),
     ]
     server.answers[("POST", "/api/workspaces")] = (403, {})
@@ -227,38 +235,27 @@ def test_a_canvas_is_opened_by_its_user_as_a_browser(
         _run(server, call=open_workspace)
 
 
-def test_chat_is_shown_at_the_canvas_current_revision() -> None:
-    workspace_id, page, chat = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    visuals = [
-        {"id": str(page), "type": "trax.browse"},
-        {"id": str(chat), "type": "trax.chat"},
-    ]
-    operations = ("POST", f"/api/workspaces/{workspace_id}/operations")
+def test_a_station_is_the_one_used_last_or_a_new_one() -> None:
+    used, made = uuid.uuid4(), uuid.uuid4()
     server = _Server(
         answers={
-            ("GET", f"/api/workspaces/{workspace_id}"): (200, {"revision": 7}),
-            operations: (200, {"visuals": visuals}),
+            ("POST", "/api/workspaces"): (200, {"id": str(used)}),
+            ("POST", "/api/workspaces/new"): (200, {"id": str(made)}),
         },
     )
 
-    assert (
-        _run(server, call=lambda client: show_chat(client, workspace_id=workspace_id))
-        == chat
-    )
+    opened = _run(server, call=open_workspace)
+    another = _run(server, call=lambda client: open_workspace(client, new=True))
 
-    shown = server.asked[1]
-    assert loads(shown.content) == {
-        "revision": 7,
-        "operation": {"kind": "show", "visual_type": "trax.chat"},
-    }
-    _ = uuid.UUID(shown.headers["Idempotency-Key"])
-    server.answers[operations] = (409, {})
-    with pytest.raises(ValueError, match="show answered 409"):
-        _run(server, call=lambda client: show_chat(client, workspace_id=workspace_id))
+    assert (opened, another) == (used, made)
+    assert [(each.method, each.url.path) for each in server.asked] == [
+        ("POST", "/api/workspaces"),
+        ("POST", "/api/workspaces/new"),
+    ]
 
 
 def test_a_posted_line_carries_its_canvas_conversation_and_key() -> None:
-    workspace_id, chat, conversation, key = (uuid.uuid4() for _ in range(4))
+    workspace_id, conversation, key = (uuid.uuid4() for _ in range(3))
     server = _Server(
         answers={
             ("POST", "/api/chats"): (200, {"conversation_id": str(conversation)}),
@@ -270,7 +267,6 @@ def test_a_posted_line_carries_its_canvas_conversation_and_key() -> None:
         call=lambda client: send_chat(
             client,
             workspace_id=workspace_id,
-            chat_id=chat,
             text="hi",
             conversation_id=conversation,
             key=key,
@@ -281,31 +277,26 @@ def test_a_posted_line_carries_its_canvas_conversation_and_key() -> None:
         call=lambda client: send_chat(
             client,
             workspace_id=workspace_id,
-            chat_id=chat,
             text="new",
         ),
     )
 
     assert conversation_of(sent) == conversation
     continued, started = server.asked
-    assert loads(continued.content) == {
+    assert json_loads(continued.content) == {
         "workspace_id": str(workspace_id),
         "text": "hi",
-        "chat_instance_id": str(chat),
-        "expected_record_id": None,
         "conversation_id": str(conversation),
     }
     assert continued.headers["Idempotency-Key"] == str(key)
-    assert (
-        from_plain(loads(started.content), dict[str, object])["conversation_id"] is None
-    )
+    assert json_loads(started.content, dict[str, object])["conversation_id"] is None
     assert uuid.UUID(started.headers["Idempotency-Key"]) != key
 
 
 def test_a_posted_line_names_the_line_it_forks_when_given_one() -> None:
-    workspace_id, chat, session = (uuid.uuid4() for _ in range(3))
+    workspace_id, conversation, session = (uuid.uuid4() for _ in range(3))
     server = _Server(
-        answers={("POST", "/api/chats"): (200, {"conversation_id": str(chat)})},
+        answers={("POST", "/api/chats"): (200, {"conversation_id": str(conversation)})},
     )
     fork = {"session_id": str(session), "part": 0, "idx": 3}
 
@@ -314,14 +305,13 @@ def test_a_posted_line_names_the_line_it_forks_when_given_one() -> None:
         call=lambda client: send_chat(
             client,
             workspace_id=workspace_id,
-            chat_id=chat,
             text="hi",
             fork=fork,
         ),
     )
 
     [forked] = server.asked
-    assert from_plain(loads(forked.content), dict[str, object])["fork"] == fork
+    assert json_loads(forked.content, dict[str, object])["fork"] == fork
 
 
 def test_the_assistant_opens_a_conversation_as_its_science_chat() -> None:
@@ -346,7 +336,7 @@ def test_the_assistant_opens_a_conversation_as_its_science_chat() -> None:
     )
 
     assert opened == session_id
-    assert loads(server.asked[0].content) == {
+    assert json_loads(server.asked[0].content) == {
         "cli": "codex",
         "actor": f"chat-{conversation.hex[:12]}",
         "cli_session_id": f"chat:{conversation}",
@@ -362,7 +352,7 @@ def test_the_assistant_opens_a_conversation_as_its_science_chat() -> None:
 
 
 def test_conversing_posts_a_line_then_has_the_assistant_open_its_session() -> None:
-    workspace_id, chat, conversation, session_id = (uuid.uuid4() for _ in range(4))
+    workspace_id, conversation, session_id = (uuid.uuid4() for _ in range(3))
     store, _ = make_store()
     server = _Server(
         answers={
@@ -378,15 +368,14 @@ def test_conversing_posts_a_line_then_has_the_assistant_open_its_session() -> No
             client,
             store,
             workspace_id=workspace_id,
-            chat_id=chat,
             text="hello there",
         ),
     )
 
     assert opened == session_id
     posted, started, _ = server.asked
-    assert from_plain(loads(posted.content), dict[str, object])["text"] == "hello there"
-    assert from_plain(loads(started.content), dict[str, object])["cli_session_id"] == (
+    assert json_loads(posted.content, dict[str, object])["text"] == "hello there"
+    assert json_loads(started.content, dict[str, object])["cli_session_id"] == (
         f"chat:{conversation}"
     )
 
@@ -453,6 +442,6 @@ def _run[T](
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

@@ -1,7 +1,8 @@
 """The ``trax machine`` command: record where campaigns may run, and read it back.
 
-The registry only records machines; no verb here reaches one. Listing and
-showing need the writer role, and changing the registry needs the admin role.
+The registry records machines; listing and showing need the writer role, and
+changing the registry needs the admin role. On the host itself, ``connect`` joins
+and keeps the machine connected with the machine's own credential.
 """
 
 from __future__ import annotations
@@ -12,7 +13,9 @@ from typing import TYPE_CHECKING, Final, cast, override
 import argparse
 import re
 import sys
+import time
 
+from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.trax.commands import Command, HelpPage
 from trackinizer.trax.context import cwd
@@ -20,21 +23,24 @@ from trackinizer.trax.render import echo
 
 
 if TYPE_CHECKING:
-    from trackinizer.client.client import Client
+    from trackinizer.trax import machine_host
     from trackinizer.wire import wire_machines
     from trackinizer.wire.wire_machines import Machine
 else:
     from wrapt import lazy_import
 
-    # Only ``trax machine`` touches the machine models, so their pydantic build
-    # stays off the cold-start path of every other verb.
+    # Only ``trax machine`` touches the machine models and the host loop, so their
+    # pydantic build stays off the cold-start path of every other verb.
     wire_machines = lazy_import("trackinizer.wire.wire_machines")
+    machine_host = lazy_import("trackinizer.trax.machine_host")
 
 
 MACHINE_WORD: Final = "machine"
 """The verb that selects this command, in matching, help and usage."""
 
-_FORMS: Final = "[NAME [FIELD [to VALUE|-|@FILE] | label add|del LABEL | del]]"
+_FORMS: Final = (
+    "[NAME [FIELD [to VALUE|-|@FILE] | label add|del LABEL | del | connect]]"
+)
 
 _USAGE: Final = f"usage: trax {MACHINE_WORD} {_FORMS}"
 
@@ -51,7 +57,8 @@ class Machines(Command):
         summary=(
             "Bare 'machine' lists the registered machines; 'machine NAME' shows "
             "one. Both need the writer role. Setting, labelling and deleting need "
-            "the admin role. The registry records machines; it never reaches one."
+            "the admin role. 'connect' runs on the machine's host, with its own "
+            "credential."
         ),
         arguments=(
             ("NAME", "lowercase letters, digits and '-', at most 63 characters"),
@@ -70,12 +77,18 @@ class Machines(Command):
             f"trax {MACHINE_WORD} NAME label add LABEL      add a label",
             f"trax {MACHINE_WORD} NAME label del LABEL      remove a label",
             f"trax {MACHINE_WORD} NAME del                  unregister the machine",
+            f"trax {MACHINE_WORD} NAME connect < TOKEN      join, then heartbeat",
         ),
         notes=(
             "A field left out of a set keeps its value; to '' clears one.",
             (
                 "One trailing newline is stripped from stdin and file values; an "
                 "empty one is refused."
+            ),
+            (
+                "connect reads the one-use enrollment token from stdin and saves the "
+                "machine credential for this user; it exits 0 once the machine is "
+                "revoked."
             ),
             (
                 "A last word of help, -h or --help shows this page: set such a value "
@@ -89,7 +102,7 @@ class Machines(Command):
     def make_parser(cls) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser(
             prog=f"trax {MACHINE_WORD}",
-            description="List, show, set or delete the registered machines.",
+            description="List, show, set, delete or host the registered machines.",
         )
         # REMAINDER, not "*": a value such as ``--verbose`` must reach ``run``
         # instead of failing as an unknown option.
@@ -116,6 +129,8 @@ class Machines(Command):
             cls.run_show(client_factory, name)
         elif len(tokens) == 2 and words[1] == "del":
             cls.run_del(client_factory, name)
+        elif len(tokens) == 2 and words[1] == "connect":
+            cls.run_connect(client_factory, name)
         elif len(tokens) == 2 and words[1] in _FIELDS:
             cls.run_field(client_factory, name, words[1])
         elif len(tokens) == 4 and words[1] in _FIELDS and words[2] == "to":
@@ -164,6 +179,7 @@ class Machines(Command):
         echo(f"role:       {machine.role or '(none)'}")
         echo(f"labels:     {_labels(machine) or '(none)'}")
         echo(f"how:        {_one_line(machine.how) or '(none)'}")
+        echo(f"status:     {machine.status}")
         echo(f"updated by: {machine.updated_by}")
         echo(f"updated:    {machine.updated.isoformat()}")
 
@@ -256,6 +272,23 @@ class Machines(Command):
         except ClientError as err:
             raise _refusal(err, role="admin", name=name) from err
         echo(f"deleted: {MACHINE_WORD} {name}")
+
+    @classmethod
+    def run_connect(cls, client_factory: Callable[[], Client], name: str) -> None:
+        """Join as ``name`` when no credential is saved, then heartbeat until revoked.
+
+        Args:
+          client_factory: Callable returning a trax Client; only its URL is used.
+          name: Machine name.
+
+        """
+        url = client_factory().base_url
+        machine_host.connect(
+            name,
+            client_for=lambda key: Client(url, api_key=key),
+            read_token=sys.stdin.readline,
+            sleep=time.sleep,
+        )
 
 
 def _check_name(name: str) -> None:

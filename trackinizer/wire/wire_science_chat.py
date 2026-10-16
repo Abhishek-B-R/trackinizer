@@ -3,9 +3,13 @@
 A conversation is one open AgentSession whose ``cli_session_id`` is
 ``chat:<conversation id>`` and whose label is :data:`SCIENCE_CHAT_LABEL`. Its records
 are the people's lines (each from its poster), the assistant's tool calls and results,
-and its answers. There is no second store: the browser reads the session's records,
-anyone signed in as a writer may post a line, and the assistant opens the session when
-it first hears the conversation.
+and its answers. There is no second store: its members read the session's records and
+post lines (its starter, the people they share it with, and whoever else the server's
+setting lets), and the assistant opens the session when it first hears the
+conversation. The session's row, which every key reads, says only who started it and
+who posted: its title is :data:`CHAT_TITLE`. A share names a person by email and
+follows the conversation, and the starter deletes the conversation while every
+person's line in it is theirs.
 
 A fork is a science chat of its own that starts from another's lines. It is a session
 with a ``produced_by`` edge to the original, labelled :data:`FORK_EDGE_LABEL` and
@@ -18,13 +22,17 @@ otherwise, which opens or resumes the conversation's session before it answers. 
 answer to a post is the conversation id at once; ``GET /api/chats/{id}`` answers 404
 until the assistant has opened the session.
 
+While a turn runs, the assistant puts the answer it is writing at
+:data:`CHAT_PARTIAL_PATH`, where the chat's readers wait for it to change. The server
+keeps it in memory alone, for a minute after its last change: it is no record, and
+the stored answer replaces it.
+
 This package is part of the publishable client distribution, so it must not
 import ``server`` / ``trax`` / fastapi (see ``import_purity_test``).
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Annotated, Final, Literal
 
 import uuid
@@ -36,18 +44,26 @@ __all__ = [
     "CHATS_PATH",
     "CHAT_ACTOR_PREFIX",
     "CHAT_HELPER_CLI",
+    "CHAT_PARTIAL_CHARS",
+    "CHAT_PARTIAL_PATH",
+    "CHAT_PARTIAL_TURN_PATH",
+    "CHAT_PARTIAL_WAIT_SEC",
     "CHAT_PATH",
     "CHAT_SESSION_PREFIX",
+    "CHAT_SHARE_PATH",
+    "CHAT_TITLE",
     "FORK_EDGE_LABEL",
     "FORK_POINT_PREFIX",
     "POSTER_LABEL_PREFIX",
     "SCIENCE_CHAT_LABEL",
     "ChatForkAt",
     "ChatHead",
+    "ChatPartial",
+    "ChatPartialState",
     "ChatSend",
     "ChatSent",
-    "ChatSummary",
     "chat_actor",
+    "chat_conversation_id",
     "chat_session_id",
     "fork_point_label",
     "poster_label",
@@ -56,6 +72,15 @@ __all__ = [
 
 CHATS_PATH: Final = "/api/chats"
 CHAT_PATH: Final = "/api/chats/{conversation_id}"
+CHAT_SHARE_PATH: Final = "/api/chats/{conversation_id}/shares/{email}"
+CHAT_PARTIAL_PATH: Final = "/api/sessions/{session_id}/partial"
+CHAT_PARTIAL_TURN_PATH: Final = "/api/sessions/{session_id}/partial/{turn}"
+
+CHAT_PARTIAL_CHARS: Final = 16_384
+"""The most text a partial carries; the assistant clips what it has written to it."""
+
+CHAT_PARTIAL_WAIT_SEC: Final = 25.0
+"""The longest a read of a partial is held for a change, under the edge's idle cutoff."""
 
 SCIENCE_CHAT_LABEL: Final = "science-chat"
 """The label every science chat session carries."""
@@ -78,6 +103,10 @@ FORK_POINT_PREFIX: Final = "fork-at:"
 CHAT_HELPER_CLI: Final = "trax-helper"
 """The CLI a ``trax helper`` session opens with: it takes messages only through Chat."""
 
+CHAT_TITLE: Final = "Science chat"
+"""The title of every science chat's session, whatever its opener asks for. Every key
+reads a session's row, while a chat's lines are its members' alone."""
+
 _ROUTE: Final = r"^#/[^\s\x00-\x1f\x7f]*$"
 """A `#/...` hash with no space or control character."""
 
@@ -93,6 +122,24 @@ def chat_session_id(conversation_id: uuid.UUID) -> str:
 
     """
     return f"{CHAT_SESSION_PREFIX}{conversation_id}"
+
+
+def chat_conversation_id(cli_session_id: str | None) -> uuid.UUID | None:
+    """Read the conversation out of a science chat session's ``cli_session_id``.
+
+    Args:
+      cli_session_id: A session's ``cli_session_id``, if it has one.
+
+    Returns:
+      conversation_id: The ``<id>`` of ``chat:<id>``; None for any other.
+
+    """
+    if cli_session_id is None or not cli_session_id.startswith(CHAT_SESSION_PREFIX):
+        return None
+    try:
+        return uuid.UUID(cli_session_id.removeprefix(CHAT_SESSION_PREFIX))
+    except ValueError:
+        return None
 
 
 def chat_actor(conversation_id: uuid.UUID) -> str:
@@ -162,11 +209,9 @@ class ChatSend(BaseModel):
     """What the conversation is; science chat is the only kind."""
 
     workspace_id: uuid.UUID
-    """The poster's own canvas, whose Chat visual the line is sent from."""
+    """The poster's own canvas, which the line is sent from."""
 
     text: str = Field(pattern=r"\S", max_length=16_384)
-    chat_instance_id: uuid.UUID | None = None
-    expected_record_id: uuid.UUID | None = None
     conversation_id: uuid.UUID | None = None
     """The conversation to post into; none starts one, named by the request's
     ``Idempotency-Key`` so a retry starts the same one."""
@@ -191,28 +236,48 @@ class ChatSend(BaseModel):
         return self
 
 
+class ChatPartial(BaseModel):
+    """The answer a chat's assistant is writing, as far as it has written it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    turn: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    """The delivery the answer is for, new for each: a reader that saw its answer
+    stored shows no partial of it again."""
+
+    text: str = Field(max_length=CHAT_PARTIAL_CHARS)
+    """The answer so far, as a reader is shown it: vetted for secrets, without the
+    notes the model keeps, and clipped."""
+
+    done: bool = False
+    """Whether ``text`` is the whole answer, which the assistant is now storing."""
+
+
+class ChatPartialState(BaseModel):
+    """What the server holds of a chat's answer in writing, and how new it is."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    seq: int
+    """Names the partial held: drawn at random, below 2**53, when the chat held none,
+    and one more with each put after it, so a put always names a new one and says
+    nothing of other chats; 0 when the server holds none for the chat. A reader
+    passes the last it saw to wait for a change, and compares it for equality only."""
+
+    partial: ChatPartial | None
+
+
 class ChatSent(BaseModel):
     """What a posted line was queued for."""
 
     conversation_id: uuid.UUID
+    workspace_id: uuid.UUID
+    """The station the line went to: the one it was sent from, or for a fork the new
+    one made for it."""
+
     session_id: uuid.UUID | None
     """The conversation's session when the assistant had it open; otherwise ``None``,
     and the session appears when the assistant opens it."""
-
-
-class ChatSummary(BaseModel):
-    """One science chat in its person's history."""
-
-    conversation_id: uuid.UUID
-    session_id: uuid.UUID
-    title: str
-    """The first line, cut to 120 characters."""
-
-    account: str
-    """The person who started it."""
-
-    modified: datetime
-    """When the session was last heard from, else when it was last changed."""
 
 
 class ChatHead(BaseModel):
@@ -232,5 +297,29 @@ class ChatHead(BaseModel):
     """The conversation this one was forked from; ``None`` for one that was not."""
 
     forks_on_typing: bool
-    """Whether a line the caller types starts a fork instead of joining the chat:
-    the caller is not in the starter's organisation."""
+    """Whether the caller does not read the chat: not its starter, not one it is
+    shared with, and not one the server's setting lets in, or it is a ``private`` or
+    ``staff`` chat they may not read. They read none of its lines, and a line they
+    type is refused with 403 ``chat_not_shared``; they cannot fork it either, since a
+    fork copies lines its poster reads."""
+
+    audience: str
+    """Who reads the chat: ``open`` (its members), ``private`` (its starter and the
+    people it is shared with) or ``staff`` (its members who hold ``staff``, once its
+    assistant has read a staff session for one of them)."""
+
+    may_hide: bool
+    """Whether the caller may make the chat ``private`` or ``open`` again: its starter,
+    while it is not ``staff``."""
+
+    shared_with: list[str]
+    """The emails the chat is shared with, oldest share first: each reads it and posts
+    into it as its starter does. Empty for anyone but the starter and an admin."""
+
+    may_share: bool
+    """Whether the caller may share the chat and stop sharing it: its starter alone.
+    An admin may only stop sharing it, since a share lets its person read it."""
+
+    may_delete: bool
+    """Whether the caller may delete the chat: an admin, the key that opened it, or
+    its starter while every person's line in it is theirs."""

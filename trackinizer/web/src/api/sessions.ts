@@ -88,6 +88,14 @@ export type FeedCursor = components["schemas"]["FeedCursor"];
 export type FeedPage = components["schemas"]["FeedResponse"];
 
 /**
+ * Whose sessions a feed read keeps, among those the caller reads: the caller's
+ * own (`mine`, the sessions under their account), the trace sessions of the
+ * campaigns they launched (`campaigns`), or every one (`everyone`, the server's
+ * default).
+ */
+export type Whose = "mine" | "campaigns" | "everyone";
+
+/**
  * Which records a feed read keeps, by session routing name, room, CLI and record
  * kind. A record passes a filter when it matches any of its values, and must
  * pass every filter given; an empty or absent one keeps everything.
@@ -97,6 +105,12 @@ export type FeedFilters = {
   readonly room?: readonly string[];
   readonly cli?: readonly string[];
   readonly kind?: readonly string[];
+  /** A station's id: only the sessions its chat started agents in, and not the chat itself. */
+  readonly station?: string;
+  /** Whose sessions; absent, every one the caller reads. */
+  readonly whose?: Whose;
+  /** Keep the sessions their owners hid (audience `private`) that the caller reads; listings leave them out otherwise. */
+  readonly hidden?: boolean;
 };
 
 /** Which page of the feed to read: its newest (`tail`), past a cursor, or within a window. */
@@ -105,6 +119,8 @@ export type FeedRead = FeedFilters & {
   /** Only what a person or agent said: the records the facets count as `conversation`. */
   readonly conversation?: boolean;
   readonly after?: FeedCursor;
+  /** Exclusive upper bound in the same order; with `tail`, the preceding page. */
+  readonly before?: FeedCursor;
   /** ISO times; `since` and `until` are both inclusive. */
   readonly since?: string;
   readonly until?: string;
@@ -118,7 +134,7 @@ export type FeedRead = FeedFilters & {
  * page can end inside a group written in the same instant.
  */
 export async function readFeed(
-  { tail, conversation, after, since, until, limit, ...filters }: FeedRead,
+  { tail, conversation, after, before, since, until, limit, ...filters }: FeedRead,
   { signal }: CallOptions = {},
 ): Promise<FeedPage> {
   return send(TIMEOUT_MS.read, signal, (signal) =>
@@ -129,6 +145,9 @@ export async function readFeed(
           ...(conversation ? { conversation } : {}),
           ...(after
             ? { after_created: after.created, after_session: after.session_id, after_part: after.part, after_seq: after.seq }
+            : {}),
+          ...(before
+            ? { before_created: before.created, before_session: before.session_id, before_part: before.part, before_seq: before.seq }
             : {}),
           ...(since ? { since } : {}),
           ...(until ? { until } : {}),
@@ -167,14 +186,47 @@ export async function readFeedFacets({ since, until, ...filters }: FacetsRead, {
   );
 }
 
-/** The filters as query parameters, each value repeated and empty ones left out. */
-function filterQuery({ actor, room, cli, kind }: FeedFilters) {
+/** The filters as query parameters, each value repeated and empty ones left out; the histogram takes them too. */
+export function filterQuery({ actor, room, cli, kind, station, whose, hidden }: FeedFilters) {
   return {
     ...(actor?.length ? { actor: [...actor] } : {}),
     ...(room?.length ? { room: [...room] } : {}),
     ...(cli?.length ? { cli: [...cli] } : {}),
     ...(kind?.length ? { kind: [...kind] } : {}),
+    ...(station ? { station } : {}),
+    ...(whose ? { whose } : {}),
+    ...(hidden ? { hidden } : {}),
   };
+}
+
+/** Who reads a session besides its owner: whom the org mode lets in (`open`), or only staff and admins (`private`). */
+export type SessionAudienceChange = components["schemas"]["SessionAudienceChange"]["audience"];
+
+/** What a change of audience answers: the session, its audience now, and every session it changed (each of a chat's). */
+export type SessionAudience = components["schemas"]["SessionAudienceResponse"];
+
+/** The 403 code of a change of audience by anyone but the session's owner (a chat's starter), an admin too. */
+export const SESSION_NOT_OWNER = "session_not_owner";
+
+/** The 409 code of a change of a staff session's audience, which never changes. */
+export const SESSION_STAFF = "session_staff";
+
+/**
+ * Send `POST /api/sessions/{id}/audience`: hide a session of the caller's from
+ * everyone but its owner, staff and admins (`private`), or show it again
+ * (`open`), under idempotency `key`. A chat's session changes every session of
+ * the chat. Only the owner may (403 `session_not_owner`); a staff session never
+ * changes (409 `session_staff`).
+ */
+export async function setSessionAudience(sessionId: string, audience: SessionAudienceChange, key: string): Promise<SessionAudience> {
+  return send(TIMEOUT_MS.write, undefined, (signal) =>
+    client.POST("/api/sessions/{session_id}/audience", {
+      params: { path: { session_id: sessionId } },
+      body: { audience },
+      headers: { "Idempotency-Key": key },
+      signal,
+    }),
+  );
 }
 
 /** Where a routed message goes: an agent's routing name, in one of its rooms or `null` for its only one. */

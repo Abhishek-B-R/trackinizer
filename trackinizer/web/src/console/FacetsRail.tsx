@@ -25,6 +25,9 @@ export const ACTIVE: readonly { readonly value: Active; readonly label: string; 
  * step), how far back to look when live, and groups, each picked in one step.
  * A row is a session, so a name an ended session and a live one share shows
  * twice. Working turns Quiet as the minutes pass, with or without new records.
+ * A session the server says the caller may change (`hideable`: their own, and no
+ * chat) has a switch that says Public or Private and flips on a click; another's
+ * private session is marked Private.
  */
 export function AgentsSection({
   agents,
@@ -32,6 +35,7 @@ export function AgentsSection({
   onPicks,
   active,
   onActive,
+  onHide = null,
 }: {
   agents: readonly FeedActorFacet[];
   picks: readonly string[];
@@ -39,6 +43,8 @@ export function AgentsSection({
   active: Active;
   /** Null when the view is a window of history, which sets how far back on its own. */
   onActive: ((active: Active) => void) | null;
+  /** Make a session of the caller's private, or public again; null offers no switch. */
+  onHide?: ((agent: FeedActorFacet) => void) | null;
 }) {
   const [query, setQuery] = useState("");
   const [by, setBy] = useState<Grouping>("none");
@@ -82,8 +88,8 @@ export function AgentsSection({
                   head
                 />
               )}
-              {group.agents.map(({ session_id, actor, count }) => (
-                <Row key={session_id} label={actor} text={actor} count={count} picks={picks} names={[actor]} onChange={() => onPicks(toggle(picks, [actor], null))} />
+              {group.agents.map((agent) => (
+                <AgentRow key={agent.session_id} agent={agent} picks={picks} onPicks={onPicks} onHide={onHide} />
               ))}
             </div>
           );
@@ -180,6 +186,45 @@ function Find({
   );
 }
 
+/**
+ * One session's tick, with its Public/Private switch beside it when the caller
+ * may flip it, else marked Private when its owner made it so.
+ */
+function AgentRow({
+  agent,
+  picks,
+  onPicks,
+  onHide,
+}: {
+  agent: FeedActorFacet;
+  picks: readonly string[];
+  onPicks: (picks: string[]) => void;
+  onHide: ((agent: FeedActorFacet) => void) | null;
+}) {
+  const { actor, count } = agent;
+  const isPrivate = agent.audience === "private";
+  const switchable = onHide !== null && agent.hideable;
+  const row = <Row label={actor} text={actor} count={count} picks={picks} names={[actor]} onChange={() => onPicks(toggle(picks, [actor], null))}
+    isPrivate={isPrivate && !switchable} />;
+  if (!switchable) return row;
+  return (
+    <div className="console-agent">
+      {row}
+      <button
+        type="button"
+        className={`btn ghost console-privacy${isPrivate ? " console-privacy-private" : ""}`}
+        aria-label={`${actor} is ${isPrivate ? "private: make it public" : "public: make it private"}`}
+        title={isPrivate
+          ? "Private: only you, staff and admins read its transcript. Click to let whoever may read your sessions read it."
+          : "Public: whoever may read your sessions reads its transcript. Click to keep it to you, staff and admins; its name stays listed."}
+        onClick={() => onHide(agent)}
+      >
+        {isPrivate ? "Private" : "Public"}
+      </button>
+    </div>
+  );
+}
+
 /** One tick: a name, or a group's head, which is ticked when all its names are and half ticked when some are. */
 function Row({
   label,
@@ -189,6 +234,7 @@ function Row({
   names,
   onChange,
   head = false,
+  isPrivate = false,
 }: {
   label: string;
   text: string;
@@ -197,6 +243,8 @@ function Row({
   names: readonly string[];
   onChange: () => void;
   head?: boolean;
+  /** A session its owner made private: only they, staff and admins read it. */
+  isPrivate?: boolean;
 }) {
   const ticked = names.filter((name) => isPicked(picks, name)).length;
   return (
@@ -213,6 +261,11 @@ function Row({
       <span className="console-row-name" title={text}>
         {text}
       </span>
+      {isPrivate ? (
+        <span className="console-badge" title="Private: only its owner, staff and admins read it">
+          Private
+        </span>
+      ) : null}
       <span className="console-n">{count.toLocaleString("en")}</span>
     </label>
   );

@@ -44,9 +44,10 @@ import sys
 import time
 import uuid
 
+from treekle import ReadError, from_plain, json_loads
+
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.codec import ReadError, from_plain, loads
 
 
 if TYPE_CHECKING:
@@ -151,7 +152,7 @@ def answer(client: Writes, line: str, *, clock: Clock) -> dict[str, object]:
     try:
         return _run(
             client,
-            from_plain(loads(line), dict[str, object]),
+            json_loads(line, dict[str, object]),
             clock=clock,
         )
     except (ClientError, KeyError, TypeError, ValueError) as error:

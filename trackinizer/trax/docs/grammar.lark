@@ -158,7 +158,7 @@ group_create: KIND (inline_field | cost_action | safe_meta | EDGE edge_meta)+ (e
 VERB: "search-sessions" | "confidence" | "authority" | "workspace" | "blocked" | "machine" | "profile" | "version" | "export" | "recent" | "board" | "graph" | "cost" | "help" | "next" | "send" | "env" | "run" | "id"
 KIND: "agentsession" | "codechange" | "experiment" | "webresult" | "websearch" | "artifact" | "belief" | "issue" | "paper"
 EDGE_KEYWORD: "disfavored_by" | "superseded_by" | "broadened_by" | "disproved_by" | "narrowed_by" | "produced_by" | "required_by" | "blocked_by" | "favored_by" | "supersedes" | "disfavors" | "disproves" | "proved_by" | "broadens" | "cited_by" | "produced" | "produces" | "requires" | "narrows" | "blocks" | "favors" | "proves" | "cites"
-FIELD: "google_scholar_cluster_id" | "google_scholar_cites_id" | "publication_type" | "cli_session_id" | "publish_date" | "description" | "confidence" | "validation" | "judgement" | "abstract" | "priority" | "provider" | "subvenue" | "account" | "outcome" | "started" | "config" | "source" | "status" | "owner" | "query" | "title" | "venue" | "cli" | "sha" | "url"
+FIELD: "google_scholar_cluster_id" | "google_scholar_cites_id" | "publication_type" | "cli_session_id" | "publish_date" | "description" | "confidence" | "validation" | "judgement" | "abstract" | "priority" | "provider" | "subvenue" | "account" | "outcome" | "started" | "config" | "source" | "status" | "owner" | "query" | "title" | "venue" | "app" | "cli" | "sha" | "url"
 LIST_FIELD: "subscribers" | "issue_kind" | "subscriber" | "issuekind" | "authors" | "author" | "labels" | "label" | "kind"
 REF_LIST_FIELD: "codechanges" | "codechange"
 COST_FIELD: "resource-cost" | "agent-cost"
@@ -198,9 +198,9 @@ VERB_ARG: /\S+/
 //   issue_kind/kind: feature bug task question   publication_type: article inproceedings book thesis techreport misc
 //   priority: an int, or critical=0 high=10 medium=20 low=30 backlog=40
 //   confidence/valence: a float (valence in [-1,1], sign = for/against)
-//   config: one standard JSON object; readable/editable, not filterable
+//   config/app: one standard JSON object; readable/editable, not filterable
 // FIELD VALIDITY (a field is writable only on these kinds):
-//   any kind: account, agent-cost, description, label, labels, owner, resource-cost, status, subscriber, subscribers, title
+//   any kind: account, agent-cost, app, description, label, labels, owner, resource-cost, status, subscriber, subscribers, title
 //   Issue: + issue_kind, issuekind, kind, priority, validation
 //   Experiment: + codechange, codechanges, config, outcome
 //   Paper: + abstract, author, authors, google_scholar_cites_id, google_scholar_cluster_id, publication_type, publish_date, source, subvenue, venue
@@ -237,12 +237,12 @@ VERB_ARG: /\S+/
 //   graph [--open-only]
 //   help [TOPIC]
 //   id UUID [--format table|json] [--changes]
-//   machine [ NAME [ role|how [to V] | label add|del L | del ] ]
+//   machine [ NAME [ role|how [to V] | label add|del L | del | connect ] ]
 //   next [CLAIM] [--format text|json|ids] [--as/--actor V] [--reason V]
 //   profile [NAME] [ url|actor|token [to V] | current NAME | del ]
 //   recent [--limit V] [--format text|json]
 //   run attach NAME
-//   run claude|gemini|codex|sh [--out V] [--verbose] [--dry-run] [--no-sync] [--as V] [--room V] [--detach] [--name V]
+//   run claude|gemini|codex|sh [--out V] [--verbose] [--dry-run] [--no-sync] [--as V] [--room V] [--private] [--diff] [--detach] [--name V]
 //   run log NAME [-f/--follow]
 //   run ls
 //   run send NAME TEXT...
@@ -250,7 +250,7 @@ VERB_ARG: /\S+/
 //   search-sessions QUERY [--limit V] [--semantic/--no-semantic] [--format text|json]
 //   send TARGET TEXT...
 //   version
-//   workspace WORKSPACE_ID [show|navigate|highlight|hide|focus|place] [SUBJECT] [--record V] [--placement main|left|side|floating] [--param V]
+//   workspace WORKSPACE_ID [ACTION] [SUBJECT] [--record V] [--placement main|left|side|floating] [--param V]
 //   ^ run --as NAME = the session's owner; doubles as its routing handle
 //     (others address it @NAME), uniquified on collision (scientist#2).
 //     send TARGET = @actor[:room] of a live session; QUERY/TEXT are free words.

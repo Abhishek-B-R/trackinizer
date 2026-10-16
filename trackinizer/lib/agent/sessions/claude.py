@@ -22,6 +22,16 @@ import base64
 import binascii
 import json
 
+from treekle import (
+    MutablePlainTree,
+    PlainTree,
+    ReadError,
+    from_plain,
+    immutable,
+    json_loads,
+    mutable,
+)
+
 from trackinizer.lib.agent.sessions.claude_orders import (
     assistant_order,
     attachment_order,
@@ -73,15 +83,6 @@ from trackinizer.lib.agent.types.sessions import (
     WebFetchResult,
     WebSearchResult,
     WebSearchResults,
-)
-from trackinizer.lib.codec import (
-    MutablePlainTree,
-    PlainTree,
-    ReadError,
-    from_plain,
-    immutable,
-    loads,
-    mutable,
 )
 
 
@@ -1992,7 +1993,7 @@ def _parse(line: str) -> dict[str, object] | None:
     if not line.strip():
         return None
     try:
-        parsed = loads(line)
+        parsed = json_loads(line)
     except json.JSONDecodeError:
         return None
     if not isinstance(parsed, Mapping):
@@ -2009,7 +2010,7 @@ def _update_tools(
     content = message.get("content")
     blocks = (
         [
-            from_plain(cast(dict[str, object], block), dict[str, object])
+            cast(dict[str, object], block)
             for block in cast(list[object], content)
             if isinstance(block, dict)
         ]

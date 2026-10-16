@@ -1,11 +1,11 @@
 import AxeBuilder from "@axe-core/playwright";
 import type { Page } from "@playwright/test";
 import { resetCanvas } from "./canvasState";
-import { expect, test } from "./fixtures";
+import { expect, setPreferences, test } from "./fixtures";
 
 // axe's WCAG 2.0 and 2.1 A and AA rules (the a11y spec's) on the default layout:
 // the canvas, with Chat beside a list and a detail, with a conversation open and
-// its History menu open, and with the partner picker open, at 1280 and 390 px,
+// its station menu open, and with the partner picker open, at 1280 and 390 px,
 // in both themes. The conversation and the sessions are served by the test, since
 // no partner runs on the e2e server.
 
@@ -32,13 +32,7 @@ for (const theme of ["dark", "light"] as const) {
     test.describe(`${theme} theme, ${size.width} px`, () => {
       test.use({ viewport: size });
       test.beforeEach(async ({ page }) => {
-        await page.addInitScript((choice) => {
-          try {
-            localStorage.setItem("trackinizer.theme", choice);
-          } catch {
-            // about:blank has no storage.
-          }
-        }, theme);
+        await setPreferences(page.request, { theme });
         await page.emulateMedia({ reducedMotion: "reduce" });
       });
 
@@ -48,7 +42,6 @@ for (const theme of ["dark", "light"] as const) {
         const issue = await (await request.post("/api/inquiries/issue", {
           data: { title: `Canvas a11y ${tag}`, idempotency_key: crypto.randomUUID() },
         })).json();
-        const workspace = await (await request.post("/api/workspaces")).json();
         const chat = "0b1f6f3e-6c1e-4d3a-9a55-3a1c2f7d9a10";
         const created = "2026-10-03T10:00:00.000000Z";
         const session = "0b1f6f3e-6c1e-4d3a-9a55-3a1c2f7d9a30";
@@ -65,18 +58,14 @@ for (const theme of ["dark", "light"] as const) {
         await page.route(`**/api/sessions/${session}/records**`, (route) => route.fulfill({ json: { records } }));
         await page.route(`**/api/chats/${chat}`, (route) => route.fulfill({ json: {
           conversation_id: chat, session_id: session, title: "What changed", account: "ada@example.com", live: true,
-          forks: 0, forked_from: null, forks_on_typing: false,
+          forks: 0, forked_from: null, forks_on_typing: false, audience: "open", may_hide: false, shared_with: [], may_share: false, may_delete: false,
         } }));
-        await page.route("**/api/chats", (route) => route.fulfill({ json: [
-          { conversation_id: chat, session_id: session, title: "What changed", account: "ada@example.com", modified: created },
-        ] }));
-        await page.addInitScript(([key, id]) => {
-          try {
-            localStorage.setItem(key!, id!);
-          } catch {
-            // about:blank has no storage.
-          }
-        }, [`trackinizer.v2.chat.${workspace.id}`, chat]);
+        // The user's station for that chat. Finding it again changes nothing, so writing its page makes
+        // it the one changed last, which a tab with no station asks the server for.
+        const found = await request.post(`/api/workspaces/for-chat/${chat}`);
+        expect(found.ok()).toBe(true);
+        const moved = await request.put(`/api/workspaces/${(await found.json()).id}/page`, { data: { route: "#/list/Issue" } });
+        expect(moved.ok()).toBe(true);
         return { issue: issue.id as string };
       }
 
@@ -91,14 +80,14 @@ for (const theme of ["dark", "light"] as const) {
         await audit(page, theme, `a detail with Chat, ${size.width} px`);
       });
 
-      test("Chat with a conversation open, and its History menu open", async ({ page, request }) => {
+      test("Chat with a conversation open, and its station menu open", async ({ page, request }) => {
         const { issue } = await seed(page, request);
         await page.goto(`/app/#/lookup/${issue}`);
         await expect(page.getByText("Two things:")).toBeVisible();
         await audit(page, theme, `a conversation, ${size.width} px`);
-        await page.getByRole("button", { name: "History" }).click();
-        await expect(page.getByRole("menuitemradio", { name: /What changed/ })).toBeVisible();
-        await audit(page, theme, `the History menu, ${size.width} px`);
+        await page.getByRole("button", { name: "All stations" }).click();
+        await expect(page.getByRole("dialog", { name: "Stations" }).getByRole("button", { name: /unnamed-workstream/ }).first()).toBeVisible();
+        await audit(page, theme, `the station menu, ${size.width} px`);
       });
     });
   }

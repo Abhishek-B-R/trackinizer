@@ -7,10 +7,16 @@ nothing here imports it back.
 
 Line 1 is the header::
 
-    {"format": "trackinizer-export", "version": 1, "migrations": [...]}
+    {"format": "trackinizer-export", "version": 1, "migrations": [...],
+     "audiences": [...], "withheld_sessions": 0}
 
 ``migrations`` names the applied schema files, oldest first, so a reader knows
-which column set the rows were written under. Every later line is one row::
+which column set the rows were written under. ``audiences`` names, sorted, the
+audiences the caller reads: the session tables hold no row of a session outside
+them, so a file that names fewer than the deployment has is a partial backup.
+``withheld_sessions`` counts the sessions whose transcripts the file leaves out,
+the ones the caller does not read; a file that counts any is a partial backup too.
+Every later line is one row::
 
     {"table": "<name>", "row": {"<column>": <value>, ...}}
 
@@ -78,10 +84,14 @@ Left out on purpose, and why:
 * ``variables`` -- launch configuration, not graph records; a secret row names
   a value that lives outside the database, so a restored export could not
   carry it.
-* ``visual_workspaces``, ``visual_workspace_operations``,
-  ``visual_workspace_presets`` -- per-user canvas state, saved workflows and
-  operation receipts, not account-agnostic graph records. A Chat conversation is an
+* ``visual_workspaces``, ``visual_workspace_operations`` -- per-user stations
+  (named canvases) and operation receipts, not account-agnostic graph records. A Chat conversation is an
   AgentSession, so its lines export with the sessions.
+* ``science_chat_shares``, ``science_chat_tombstones`` -- who may post into which
+  science chat, and which chats were deleted: access control, like ``allowlist``.
+* ``credit_entries`` -- what each person was given, bought and spent: money,
+  which the database's own backups keep and a graph export would show to everyone
+  who can read it.
 * ``visual_reports``, ``visual_report_revisions`` -- shared report presentation
   and author identity; the linked Artifact and graph citations export above.
 * ``session_liveness`` -- when each live session was last heard from, which
@@ -91,5 +101,8 @@ Left out on purpose, and why:
   value is not in the database at all.
 * ``machine_enrollments``, ``machine_credentials`` -- hashes of the secrets a
   host joins and authenticates with: access control, like ``api_keys``.
+* ``code_blobs``, ``code_snapshots`` -- each record's code, kept per owner, a
+  private snapshot read by its owner alone, which a graph export would show to
+  everyone who can read it.
 * ``applied_migrations`` -- carried in the header instead.
 """

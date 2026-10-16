@@ -7,6 +7,7 @@ Houses inquiry delete too: ``DELETE /api/inquiries/{id}`` is defined in
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, patch
@@ -23,6 +24,7 @@ from hypothesis import (
     settings,
     strategies as st,
 )
+from treekle import from_plain, json_loads
 
 import httpx2
 import pytest
@@ -34,16 +36,17 @@ from trackinizer.conftest import (
     queue_field_rows,
     set_field_row,
 )
-from trackinizer.lib.codec import from_plain, loads
 from trackinizer.server import web
 from trackinizer.server.api import query
 from trackinizer.server.api.app import app
 from trackinizer.server.api.conftest import (
+    TEST_USER_EMAIL,
     answer_account_active,
     clear_identity_override,
     install_identity,
     make_test_identity,
 )
+from trackinizer.server.audience import SessionReader
 from trackinizer.server.auth import AuthIdentity, current_user
 from trackinizer.types.change_log import Change, Snapshot
 from trackinizer.types.inquiries import KIND_TO_CLASS
@@ -79,7 +82,7 @@ class TestRoutes:
         route_client: tuple[TestClient, Store, FakeEngine],
     ) -> None:
         client, _store, engine = route_client
-        set_field_row(engine.conn, {"kind": "Issue"})
+        set_field_row(engine.conn, {"kind": "Issue", "account": TEST_USER_EMAIL})
         engine.conn.fetch.return_value = []
         r = client.request(
             "DELETE",
@@ -93,7 +96,10 @@ class TestRoutes:
         route_client: tuple[TestClient, Store, FakeEngine],
     ) -> None:
         client, _store, engine = route_client
-        set_field_row(engine.conn, {"kind": "Issue", "owner": "worker-1"})
+        set_field_row(
+            engine.conn,
+            {"kind": "Issue", "owner": "worker-1", "account": TEST_USER_EMAIL},
+        )
 
         response = client.request(
             "DELETE",
@@ -221,6 +227,29 @@ class TestRoutes:
             ("title", "re", "foo"),
             ("owner", "nre", "Dan"),
             ("issue_priority", "gt", "5"),
+        ]
+
+    def test_list_kind_route_lists_for_the_reader_its_caller_is(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, store, _engine = route_client
+        asked: list[tuple[frozenset[str], str]] = []
+        with patch.object(store, "list_kind", new_callable=AsyncMock) as mock:
+            mock.return_value = []
+            for audiences in (frozenset({"open"}), frozenset({"open", "staff"})):
+                install_identity(
+                    replace(make_test_identity(), read_audiences=audiences),
+                )
+                assert client.get("/api/inquiries", params={"kind": "Issue"}).is_success
+                assert mock.await_args is not None
+                reader = mock.await_args.kwargs["reader"]
+                assert isinstance(reader, SessionReader)
+                asked.append((reader.audiences, reader.email))
+
+        assert asked == [
+            (frozenset({"open"}), TEST_USER_EMAIL),
+            (frozenset({"open", "staff"}), TEST_USER_EMAIL),
         ]
 
     def test_list_kind_route_logs_correlated_query_stage(
@@ -666,7 +695,7 @@ class TestRoutes:
         )
         r = client.post("/api/inquiries/lookup", json=[str(good), str(bad)])
         assert r.status_code == 200
-        body = from_plain(loads(r.content), dict[str, object])
+        body = json_loads(r.content, dict[str, object])
         assert body["found"] == {str(good): "Issue"}
         assert body["missing"] == [str(bad)]
 
@@ -676,9 +705,8 @@ class TestRoutes:
     ) -> None:
         """SSE relays every NOTIFY payload as ``{"id": "<uuid>"}``.
 
-        Matches the Auth section of ``docs/design.md``: viewer-gated reads, no
-        per-subscriber filter; localhost-only deployment is the
-        access boundary.
+        Viewer-gated reads, and every change reaches every viewer; the one
+        exception, a ping about a session's transcript, is the next test's.
         """
         client, _store, engine = route_client
         first = new_uuid()
@@ -691,6 +719,34 @@ class TestRoutes:
             body = b"".join(r.iter_bytes())
         assert f'data: {{"id": "{first}"}}'.encode() in body
         assert f'data: {{"id": "{second}"}}'.encode() in body
+
+    def test_subscribe_holds_back_a_hidden_transcripts_ping_from_a_viewer(
+        self,
+        route_client: tuple[TestClient, Store, FakeEngine],
+    ) -> None:
+        client, _store, engine = route_client
+        # The database says the viewer reads the session, once they hold its audience.
+        engine.conn.fetchval = AsyncMock(return_value=True)
+        hidden = new_uuid()
+        shown = new_uuid()
+        engine.listen_messages = [
+            json.dumps({"id": str(hidden), "audience": "staff"}),
+            json.dumps({"id": str(shown), "audience": "open"}),
+        ]
+
+        def streamed() -> str:
+            with client.stream("GET", "/api/change_log/stream") as r:
+                return b"".join(r.iter_bytes()).decode()
+
+        install_identity(make_test_identity())
+        opened = streamed()
+        install_identity(
+            replace(make_test_identity(), read_audiences=frozenset({"open", "staff"})),
+        )
+        staffed = streamed()
+
+        assert (str(hidden) in opened, str(shown) in opened) == (False, True)
+        assert (str(hidden) in staffed, str(shown) in staffed) == (True, True)
 
     def test_subscribe_routes_share_wire_shape(self) -> None:
         """``/api/change_log/stream`` and ``/api/web/subscribe`` emit identical bytes.
@@ -1072,6 +1128,7 @@ async def test_fields_keep_the_named_values_on_a_real_engine(
             SubmitWebSearch(account=account, title="query"),
             SubmitAgentSession(account=account, title="session"),
         ],
+        session_audience="open",
     )
     edges: tuple[tuple[uuid.UUID, Edge.Kind, uuid.UUID], ...] = (
         (child, "narrows", parent),
@@ -1112,6 +1169,68 @@ async def test_fields_keep_the_named_values_on_a_real_engine(
     # The relations are real when named: the edges were read.
     assert any(row.get("narrows") for row in rows)
     assert any(row.get("proved_by") for row in rows)
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+async def test_a_row_is_purged_by_its_account_or_an_admin_and_no_other_writer(
+    pglite_route_client: tuple[httpx2.AsyncClient, Store],
+) -> None:
+    http, store = pglite_route_client
+    ada = "ada@example.com"
+    mine, by_admin, kept = await store.submit_batch(
+        [SubmitIssue(account=ada, title=title) for title in ("mine", "admin", "kept")],
+    )
+
+    install_identity(make_test_identity(api_key_id=None, email="bob@example.com"))
+    other = await http.request("DELETE", f"/api/inquiries/{kept}", json={})
+    install_identity(make_test_identity(api_key_id=None, email="Ada@Example.com"))
+    own = await http.request("DELETE", f"/api/inquiries/{mine}", json={})
+    install_identity(
+        make_test_identity(api_key_id=None, email="root@example.com", role="admin"),
+    )
+    admin = await http.request("DELETE", f"/api/inquiries/{by_admin}", json={})
+
+    assert (other.status_code, own.status_code, admin.status_code) == (403, 200, 200)
+    assert json_loads(other.content, dict[str, object])["detail"] == (
+        "A row is purged by its account or an admin"
+    )
+    assert await store.get_inquiry(kept) is not None
+    assert await store.get_inquiry(mine) is None
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+async def test_a_writer_cannot_take_a_row_by_its_account_and_then_purge_it(
+    pglite_route_client: tuple[httpx2.AsyncClient, Store],
+) -> None:
+    http, store = pglite_route_client
+    ada, bob = "ada@example.com", "bob@example.com"
+    async with store.engine.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (id, email, name, role, status) "
+            "SELECT gen_random_uuid(), email, 'Test', 'writer', 'active' "
+            "FROM unnest($1::text[]) AS email",
+            [ada, bob],
+        )
+    taken, given = await store.submit_batch(
+        [SubmitIssue(account=ada, title=title) for title in ("taken", "given")],
+    )
+
+    install_identity(make_test_identity(api_key_id=None, email=bob))
+    take = await http.put(f"/api/inquiries/{taken}/account", json={"value": bob})
+    purge = await http.request("DELETE", f"/api/inquiries/{taken}", json={})
+    install_identity(make_test_identity(api_key_id=None, email=ada))
+    give = await http.put(f"/api/inquiries/{given}/account", json={"value": bob})
+    install_identity(
+        make_test_identity(api_key_id=None, email="root@example.com", role="admin"),
+    )
+    moved = await http.put(f"/api/inquiries/{taken}/account", json={"value": bob})
+
+    assert (take.status_code, purge.status_code) == (403, 403)
+    assert (give.status_code, moved.status_code) == (200, 200)
+    held = [await store.get_inquiry(row) for row in (taken, given)]
+    assert [row.account for row in held if row is not None] == [bob, bob]
 
 
 @pytest.mark.db_pglite
@@ -1424,6 +1543,6 @@ async def _viewer() -> AuthIdentity:
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

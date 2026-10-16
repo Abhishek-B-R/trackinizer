@@ -14,6 +14,8 @@ from uuid import UUID, uuid4
 
 import json
 
+from treekle import from_plain, immutable
+
 import pytest
 import pytest_asyncio
 
@@ -23,7 +25,6 @@ from trackinizer.lib.agent.sessions import (
 )
 from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.lib.agent.types.sessions import SessionRecord, Thinking
-from trackinizer.lib.codec import from_plain, immutable
 from trackinizer.server.embedders.stub import StubEmbedder
 from trackinizer.server.store.core import Store
 from trackinizer.trax.run.errors import CiphertextDroppedError
@@ -73,6 +74,7 @@ async def _captured(store: Store, name: str) -> tuple[UUID, int]:
     records.extend(reader.close())
     session_id = await store.submit_agentsession(
         SubmitAgentSession(title=f"resume {name}", cli="claude", account="t@e"),
+        audience="open",
     )
     part = await store.upsert_session_manifest(
         session_id,
@@ -252,6 +254,7 @@ async def test_stamping_the_id_re_attaches_rather_than_forking(store: Store) -> 
             cli_session_id=str(minted),
         ),
         requested_actor="agent",
+        audience="open",
     )
 
     assert resumed == session_id, "the resumed run forked a second AgentSession"
@@ -271,6 +274,7 @@ async def test_without_the_stamp_the_run_forks(store: Store) -> None:
             cli_session_id=str(uuid4()),
         ),
         requested_actor="agent",
+        audience="open",
     )
 
     assert forked != session_id
@@ -327,6 +331,6 @@ async def test_the_session_stays_searchable_without_its_ciphertext(
 
 
 if __name__ == "__main__":
-    from trackinizer.lib.testing.main import test_main
+    from trackinizer.lib.testing.runner import test_main
 
     test_main(__file__)

@@ -24,11 +24,13 @@ export type FieldProps = {
  * A draft goes under one idempotency key, which Retry sends again, so a send
  * whose answer was lost reaches the agent once; an edited draft, or the draft
  * sent to another `target`, takes a fresh key. Enter sends, and Shift+Enter (or
- * Enter while an input method composes) types a line break. A failure keeps the
+ * Enter while an input method composes) types a line break. Alt+Enter never sends:
+ * it is Chat's full screen key. The Send button shows only on a touch screen
+ * (composer.css): with a keyboard, Enter is the way to send. A failure keeps the
  * draft and says `failure(error)`; a success empties the box and shows what
  * `send` resolved with. A draft `check` finds wrong (it names the problem, or
  * returns `""`) is not sent: the composer says why until the draft changes. Under a new `target`, the old key, failure and receipt
- * no longer apply. `field` draws the textarea from the props the composer gives
+ * no longer apply, though a draft sent before the move still leaves the box. `field` draws the textarea from the props the composer gives
  * it, and may change the draft with `edit` as typing does (the console's adds
  * its @ suggestions); by default it is the plain textarea.
  *
@@ -69,11 +71,11 @@ export function Composer({
   const sending = useMutation({
     mutationFn: (message: Sent) => send(message.text, message.key),
     onSuccess: (text, message) => {
-      if (message.target !== currentTarget.current) return;
-      setReceipt({ text, target: message.target });
-      // A draft typed while this one was on its way stays.
+      // Sent, the draft leaves the box even if the box moved meanwhile, as Chat's does to a fork it
+      // started; a draft typed while this one was on its way stays.
       setDraft((current) => (current === message.text ? "" : current));
       setSent((current) => (current?.key === message.key ? null : current));
+      if (message.target === currentTarget.current) setReceipt({ text, target: message.target });
     },
   });
   /** Change the draft as typing does: a changed draft goes under a new key, and the receipt goes. */
@@ -112,7 +114,7 @@ export function Composer({
           rows: 3,
           onChange: (event) => edit(event.currentTarget.value),
           onKeyDown: (event) => {
-            if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
+            if (event.key !== "Enter" || event.shiftKey || event.altKey || event.nativeEvent.isComposing) return;
             event.preventDefault();
             event.currentTarget.form?.requestSubmit();
           },
@@ -120,7 +122,7 @@ export function Composer({
         edit,
       )}
       <div className="composer-actions">
-        <button className="btn" type="submit" disabled={!enabled || !draft.trim() || sending.isPending}>
+        <button className="btn composer-send" type="submit" disabled={!enabled || !draft.trim() || sending.isPending}>
           Send message
         </button>
         {failed && sending.error && retryable(sending.error) ? (

@@ -11,9 +11,43 @@
       "email": "no-auth@localhost",
       "last_login": null,
       "name": "no-auth",
+      "open_audiences": [
+        "open",
+        "private",
+        "staff"
+      ],
+      "org_mode": "individual",
+      "pinned_audience": null,
+      "preferences": {
+        "aliases": [],
+        "chat_side": "left",
+        "chat_style": "default",
+        "collapsed": [],
+        "console_views": [],
+        "create_draft": null,
+        "drafts": {},
+        "highlight_mentions": true,
+        "home": "graph",
+        "lens": null,
+        "people": {},
+        "read": {
+          "boundary": null,
+          "marks": []
+        },
+        "stars": [],
+        "terminal_font_size": "13px",
+        "theme": "dark",
+        "views": []
+      },
+      "read_audiences": [
+        "open",
+        "private",
+        "staff"
+      ],
       "role": "admin",
       "rules_issue_id": null,
       "rules_version": null,
+      "summary_accounts": [],
       "user_id": "00000000-0000-4000-9000-000000000001",
       "visual_workspace_enabled": true
     },

@@ -16,9 +16,10 @@ from uuid import UUID
 import collections
 import uuid
 
+from treekle import from_plain
+
 import asyncpg
 
-from trackinizer.lib.codec import from_plain
 from trackinizer.server.notify import (
     NOTIFICATION_BUFFER,
     Notification,
@@ -579,12 +580,23 @@ class _CascadeAuditMixin(_StoreShared):
     # documented Store API always wrap in :func:`notify_after_commit`; tests and one-off
     # helpers that drive :meth:`emit_change` directly should not crash on a missing
     # buffer.
-    def _buffer_notification(self, subject_id: UUID) -> None:
+    #
+    # ``audience`` is set by a write to a session's transcript and names the session's
+    # audience: a live stream relays that ping only to a viewer who reads it, where a
+    # change to the row itself, which is open, reaches every viewer.
+    def _buffer_notification(
+        self,
+        subject_id: UUID,
+        *,
+        audience: str | None = None,
+    ) -> None:
         """Queue a notify payload for post-commit publish."""
         buffer = NOTIFICATION_BUFFER.get()
         if buffer is None:
             return
-        buffer.append(Notification(engine=self.engine, subject_id=subject_id))
+        buffer.append(
+            Notification(engine=self.engine, subject_id=subject_id, audience=audience),
+        )
 
     # Known gap: a keyed retry of a purge that landed is not replayed. It finds the
     # row gone and answers 404. A client can read that 404, after an unanswered
@@ -630,44 +642,81 @@ class _CascadeAuditMixin(_StoreShared):
                 raise ConflictError(
                     f"inquiry is owned by {owner!r}; release its owner before purge",
                 )
-            kind = cast(Inquiry.InquiryKind, row["kind"])
-            parent_edges = await conn.fetch(
-                "SELECT from_id, from_kind, to_id, to_kind, edge_kind, "
-                "priority, note, valence, labels FROM edges "
-                "WHERE from_id = $1 OR to_id = $1",
-                target_id,
-            )
-            # Emit while the row still exists so ``subscribers_snapshot``
-            # captures who was watching right before the DELETE.
-            cause, _ = await self.emit_change(
+            return await self.purge_held(
                 conn,
+                target_id,
+                kind=cast(Inquiry.InquiryKind, row["kind"]),
                 api_key_id=api_key_id,
                 actor=actor,
-                subject_id=target_id,
-                subject_kind=kind,
-                kind="purged",
                 reason=reason,
-                cascade=False,
             )
-            await self._cascade_dependency_changed(
+
+    async def purge_held(
+        self,
+        conn: Conn,
+        target_id: UUID,
+        *,
+        kind: Inquiry.InquiryKind,
+        api_key_id: UUID | None,
+        actor: Inquiry.Actor,
+        reason: str,
+    ) -> UUID:
+        """Delete a row ``conn``'s transaction holds, auditing it and every edge first.
+
+        The caller has locked the row ``FOR UPDATE`` and decided it may go:
+        :meth:`purge` refuses an owned row, while a science chat's delete takes its
+        sessions, whose routing name is their owner. Wrap the transaction in
+        ``notify_after_commit``.
+
+        Args:
+          conn: The connection, inside the transaction that locked the row.
+          target_id: Inquiry to delete.
+          kind: Its kind.
+          api_key_id: API key that authorized the purge, if any.
+          actor: Identifier recorded as the purge's author.
+          reason: Explanation for the purge.
+
+        Returns:
+          change_id: The ``purged`` change_log row id.
+
+        """
+        parent_edges = await conn.fetch(
+            "SELECT from_id, from_kind, to_id, to_kind, edge_kind, "
+            "priority, note, valence, labels FROM edges "
+            "WHERE from_id = $1 OR to_id = $1",
+            target_id,
+        )
+        # Emit while the row still exists so ``subscribers_snapshot``
+        # captures who was watching right before the DELETE.
+        cause, _ = await self.emit_change(
+            conn,
+            api_key_id=api_key_id,
+            actor=actor,
+            subject_id=target_id,
+            subject_kind=kind,
+            kind="purged",
+            reason=reason,
+            cascade=False,
+        )
+        await self._cascade_dependency_changed(
+            conn,
+            child_id=target_id,
+            child_kind=kind,
+            caused_by=cause,
+            edge_rows=parent_edges,
+        )
+        for edge in parent_edges:
+            await self._emit_purge_edge_removed(
                 conn,
-                child_id=target_id,
-                child_kind=kind,
+                target_id=target_id,
+                target_kind=kind,
+                edge=edge,
                 caused_by=cause,
-                edge_rows=parent_edges,
+                api_key_id=api_key_id,
+                actor=actor,
             )
-            for edge in parent_edges:
-                await self._emit_purge_edge_removed(
-                    conn,
-                    target_id=target_id,
-                    target_kind=kind,
-                    edge=edge,
-                    caused_by=cause,
-                    api_key_id=api_key_id,
-                    actor=actor,
-                )
-            await conn.execute("DELETE FROM inquiries WHERE id = $1", target_id)
-            return cause
+        await conn.execute("DELETE FROM inquiries WHERE id = $1", target_id)
+        return cause
 
     async def _emit_purge_edge_removed(
         self,

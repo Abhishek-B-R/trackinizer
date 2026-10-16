@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
 from trackinizer.server.api._deps import get_store
+from trackinizer.server.api.session_access import session_reader
 from trackinizer.server.auth import AuthIdentity, require_role
 from trackinizer.wire.wire_export import (
     EXPORT_API_PATH,
@@ -50,8 +51,12 @@ async def export_route(
 ) -> StreamingResponse:
     """Stream every exported row as one JSON object per line.
 
-    Viewer-gated: it is a read, and a backup or mirror job should be able to
-    run on a read-only key.
+    Viewer-gated: it is a read, so a read-only key can run it. A session's transcript
+    is exported only to a caller who reads it: one whose audiences include the
+    session's, and for a science chat one of the chat's members, an admin no more
+    than anyone else. The header line names the audiences the file was read for and
+    counts the sessions whose transcripts it left out (``withheld_sessions``), so a
+    file that is not a whole backup says so.
 
     Args:
       request: FastAPI request object for store access.
@@ -61,8 +66,9 @@ async def export_route(
       result: The header line, then one line per row.
 
     """
-    del identity
-    graph = await get_store(request).export_graph()
+    graph = await get_store(request).export_graph(
+        reader=session_reader(request, identity),
+    )
     return StreamingResponse(export_lines(graph), media_type=EXPORT_MEDIA_TYPE)
 
 
@@ -81,6 +87,8 @@ def export_lines(graph: GraphExport) -> Iterator[bytes]:
             "format": EXPORT_FORMAT,
             "version": EXPORT_VERSION,
             "migrations": list(graph.migrations),
+            "audiences": list(graph.audiences),
+            "withheld_sessions": graph.withheld_sessions,
         },
     )
     for table, rows in graph.tables:

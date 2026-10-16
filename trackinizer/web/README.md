@@ -23,7 +23,7 @@ anyone when it runs with `--no-auth`. Any other browser gets the sign-in page.
 - `test/testdata/` holds the server's real answer to the calls of the
   modules in `fixtures_test.py`'s table (see
   [response shapes](#response-shapes-and-fixtures)); the canvas's and Chat's
-  calls (`workspaces`, `chats`, and the visuals, presets, timeline and Artifact
+  calls (`workspaces`, `chats`, `code`, and the visuals, timeline and Artifact
   modules) have none.
 - `e2e/` is the Playwright suite, `e2e/live/` its live and responsiveness part.
 - `scripts/` holds the schema dump, the local preview, the seed and writer
@@ -37,7 +37,8 @@ anyone when it runs with `--no-auth`. Any other browser gets the sign-in page.
 ### How every call is made
 
 - Every call goes through `send` in `src/api/client.ts`, under a timeout: 15 s
-  for reads, 6 s for search, 30 s for writes. A failure is an `ApiError` with the
+  for reads, 6 s for search, 30 s for writes, and 35 s for the read of a chat's
+  reply being written, which the server holds up to 25 s. A failure is an `ApiError` with the
   status and the server's `detail`. Status 0 means no answer: `code` is
   `timeout` or `network`. A 422's field errors become one line per field. A
   success whose body is not JSON keeps its status, with `code` `unreadable`.
@@ -84,10 +85,10 @@ anyone when it runs with `--no-auth`. Any other browser gets the sign-in page.
 ### The calls
 
 Each call's fixture, where it has one, is
-`test/testdata/<module>/<function>.json`. The `workspaces` and `chats` calls have
-none: the schema types them (`tsc` against `openapi.json`, kept in step by
-`openapi_drift_test.py`), and their API-module tests check what each sends and
-how it reads a frame.
+`test/testdata/<module>/<function>.json`. The `workspaces`, `chats` and `code`
+calls have none: the schema types them (`tsc` against `openapi.json`, kept in step
+by `openapi_drift_test.py`), and their API-module tests check what each sends and
+how it reads a frame or an answer.
 
 | Module | Function | Route |
 |---|---|---|
@@ -116,10 +117,11 @@ how it reads a frame.
 | `sessions` | `listSessionParts` | `GET /api/sessions/{id}/parts` |
 | | `readSessionRecords` | `GET /api/sessions/{id}/records?part=&after_idx=&limit=&plaintext_only=true` |
 | | `sendSessionMessage` | `POST /api/sessions/{id}/inbound` (header `Idempotency-Key`) |
-| | `readFeed` | `GET /api/web/feed?tail=&conversation=&after_created=&after_session=&after_part=&after_seq=&since=&until=&limit=&actor=&room=&cli=&kind=` (each filter repeated per value) |
-| | `readFeedFacets` | `GET /api/web/feed/facets?since=&until=&actor=&room=&cli=&kind=` |
+| | `readFeed` | `GET /api/web/feed?tail=&conversation=&after_created=&after_session=&after_part=&after_seq=&since=&until=&limit=&actor=&room=&cli=&kind=&station=&whose=&hidden=` (each filter repeated per value) |
+| | `readFeedFacets` | `GET /api/web/feed/facets?since=&until=&actor=&room=&cli=&kind=&station=&whose=&hidden=` |
 | | `sendRoutedMessage` | `POST /api/messages` (header `Idempotency-Key`) |
-| `histogram` | `readHistogram` | `GET /api/web/feed/histogram?since=&until=&buckets=&actor=&room=&cli=&kind=` |
+| | `setSessionAudience` | `POST /api/sessions/{id}/audience` (header `Idempotency-Key`; `{audience: "private" \| "open"}`) |
+| `histogram` | `readHistogram` | `GET /api/web/feed/histogram?since=&until=&buckets=&actor=&room=&cli=&kind=&station=&whose=&hidden=` |
 | `admin` | `setInquiryLock` | `PUT /api/admin/inquiries/{id}/lock` |
 | | `listUsers` | `GET /api/admin/users` |
 | | `setUserRole` | `PUT /api/admin/users/{id}/role` |
@@ -134,6 +136,11 @@ how it reads a frame.
 | `chats` | `listChats` | `GET /api/chats` |
 | | `getChatHead` | `GET /api/chats/{id}` (404 until the assistant opens the session: `null`) |
 | | `sendChatLine` | `POST /api/chats` (header `Idempotency-Key`; `conversationId` null starts a conversation; `fork` starts one from a line of another) |
+| | `shareChat`, `unshareChat` | `PUT`, `DELETE /api/chats/{id}/shares/{email}` |
+| | `deleteChat` | `DELETE /api/chats/{id}` |
+| | `readChatPartial` | `GET /api/sessions/{id}/partial?after=&wait_sec=25` (held until the partial's `seq` is not `after`, or 25 s; 404 when the server streams no replies) |
+| `code` | `getCodeDiff` | `GET /api/code/diff?from=&to=` (404 when either record has no snapshot the reader may read: `null`) |
+| | `readCodeFile` | `GET /api/code/records/{id}/file?path=` |
 
 Edges are stored child to parent: `from` is the child, which `narrows` its
 parent or `proves` its Belief. `/api/web/get` returns `edges` (this row is the
@@ -275,20 +282,44 @@ with one response shape, so the fixtures take one per verb.
   each a history entry; j and k move within the deepest column, and Enter opens
   its selection. A click leaves the focus where it was, as a list's buttons do,
   so Enter after a click still opens the selection.
-- The canvas is on for everyone (`visual_workspace_enabled` defaults true;
-  Settings' Agent workspace opts out). It wraps every view but Settings and
-  Admin, so Chat stays while an agent moves the page. Its chunk loads only for a
-  user who has it on, together with Chat's, the renderer it shows first, so the
-  canvas's first render suspends on nothing (a suspended renderer holds its
-  fallback for React's 300 ms throttle, which cost a cold first load of a page
-  250 to 300 ms); until both are in, the shell holds its busy frame, and the view
-  then mounts once, inside the canvas.
-- The page is `trax.browse`: it has no record or parameters, it cannot be
-  dismissed (no ×, and Configure's box is fixed), and a crash in it shows the
-  app's crash screen (Copy details, Reload) inside the canvas, which clears when
-  the page moves. The record the canvas's Chat button means is the one the
-  address names (`#/lookup/<id>`, or `#/ref/<Kind>/<seq>` resolved), never a
-  visual's.
+- The workbench (the canvas) is on for everyone (`visual_workspace_enabled`
+  defaults true; Settings' Agent workspace opts out, "Enable agent-guided
+  workbench"). It has no toolbar row: its visual toggles and Artifact link are
+  the sidebar's Workbench section (see the sidebar below). It wraps every view
+  but Settings and Admin, so Chat stays while an agent moves the page. Its chunk
+  loads only for a
+  user who has it on, together with Chat's column (`src/visuals/ChatColumn.tsx`),
+  so neither first render suspends (a suspended view holds its fallback for
+  React's 300 ms throttle, which cost a cold first load of a page 250 to 300 ms);
+  until both are in, the shell holds its busy frame, and the view then mounts
+  once, inside the canvas, inside the column.
+- The page is `trax.browse`: it has no record or parameters, it closes with the
+  × every tile has (and its toggle in the Workbench section shows it again), and
+  a crash in it shows the app's crash screen (Copy details, Reload) inside the
+  canvas, which clears when the page moves. A closed page comes back with the
+  user's next navigation (a link, an app route, a changed hash), and with an
+  agent's `navigate` (the server shows it in the same revision).
+- `trax.files` (`src/visuals/Files.tsx`) shows any record's files document
+  (`wire/files_doc.py`, `src/visuals/filesDoc.ts`): the Artifacts labelled
+  `files` and `files:of:<record id>`, kept only when filed by one of the
+  profile's `summary_accounts` or by the account the record itself is filed
+  under (read only when another account filed a row), since any writer can
+  label a row: a person's own work tree on their own record shows, and no one
+  can plant one on someone else's; of those,
+  the newest changed, with "Newest of N" when more are filed. The read is the
+  list route, so a reader sees a document only where they may read its
+  Artifact; no route reads a tree, and nothing opens or downloads a file. It
+  reads again every minute. The changed files come first, each folding open to
+  its diff (its header lines, then its hunks numbered as in the file, 400 lines
+  at most), then the file tree, directories first, a directory whose only child
+  is a directory joined to it; a changed file's click there opens its diff.
+  Three params narrow it, each checked by the server against the catalog: `path`
+  (up to 512 characters) a prefix, or a glob when it holds `*` or `?` (`**/`
+  crosses directories, `*` and `?` do not), case ignored, over both lists;
+  `changed` hides the tree; `file` (up to 512) opens the diff of the changed
+  file at that path, or of each one of that name, and narrows nothing. In a
+  canvas each control (the path filter on Enter, Changed only, Close) shows the
+  visual again with all three; showing it on a new record alone keeps them.
 - Navigation is an event. An agent's `navigate` frame moves the page when
   `parseHash` accepts its `#/...` route (any other is ignored), and writes
   nothing. The browser's own links, Chat's, the record context, the context
@@ -298,48 +329,170 @@ with one response shape, so the fixtures take one per verb.
   them fit 1280 px beside the sidebar with no sideways scroll; at 900 px and
   narrower they stack, each 400 px or 48% of the screen high, and the stage
   scrolls up and down.
+- Chat is a column of its own beside the canvas (`ChatColumn`), not a visual in
+  it: on the left by default, a third of the screen wide or 80 characters of its
+  own font plus its padding, whichever is less (the CSS sets `ch` on the column,
+  so it is Chat's font that is counted). A divider between Chat and the canvas
+  resizes it by the pointer or the arrow keys (16 px, 48 with Shift), down to
+  280 px and up to seven tenths of the row; the width is kept in
+  `localStorage` with the canvas's sizes (`trackinizer.v2.canvas.sizes`, `chat`).
+  A button in Chat's header moves it to the other side, kept under
+  `trackinizer.chat.side`. State that lasts only for the page, hidden and full
+  screen, lives with the side in one store (`src/visuals/chatColumnState.ts`), so a
+  reload shows Chat. `Ctrl+\` (⌘\) and the Hide button in its header hide it,
+  and three docked columns in the workbench hide it until one goes; hidden,
+  it leaves a 16 px strip in the accent colour at its edge, and a press on the
+  strip shows it. An agent hides and shows it with a `chat` frame
+  (`{type: "chat", hidden, t}`, routed to the store by `CanvasStream`; a hide leaves
+  full screen, a show keeps the side, and a reload shows Chat). Resting the pointer
+  on the strip for 120 ms opens Chat over the canvas at its column width, with no
+  reflow, over the folded sidebar rail and anything else the workbench draws; it
+  folds 300 ms after the pointer and the keyboard have left (`hoverOpen.ts`), and a
+  click anywhere in it, its Pin button, a click on the strip or the hide key stand
+  it beside the canvas again. Alt+Enter makes it fill the main area, the canvas kept
+  mounted and hidden; Esc or Alt+Enter returns. Alt+Enter never sends from a
+  composer. All three are commands in the ⌘K palette, mounted with the column,
+  so they exist only where Chat does. Under 900 px Chat stands under the page at
+  full width. Nothing of Chat covers the canvas while an agent moves it.
+- A station is a named workstream: a canvas with at most one chat, a name and the
+  page it last showed (`src/stations/`). The tab shows one at a time. Its id is the
+  one `stations/store.ts` holds, kept in the tab's `sessionStorage` so a reload
+  keeps it; a tab with none (a new tab) asks the server (`POST /api/workspaces`,
+  the station changed last, or the first), and a station that is gone is
+  replaced the same way. `useStation` reads it from the
+  cache the stream keeps (`["workspace", id]`), and `CanvasStream`, the canvas,
+  Chat and the Settings partner choice all read that one entry. Switching
+  (`showStation`) seeds the cache, reopens the stream for the new id and moves the
+  page to the station's own (the graph when it has none). The page is written back
+  by `usePageSync` at most once every 500 ms, and not for a switch until the
+  address is where the switch sent it. The tab's title is `<station name> ·
+  Trackinizer`.
+- Chat's top is a strip of tabs (`StationTabs`), one per station, in the order
+  they were made, as a browser's: a click on a tab opens its station, and opening
+  one moves no tab. A click on the current tab, or a double click on any, edits its
+  name in place: Enter or leaving the field saves, Esc keeps the old name, a blank
+  or unchanged name sends nothing, and a taken name says "That name is taken" and
+  keeps the field. `+` makes a fresh station (`unnamed-workstream#N`, no chat yet)
+  and opens it. All stations opens the station menu (`StationMenu`): a search by
+  name (any case), every station newest opened first, Enter or a click to open one,
+  Esc to close. A press outside the menu, or the keyboard leaving it, closes it; a
+  blur alone does not, since Safari focuses no clicked button. `g ]` and `g [` walk
+  the renamed stations (names that are not `unnamed-workstream#N`) in the order they
+  were made, wrapping; `g s` opens the menu with the search focused; each station is
+  a palette command, "Open station <name>". There is no History and no Clear chat:
+  the tabs and search replace the first, `+` the second.
 - Chat talks to the server's assistant (`src/visuals/Chat.tsx`). A conversation is
   a science chat: an AgentSession (label `science-chat`, `cli_session_id`
   `chat:<conversation id>`) that the assistant opens. Chat reads the session's
   records; there is no chat store. Its header names the partner
-  (`workspace.partner`) and has History and Clear chat. The History menu has the
-  `menu` role, its items `menuitemradio` with the current one checked, and Escape
-  closes it. History lists `GET /api/chats` (the chats the user started or posted
-  in: title, age, starter) on each open; picking one opens it. Any other science
-  chat opens by link: a session's page, or the Console line, offers Continue in
-  Chat (`useContinueInChat`, `src/visuals/continueChat.ts`), which leaves a
-  request on the shell's `ChatFeed` and shows Chat; Chat resolves the session
-  (`cli_session_id`, label) and opens its conversation, or says "That session is
-  not a science chat." Clear chat starts an empty conversation and keeps the old
-  one: the next send goes with `conversationId: null`, and the receipt's id
-  becomes the open one, unless the user has picked another conversation since.
-  The open conversation is held by the shell (`ChatFeed`), so Chat mounting again
-  keeps it, and in `localStorage` under `trackinizer.v2.chat.<workspace id>`, so
-  a reload reopens it; with storage refused it lasts until the page does.
+  (`workspace.partner`) and has the side button, plus Hide, Share and Delete when
+  the head allows them (below). Which conversation Chat shows is
+  the station's `conversation_id`, which the first line binds (the receipt's
+  `workspace_id` names the station it went to; a fork is a station of its own, which
+  the tab then shows on the page it is on). Any other science chat opens by link: a
+  session's page, or the Console line, offers Continue in Chat (`useContinueInChat`,
+  `src/visuals/continueChat.ts`), which leaves a request on the shell's `ChatFeed` and
+  shows Chat, if it is hidden; Chat resolves the session (`cli_session_id`, label),
+  and `POST /api/workspaces/for-chat/<conversation>` opens the user's station for it
+  (made, if there is none) and the tab shows that, or says "That session is not a
+  science chat."
+- Every Console read is scoped. Opened inside a named station, it starts on that
+  station's agents: its feed, facets and histogram reads carry `station=<id>`
+  (the sessions its chat started agents in, the chat itself left out) and
+  `whose=everyone`, since those are the assistant's sessions, under no person's
+  account. Anywhere else it starts on the person's own sessions, `whose=mine`.
+  The Scope control (This station, inside a station; Mine; My campaigns;
+  Everyone) switches it, for the station it was switched in: My campaigns is
+  `whose=campaigns`, the sessions of the campaigns the person launched (the
+  server matches the `<slug>:asker:<email>` label of their briefs), and Everyone
+  is `whose=everyone`, every session the server's org mode lets them read. Show
+  hidden adds `hidden=true`: the reads then keep the sessions their owners hid
+  (audience `private`) that the person reads, their own and, for staff and
+  admins, other people's; each such row says Hidden. A row the facets mark
+  `hideable` (the person's own session, never a chat) offers Hide, or Unhide
+  once hidden (`setSessionAudience`); the Console then reads its feed afresh and
+  its facets and histogram again, a hide's toast offers Undo, and a refusal
+  (`session_not_owner`, `session_staff`, which the server sends as a code alone)
+  has a sentence of its own. The scope and Show hidden belong to the tab, not
+  to the saved view. The station's own chat is hidden
+  widened too, and no `chat-*` actor is a message target (an `@` completion, a To
+  chip, `@*`, or a typed `@chat-...`, which says "open its station"); another
+  station's chat line offers Open station, which goes through Chat's for-chat
+  switch. The box names its targets ("Message lead-2"). When a line's per-target
+  sends have all settled, one `POST /api/workspaces/<id>/relay` tells the station's
+  chat (only when its head says `forks_on_typing` is false; a chat the person does
+  not read is not theirs to speak into), with the targets that took it, under a
+  key made with the line's route (a
+  Retry reuses it); `{delivered: false}`, or a failed relay, adds "Chat not told" to
+  the receipt. The chat records that as a line starting `→ ` (`RELAY_MARK`), which
+  Chat draws as "you → lead-2: text" in its own style (a dim comment line in the
+  Terminal style), and which counts as none of the person's own lines.
 - Chat sends the page it is on: each line carries `page`, the `#/...` hash as it
   is sent, and `trail`, the up to 8 hashes before it, oldest first (routes only;
   the server resolves their records). `src/router/trail.ts` records them from
-  `main.tsx` on, so pages visited before Chat opened count. With no record
-  pinned, Chat shows `On screen: Kind#seq title` for the record a
-  `#/lookup/<id>` or `#/ref/<Kind>/<seq>` page shows, and follows the page.
+  `main.tsx` on, so pages visited before Chat opened count. Chat shows
+  `On screen: Kind#seq title` for the record a `#/lookup/<id>` or
+  `#/ref/<Kind>/<seq>` page shows, and follows the page; a line pins no record.
 - The partner is the shared assistant, or the owner's own `trax helper` when the
   canvas chooses `local`; with none live, Chat says how to start one
   (`ChatOff`, `HelperCommands`) and the box is off.
-- A chat is joined by typing in it, or forked. Every stored line has a "Fork from
-  here" button (not a line still sending, and not for a viewer): it picks the
-  line, a banner says so with a Cancel, and the next message is sent with
-  `fork: {sessionId, part, idx}` instead of a `conversationId`. The server makes the
-  fork a new conversation, named by the idempotency key, and Chat opens it. A chat
-  whose head says `forks_on_typing` (the server's call, from the verified email
-  domains; see `chat_orgs` in `server/config.py`) forks the same way at its latest
-  line whatever the user types, since the server refuses a post into it; the
-  composer is off until the head is read, and a post the server still refuses
-  (403) is sent again as a fork at the latest stored line. A fork
+- Who reads a chat is the server's call, and its head says it: `audience` is
+  `open` (whom the server's org mode lets in: everyone signed in under `single`,
+  the starter's email domain under `domain`, nobody else under `individual`;
+  see `chat_orgs` in `server/config.py`), `private` once its starter hid it, or
+  `staff` once the assistant read a staff session into it; the chat's starter and
+  the people it is shared with read it in every case, and a staff chat only those
+  of them who hold staff. Whoever reads a chat joins it by typing in it. A chat
+  whose head says `forks_on_typing` is one the person does not read: the server
+  refuses its records and their lines, and a fork too, since a fork copies lines
+  its poster reads. Chat then reads no records (and drops any read before the chat
+  closed to them), says why (not shared with them, hidden, or staff only and they
+  hold no staff), and keeps the composer off. The composer is off until the head
+  and the lines are read, and a post the server still refuses (403
+  `chat_not_shared`, or any other) is shown, never sent again as a fork.
+- An open chat is forked from any stored answer: its "Fork from here" button (not
+  a line still sending, and not for a viewer) picks the line, a banner says so
+  with a Cancel, and the next message is sent with `fork: {sessionId, part, idx}`
+  instead of a `conversationId`. The server makes the fork a new conversation,
+  named by the idempotency key, and Chat opens it. A hidden or staff-only chat
+  offers no fork, since the copy would not keep who reads it; a fork the server
+  refuses as such (409 `chat_fork_closed`, the chat closed after the line was
+  picked) drops the picked line, keeps the draft, says why and reads the head
+  again. A post that names a deleted chat (410
+  `chat_deleted`), or a head read that does, lets that chat go: the station
+  holds no conversation, and a post starts a new chat with the same line. A fork
   opens with the original's lines up to the one picked, so mine among them are
   not waited for as a new line (`linesThrough`). The head also says how often a chat
   was forked and which chat a fork came from.
-- The composer says chats are public to every user and cannot be deleted. Chat has
-  no delete.
+- A hidden chat's header says Hidden and a staff chat's Staff only. The head's
+  `may_hide` (its starter, while it is not staff) shows Hide (`HideChat`), which
+  makes it `private` (`setSessionAudience` on its session, which moves every
+  session of the chat), or Unhide once hidden; the head is then read again, and a
+  refusal is one toast line, `session_not_owner` and `session_staff` in sentences
+  of their own.
+- The head says what the caller may do (`may_share`, `may_delete`,
+  `shared_with`), and Chat's header shows only that. Share (`ShareChat`,
+  `src/visuals/ChatSharing.tsx`) opens a panel listing `shared_with`, each with
+  Remove, and a field to add an address; each change is `PUT`/`DELETE
+  /api/chats/<id>/shares/<email>`, after which the head is read again, since it
+  is the list. Delete (`DeleteChat`) asks "Delete this chat? Its forks keep
+  their copies." first; once the server has deleted it the station holds no
+  conversation (its cached `conversation_id` is null) and shows an empty chat,
+  whose next line starts a new one. A refused share or delete is one toast
+  line:
+  `chat_not_starter`, `chat_has_other_posters` and `chat_staff_only` (a share of a
+  staff chat with someone who holds no staff; the code is the error's `code`, which
+  `ApiError.code` reads) have their own sentences, any other refusal shows the
+  server's reason. A shared person reads the chat and their lines land in it; the
+  server refuses everyone else's (`forks_on_typing`). Only the starter shares a
+  chat; an admin may only remove a share, so an admin's head has no Share.
+- The composer says who reads the chat, from its `audience` and the profile's
+  `org_mode` ("Read by everyone signed in to this server." under `single`; the
+  starter, their shares and the starter's organisation under `domain`; the
+  starter and their shares under `individual`), the same for every reader; a
+  server that names no `org_mode` gets the general sentence. The starter may
+  delete a chat while they are its only poster, and an admin always; the server
+  decides, and the head says so.
 - An answer that arrives lights up the rows it cites at once, through the tab's
   highlight store, as the agent's Highlight does, with no server round trip beyond
   `GET /api/inquiries/{Kind}/{seq}` for a ref not seen before (`useAnswerHighlights`,
@@ -376,11 +529,25 @@ with one response shape, so the fixtures take one per verb.
   refuses a blank message and one over 16,384 characters. A send the server
   refused (4xx) shows the server's reason and offers no Retry; one that got no
   answer, or a 5xx, keeps the draft with Retry under one idempotency key. The
-  transcript follows the newest row, the working row too, unless the reader has
-  scrolled up. Chat shows no write error of its own: the canvas shows it once. A
-  Chat about a record links to it and has Clear context, which returns Chat to
-  the side. The canvas toolbar's Chat button shows Chat at the side, or focuses
-  it when it is shown.
+  transcript follows the newest row, the working row and the reply being written
+  too, unless the reader has scrolled up.
+- The reply the assistant is writing shows as it is written
+  (`useChatPartial`, `src/visuals/chatPartial.ts`). While an answer is owed (the
+  last line is pending, or has no answer after it) in a chat the reader reads,
+  and the partner is live, Chat reads `GET /api/sessions/{id}/partial`, each read
+  held by the server until the reply changes and the next asking after the `seq`
+  the last one answered. Nothing of it is stored: the server keeps it in memory,
+  for the chat's readers only, until the answer is stored, the turn calls a tool
+  or fails (the assistant clears it), or 60 s pass with no change. The reply is a
+  bubble drawn as the answer will be (Markdown, no images, ending in a caret) in
+  place of "Waiting for the assistant…" or "Working…"; "Sending…" and a partner
+  gone still show instead. It is `aria-busy`, so the log announces the answer
+  once, when it is stored. The stored answer takes the bubble's place in the
+  render that counts it, and a later reply of that turn shows no more; a turn's
+  finished text (`done`) shows only where its bubble already is, so one still
+  held raises none under the next line (`nextBubble`). A 404 (the server streams
+  no replies, `TRACKINIZER_CHAT_STREAMING=off`) ends the reads, and Chat shows
+  the working line as before; another failure is read again after 1, 2, then 5 s.
 - The graph is the home view. It draws the newest 1,000 inquiries by default,
   or 100, 5,000, all of them, or any count typed into the Nodes menu (a typed
   count picks exactly that count: 50 is 50, and 1,000 the 1k preset), each
@@ -448,17 +615,34 @@ with one response shape, so the fixtures take one per verb.
   stays collapsed as the selection moves, as VS Code's and Linear's panels
   do: only its button, `]`, or Space in a list expands it. Peek's detail shows
   its rail whatever the detail page chose, with no button for it. Collapsing
-  or expanding one frames the graph again. The canvas's Configure opens its
-  panel, and Done collapses it.
-- The app's sidebar collapses too, by the button beside New or ⌘B (Ctrl+B),
-  as VS Code's primary side bar does: `[` and `]` stay each view's own. It
-  narrows to a 48 px rail of its icons, as VS Code's activity bar is: the
-  button that expands it on top, then search, New and every entry in its
-  order, each a link named and titled by its label, the current one marked,
-  and the user's avatar at the foot. Rules stand in for the section headings.
-  The graph frames again in the width it gives. Narrow, the sidebar is the
-  drawer, whole, whether collapsed or not, and has no collapse button.
-- The sun or moon beside the user, in the sidebar or its rail, switches the
+  or expanding one frames the graph again.
+- The app's sidebar folds away and stands on one side only, opposite Chat, so
+  flipping Chat's side moves both (`src/app/Shell.tsx`). It starts as a 48 px
+  rail of its icons, as VS Code's activity bar is: the button that pins it open
+  on top, then Search, New and every entry in its order, each a link named and
+  titled by its label, the current one marked; at the foot Your settings,
+  Admin, the theme and the user's avatar. A rule stands in each section
+  heading's place, and every row is as tall as opened, so each icon stands
+  exactly where it does with the sidebar open: 24 px from the outer edge. At
+  the right the open sidebar's rows turn over, icon outermost, to keep that.
+  Resting the pointer on the
+  rail for 120 ms opens it over the workbench, which keeps its width; it folds
+  100 ms after the pointer and the keyboard have left it, sooner than Chat's
+  300 ms since the opened rail touches the rail (`useHoverOpen`,
+  `RAIL_FOLD_AFTER_MS`), and a link followed folds it at once. The
+  button beside the logo, or ⌘B (Ctrl+B), as VS Code's primary side bar does,
+  pins it open, taking room from the workbench. It stands at the sidebar's outer
+  edge, so it stays put as the rail opens and folds, over Search and then New,
+  each a row of its own with its key; `[` and `]` stay each view's own. The
+  graph frames again in the width a pin gives. While a workbench is mounted the
+  sidebar has a Workbench section, folded at first: the visual toggles and the
+  Artifact link (the section's body is a slot, `src/app/workbenchSlot.tsx`, that
+  the canvas draws into). In the rail it is one icon, which opens the sidebar on
+  its controls, unfolded. Settings has a Close link in its header, back to the
+  last page before Settings or Admin, or the graph; the page is as wide as its
+  sections, so Close stands at their edge. Narrow, the sidebar is the drawer,
+  whole, whether collapsed or not, and has no collapse button.
+- The sun or moon over the user, in the sidebar or its rail, switches the
   theme to light or dark; Settings' Appearance also offers System, and shows
   a switch made here at once (`useTheme` in `src/theme.ts`).
 - Search in the palette answers while you type from what the app has loaded:
@@ -620,20 +804,32 @@ with one response shape, so the fixtures take one per verb.
   detail read ahead into the detail's own query (`src/lists/prefetch.ts`): at
   most 10 a minute, and none read in the last 30 s. A `Kind#seq` link to a row
   the app holds opens by that row's id, with no by-seq lookup.
-- A 401 from any read or write ends the session: open drafts are saved to
-  `localStorage` (`trackinizer.v2.drafts.<email>`), the current hash to
-  `sessionStorage` (`trackinizer.v2.return_hash`), and the browser goes to
-  `/auth/login_page?next=%2Fapp%2F`. The next boot restores both.
+- A 401 from any read or write ends the session: the drafts still open are saved
+  to `localStorage` (`trackinizer.v2.drafts.<email>`, and `trackinizer.v2.create.<email>`
+  for the create form), since the server can no longer take them, the current hash
+  to `sessionStorage` (`trackinizer.v2.return_hash`), and the browser goes to
+  `/auth/login_page?next=%2Fapp%2F`. The next boot sends the drafts to the user's
+  preferences (`adoptLocalUserData`) and restores the hash.
 - A write refused with 403 refetches the profile, since the role may have
   changed.
-- This browser's own state is one versioned JSON value in `localStorage`, keyed
-  `trackinizer.v2.<origin>.<email>` (`src/state/`): stars, saved views
-  (`{id, name, request}`, the exact list request), aliases, people added by hand,
-  notification read state (`{boundary, marks}`) and UI state
-  (`{collapsed, lens, tiles}`). Settings exports it and imports another browser's: an
-  import never deletes, views merge by id, and UI state stays this browser's.
-  Tabs see each other's changes through the `storage` event. The value is
-  version 2; a version 1 value reads as version 2 with no tiles.
+- The user's own data lives in their preferences on the server
+  (`server/preferences.py`, `src/preferences.ts`), so it follows them to any
+  browser: stars, saved views (`{id, name, request}`, the exact list request),
+  aliases, people added by hand, notification read state (`{boundary, marks}`),
+  folded sections (`collapsed`), the last lens, unsent drafts of a field
+  (`drafts`, by inquiry id and field), the create form's (`create_draft`) and the
+  console's views (`console_views`).
+  `src/state/store.ts` is a view of it: a change sends only the keys it changed,
+  each replaced whole. Only `ui.tiles` stays in `localStorage`, one versioned JSON
+  value keyed `trackinizer.v2.<origin>.<email>`, and tabs see each other's tiles
+  through the `storage` event.
+- A draft is written after typing pauses for 500 ms, one request however many
+  keys were typed, and again as the page closes (`choosePreferencesSoon`); sending
+  or discarding it removes it. It reopens on the next load of its field or form, in
+  any browser. A browser that kept this data before the move sends it once at the
+  first boot, merged into the user's (`adoptLocalUserData`: stars, names, people and
+  views are unions; a draft kept here replaces the server's of the same field),
+  then forgets it.
 - A tile's bar is how it is placed; there is no Focus button and no placement
   menu. A press on the bar focuses the tile. A drag floats it, or docks it at
   the edge of the stage it is dropped on: the left or right 48 px for the
@@ -643,8 +839,7 @@ with one response shape, so the fixtures take one per verb.
   stays in its strip while dragged (the strip would clip it) and a card with
   its name follows the pointer. Every visual but the page also has two dock
   buttons, ◧ and ◨, the same docking by one press or by the keyboard. The page
-  stays the page: docked, its bar only focuses. Chat dragged out floats as it
-  does standing aside (below), open under the pointer that dropped it.
+  stays the page: docked, its bar only focuses.
 - Every boundary on the canvas resizes what it bounds, as a desktop's windows
   and an editor's panes do. A floating window resizes by any of its four edges
   and four corners: the opposite sides stay, it never goes under 280 by 220 px,
@@ -655,21 +850,8 @@ with one response shape, so the fixtures take one per verb.
   other, down to each one's least size. The sizes are this browser's, kept in
   `localStorage` (`trackinizer.v2.canvas.sizes`): a column's width per side, a
   window's size per visual type, and a docked tile's share of its strip per
-  visual type (an even share is 1). Opening a saved view forgets the windows'
-  sizes, as it forgets their places, and shows the view's.
-- Chat is docked beside the page: in the column at either side, or in the main
-  strip when placed there. A canvas that stored it floating shows it at the
-  right. When an
-  agent moves the page (`navigate`) or shows a visual (a `workspace` frame's
-  `shown`), Chat stands aside: the same tile, never mounted again, floats over
-  the page folded to a filled bar. It opens after the pointer has rested on it
-  120 ms, stays open while the pointer is over it or the keyboard is in its
-  contents, and folds 300 ms after both have left; each later navigation or
-  show folds it at once. A dock button on its bar puts it back at that side,
-  and the toolbar's Chat at the side it came from.
-  Standing aside is the tab's own state (`ChatFeed.aside`), never the canvas's:
-  a reload starts docked, and its fold is not remembered.
-- A floating canvas tile (a visual placed Float, or Chat standing aside) moves
+  visual type (an even share is 1).
+- A floating canvas tile (a visual placed Float) moves
   by its whole top bar and by the
   ⠿ handle, which also moves by the arrow keys (16 px, 48 with Shift) and never
   docks. A press on the bar that stays within 4 px is a click, which focuses;
@@ -679,8 +861,7 @@ with one response shape, so the fixtures take one per verb.
   is a transform on the tile alone, kept inside the stage, and the canvas takes
   the place once, on release. The place and the fold are kept per visual type in
   `ui.tiles` (`{collapsed, place: {left, top} | null}`), so they survive a
-  reload; a browser that cannot store keeps them for the session. Opening a
-  saved view forgets the places and shows the view's. A drag and an arrow key
+  reload; a browser that cannot store keeps them for the session. A drag and an arrow key
   start from where the tile is drawn, which the stage's hold may have moved from
   the saved place. The stage holds each tile from the place it is meant to stand
   at, not from where an earlier hold left it, so a tile a narrow window pushed in
@@ -692,17 +873,17 @@ with one response shape, so the fixtures take one per verb.
   Outline on Issues; Columns lives in the hash), pages loaded and focused row
   in `sessionStorage` (`trackinizer.v2.list.<id>`), so Back returns to it as it
   was.
-- The console's views are one JSON list in `localStorage` per signed-in email
-  (`trackinizer.v2.console.<email>`), as drafts are: each view's id, name, pin,
-  start time, agents, rooms, CLIs, level and range. A view saves itself on every
-  change; a new "Untitled view" is stored on its first. Pinned views list first,
-  then the rest, each newest first. The tab's open view is the stored one with
-  the id in `sessionStorage` (`trackinizer.v2.console.open`), so a reload opens
-  it again, another tab's edit shows, and another tab's delete opens the first
-  view left; a tab with none opens the first view. A stored view of another
-  shape, with a time that is not one, or with a range that ends before it
-  starts, is left out. When the browser refuses to store, or denies storage
-  altogether, the open view still changes, unsaved. The console's feed pages and
+- The console's views are the user's `console_views` preference, kept on the
+  server so any browser finds them: each view's id, name, pin, start time, agents,
+  rooms, CLIs, level and range. A view saves itself on every change; a new
+  "Untitled view" is stored on its first. Pinned views list first, then the rest,
+  each newest first. The open view's id lives in the station's layout, so a reload
+  opens it again, another tab's edit shows, and another tab's delete opens the
+  first view left; a station with none opens the first view. When the server
+  refuses a change, the open view still shows it, unsaved. A browser that kept
+  views under `trackinizer.v2.console.<email>` has them merged into the user's
+  once, by id with the server's copy winning, and the key removed
+  (`adoptLocalUserData`). The console's feed pages and
   facets are read through the query cache under `["console", "feed", read]` and
   `["console", "facets", window]`; live, the facets are read again on a stream
   batch at most every 10 s, and every minute. After a
@@ -715,16 +896,15 @@ with one response shape, so the fixtures take one per verb.
   them; whether a panel shows is the tab's preference, as the key's is.
 - So is whether each panel that collapses is collapsed, in `sessionStorage`
   under `trackinizer.v2.panel.<id>`: `app.sidebar`, `peek`, `graph.results`,
-  `detail.rail`, `console.rail` and `visuals.configure`. A new tab starts with
-  each expanded, and Configure's closed.
+  `detail.rail` and `console.rail`. A new tab starts with each expanded, but
+  the sidebar, which starts as a rail.
 - Drafts live in their editor's state, never in a cached row, so a refetch
   leaves them alone.
 - The canvas's state is `["workspace", id]` in the cache, filled by the shell's
   workspace events stream (`newerWorkspace` keeps the newest revision) and, once,
-  by a read. A conversation's records are `["chat", "records", session]`, its head
-  `["chat", "head", id]` and its history `["chats"]`. What is not records (how
-  often the stream opened, each canvas's open conversation and a Continue in Chat
-  request) is the shell's `ChatFeed`
+  by a read. A conversation's records are `["chat", "records", session]` and its head
+  `["chat", "head", id]`; the user's stations are `["stations"]`. What is not records
+  (how often the stream opened and a Continue in Chat request) is the shell's `ChatFeed`
   (`src/visuals/chatFeed.ts`), above Chat, which is a lazy chunk that may load
   after a frame arrived and mount again.
 
