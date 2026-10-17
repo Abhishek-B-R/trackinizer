@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast, get_args
 
+import math
 import uuid
 
 from treekle import from_plain
@@ -120,6 +121,8 @@ def parse_list_query(
         if isinstance(clause, _KindClause):
             kinds.append(clause.kind)
         elif isinstance(clause, _RangeClause):
+            if not kinds:
+                raise ClientError("seq range requires a preceding kind")
             # Per GRAMMAR.md 6, a range token binds to the most recently named
             # kind, last-wins across space-separated tokens. The union lives
             # inside one comma-separated token (``222..260,279..``), carried as
@@ -518,6 +521,14 @@ def ref_text(ref: Ref) -> str:
     return str(ref.uuid)
 
 
+def parse_sequence_number(value: str) -> int:
+    """Convert a sequence token to an integer or raise ClientError."""
+    try:
+        return int(value)
+    except ValueError as err:
+        raise ClientError(f"invalid sequence number: {err}") from err
+
+
 def starts_with_ref(tokens: Sequence[str]) -> bool:
     """Whether the first token is a seq number or UUID.
 
@@ -529,7 +540,7 @@ def starts_with_ref(tokens: Sequence[str]) -> bool:
 
     """
     return bool(tokens) and (
-        tokens[0].isdigit() or UUID_RE.match(tokens[0]) is not None
+        tokens[0].isdecimal() or UUID_RE.match(tokens[0]) is not None
     )
 
 
@@ -563,13 +574,13 @@ def parse_subject_list(
             if pos + 1 >= len(tokens):
                 return None
             next_token = tokens[pos + 1]
-            if not (next_token.isdigit() or UUID_RE.match(next_token)):
+            if not (next_token.isdecimal() or UUID_RE.match(next_token)):
                 return None
             current_kind = KIND_LOWER[lower]
             pos += 1
             continue
-        if token.isdigit():
-            subjects.append(SeqRef(kind=current_kind, seq=int(token)))
+        if token.isdecimal():
+            subjects.append(SeqRef(kind=current_kind, seq=parse_sequence_number(token)))
             pos += 1
             continue
         if UUID_RE.match(token):
@@ -739,14 +750,17 @@ def consume_ref(
     head = args[pos]
     if UUID_RE.match(head):
         return UuidRef(uuid=uuid.UUID(head), expected_kind=kind_hint), 1
-    if kind_hint is not None and head.isdigit():
-        return SeqRef(kind=kind_hint, seq=int(head)), 1
+    if kind_hint is not None and head.isdecimal():
+        return SeqRef(kind=kind_hint, seq=parse_sequence_number(head)), 1
     if head.lower() in KIND_LOWER:
         if pos + 1 >= len(args):
             raise ClientError(f"incomplete ref: kind {head!r} without seq")
         seq_token = args[pos + 1]
-        if seq_token.isdigit():
-            return SeqRef(kind=parse_kind(head), seq=int(seq_token)), 2
+        if seq_token.isdecimal():
+            return SeqRef(
+                kind=parse_kind(head),
+                seq=parse_sequence_number(seq_token),
+            ), 2
         if UUID_RE.match(seq_token):
             return UuidRef(
                 uuid=uuid.UUID(seq_token),
@@ -1024,15 +1038,15 @@ def _scan_clauses(tokens: Sequence[str]) -> Iterator[_Clause]:
         token_text = tokens[index].lower()
         op_next = token(tokens, index + 1)
         op_next_lower = op_next.lower() if op_next is not None else None
-        if token_text in KIND_LOWER and not _is_mutation_head(
-            token_text,
-            op_next_lower,
+        if (
+            token_text in KIND_LOWER
+            and op_next_lower not in FILTER_OPS
+            and not _is_mutation_head(token_text, op_next_lower)
         ):
             # A token that is both a kind keyword and a list field (only
-            # ``codechange``) is a bare kind ONLY when no mutation operator
-            # follows: ``trax issue belief`` widens, but ``codechange add 7`` is
-            # a field mutation. A bare kind is never followed by to/add/del, so
-            # the next token disambiguates without ambiguity.
+            # ``codechange``) is a bare kind only when no field operator
+            # follows: ``trax issue codechange`` widens, but ``codechange is
+            # UUID`` filters and ``codechange add 7`` mutates the list.
             yield _KindClause(kind=KIND_LOWER[token_text])
             index += 1
         elif ranges := _parse_range(token_text):
@@ -1164,9 +1178,10 @@ def _parse_range(token_text: str) -> tuple[SeqRange, ...]:
 def _parse_interval(part: str) -> SeqRange:
     """Parse one range element -- an interval or a bare seq -- raising if malformed."""
     if ".." not in part:
-        if not part.isdigit():
+        if not part.isdecimal():
             raise ClientError(f"invalid range element {part!r}")
-        return SeqRange(start=int(part), stop=int(part))
+        seq = parse_sequence_number(part)
+        return SeqRange(start=seq, stop=seq)
     try:
         return parse_interval(part)
     except ValueError as err:
@@ -1246,6 +1261,8 @@ def _parse_cost_action(
         # ValueError leaking a Python traceback to the CLI (mirrors the edge
         # valence guard).
         raise ClientError(f"cost {field!r} must be a number, got {value!r}") from None
+    if not math.isfinite(delta):
+        raise ClientError(f"cost {field!r} must be finite, got {value!r}")
     return AddCost(field=field, value=delta), 3
 
 
@@ -1294,7 +1311,7 @@ def _parse_relation_or_edge(
 ) -> tuple[Action, int]:
     """Decide between a relation projection and an edge mutation."""
     value = token(tokens, index + 1)
-    if value is None or value.isdigit():
+    if value is None or value.isdecimal():
         return RelationAction(
             relation=relation,
             index=value or "",

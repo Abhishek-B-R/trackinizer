@@ -23,6 +23,7 @@ import pytest
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
+from trackinizer.server.api.query import parse_filter
 from trackinizer.trax import cli, grammar
 from trackinizer.trax.conftest import FakeClient
 from trackinizer.trax.grammar import (
@@ -37,6 +38,7 @@ from trackinizer.trax.grammar import (
     is_issue_kind,
     validate_writable_fields,
 )
+from trackinizer.trax.parser import parse_list_query
 from trackinizer.types.columns import flat_column_specs
 from trackinizer.types.edges import Edge
 from trackinizer.types.inquiries import KIND_TO_CLASS, Inquiry
@@ -356,6 +358,19 @@ def test_write_fields_cli_matches_server_kind_gate() -> None:
             if applies is None or kind in applies:
                 expected.add(spec.cli_name)
         assert set(WRITE_FIELDS_CLI[kind]) == expected, kind
+
+
+@pytest.mark.parametrize("kind", list(KIND_TO_CLASS))
+def test_advertised_filter_fields_survive_server_validation(
+    kind: Inquiry.InquiryKind,
+) -> None:
+    for field in grammar.FILTER_FIELDS_CLI[kind]:
+        query = parse_list_query(kind, [field, "is", "value"])
+        assert query is not None, (kind, field)
+        assert query.kinds == (kind,), field
+        assert query.filters == (
+            parse_filter({"field": field, "op": "is", "value": "value"}, kind),
+        )
 
 
 def test_validate_writable_fields_rejects_cross_kind_field() -> None:

@@ -45,6 +45,7 @@ from trackinizer.trax.parser import (
     parse_subject_list,
     ref_text,
     required_token,
+    starts_with_ref,
 )
 from trackinizer.wire.filters import Filter
 from trackinizer.wire.refs import SeqRef, UuidRef
@@ -54,6 +55,7 @@ from trackinizer.wire.seq_ranges import SeqRange
 
 if TYPE_CHECKING:
     from trackinizer.types.inquiries import Inquiry
+    from trackinizer.wire.filters import FilterOp
 
 
 def test_consume_ref_uuid() -> None:
@@ -86,6 +88,86 @@ def test_consume_ref_seq_only_with_kind_hint() -> None:
     assert ref.kind == "Issue"
     assert ref.seq == 7
     assert consumed == 1
+
+
+@pytest.mark.parametrize("seq", ["²", "①", "𝟙²"])
+@pytest.mark.parametrize("typed", [False, True])
+def test_consume_ref_rejects_non_decimal_digits(seq: str, *, typed: bool) -> None:
+    tokens = ["issue", seq] if typed else [seq]
+    with pytest.raises(ClientError):
+        consume_ref(tokens, kind_hint="Issue")
+
+
+@pytest.mark.parametrize("digit", ["9", "٩", "９"])
+@pytest.mark.parametrize("typed", [False, True])
+def test_consume_ref_maps_decimal_conversion_limit_to_client_error(
+    digit: str,
+    *,
+    typed: bool,
+) -> None:
+    seq = digit * 4_301
+    tokens = ["issue", seq] if typed else [seq]
+    with pytest.raises(ClientError, match="sequence number"):
+        consume_ref(tokens, kind_hint="Issue")
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_subject_list_maps_decimal_conversion_limit_to_client_error(
+    *,
+    typed: bool,
+) -> None:
+    seq = "9" * 4_301
+    tokens = ["1", "issue", seq] if typed else ["1", seq]
+    with pytest.raises(ClientError, match="sequence number"):
+        parse_subject_list(tokens, default_kind="Issue")
+
+
+def test_overlong_decimal_subject_fails_before_any_request() -> None:
+    client = FakeClient()
+    with pytest.raises(ClientError, match="sequence number"):
+        cli.parse_and_run(
+            ["issue", "1", "9" * 4_301],
+            client_factory=lambda: cast(Client, client),
+        )
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("seq", ["²", "①", "𝟙²"])
+def test_non_decimal_digits_are_not_reference_heads(seq: str) -> None:
+    assert not starts_with_ref([seq])
+
+
+@pytest.mark.parametrize("seq", ["²", "①", "𝟙²"])
+def test_non_decimal_subject_fails_without_requests(seq: str) -> None:
+    client = FakeClient()
+    with pytest.raises(ClientError):
+        cli.parse_and_run(
+            ["issue", seq],
+            client_factory=lambda: cast(Client, client),
+        )
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("seq", ["²", "①", "𝟙²"])
+@pytest.mark.parametrize("typed", [False, True])
+def test_subject_list_rejects_non_decimal_digits(seq: str, *, typed: bool) -> None:
+    tokens = ["issue", seq] if typed else [seq]
+    assert parse_subject_list(tokens, default_kind="Issue") is None
+
+
+@pytest.mark.parametrize("seq", ["7", "٧", "７"])
+def test_decimal_sequence_numbers_agree_across_parser_entry_points(seq: str) -> None:
+    expected = SeqRef(kind="Issue", seq=7)
+    assert starts_with_ref([seq])
+    assert consume_ref([seq], kind_hint="Issue") == (expected, 1)
+    assert consume_ref(["issue", seq]) == (expected, 2)
+    assert parse_subject_list([seq], default_kind="Issue") == [expected]
+    assert parse_subject_list(["issue", seq], default_kind="Issue") == [expected]
+    query = parse_list_query("Issue", [f"{seq},8"])
+    assert query is not None
+    assert query.ranges == {
+        "Issue": (SeqRange(start=7, stop=7), SeqRange(start=8, stop=8)),
+    }
 
 
 def test_list_query_regex_rejection_is_a_client_error() -> None:
@@ -159,6 +241,25 @@ def test_parse_list_query_without_kind_rejects_an_unowned_field() -> None:
     """
     with pytest.raises(ClientError, match="unknown filter field 'nonsense'"):
         parse_list_query(None, ["nonsense", "re", "x"])
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [["1..3"], ["1,3"], ["title", "re", "x", "1..3"]],
+)
+def test_kindless_range_requires_a_preceding_kind(tokens: list[str]) -> None:
+    with pytest.raises(ClientError, match=r"range.*preceding kind"):
+        parse_list_query(None, tokens)
+
+
+def test_kindless_query_binds_ranges_after_explicit_kinds() -> None:
+    query = parse_list_query(None, ["issue", "1..3", "codechange", "5..7"])
+    assert query is not None
+    assert query.kinds == ("Issue", "CodeChange")
+    assert query.ranges == {
+        "Issue": (SeqRange(start=1, stop=3),),
+        "CodeChange": (SeqRange(start=5, stop=7),),
+    }
 
 
 def test_parse_list_query_filter_missing_value_raises() -> None:
@@ -456,6 +557,30 @@ def test_bulk_apply_codechange_field_not_swallowed_as_kind() -> None:
     query = parse_list_query("Issue", ["belief"])
     assert query is not None
     assert query.kinds == ("Issue", "Belief")
+
+
+@pytest.mark.parametrize(
+    "op",
+    ["is", "ne", "re", "nre", "lt", "le", "gt", "ge", "isnull", "notnull"],
+)
+def test_codechange_filter_operator_disambiguates_kind_and_field(op: FilterOp) -> None:
+    value = "550e8400-e29b-41d4-a716-446655440000"
+    tokens = ["CODECHANGE", op.upper()]
+    if op not in ("isnull", "notnull"):
+        tokens.append(value)
+    expected = Filter(
+        field="experiment_codechanges",
+        op=op,
+        value="" if op in ("isnull", "notnull") else value,
+    )
+    query = parse_list_query("Experiment", tokens)
+    assert query is not None
+    assert query.kinds == ("Experiment",)
+    assert query.filters == (expected,)
+    bulk = parse_bulk_apply("Experiment", [*tokens, "owner", "to", "Josh"])
+    assert bulk is not None
+    assert bulk.query == query
+    assert bulk.actions == (SetField(field="owner", value="Josh"),)
 
 
 def test_ref_text_seq_ref_returns_seq() -> None:
@@ -759,6 +884,20 @@ def test_parse_range_bare_seq_in_csv_is_single_row_interval() -> None:
     assert q.ranges["Issue"] == (SeqRange(start=5, stop=5), SeqRange(start=8, stop=8))
 
 
+@pytest.mark.parametrize("seq", ["²", "①", "𝟙²"])
+def test_parse_range_rejects_non_decimal_singletons(seq: str) -> None:
+    with pytest.raises(ClientError, match="invalid range element"):
+        parse_list_query("Issue", [f"{seq},3"])
+
+
+@pytest.mark.parametrize("digit", ["9", "٩", "９"])
+def test_range_singleton_maps_decimal_conversion_limit_to_client_error(
+    digit: str,
+) -> None:
+    with pytest.raises(ClientError, match="sequence number"):
+        parse_list_query("Issue", [f"1,{digit * 4_301}"])
+
+
 def test_parse_range_lone_seq_is_a_ref_not_a_range() -> None:
     """A lone seq token has no ``..`` or comma, so it stays a ref, not a range."""
     assert parse_list_query("Issue", ["227"]) is None
@@ -870,6 +1009,12 @@ def test_bare_seq_after_relation_word_is_a_relation_index_not_edge_create() -> N
     # A typed ref after the same word is an edge create, not a relation index.
     [edge_action] = parse_actions(["narrows", "issue", "2"])
     assert isinstance(edge_action, EdgeAction)
+
+
+@pytest.mark.parametrize("seq", ["²", "①", "𝟙²"])
+def test_relation_index_rejects_non_decimal_digits(seq: str) -> None:
+    with pytest.raises(ClientError):
+        parse_actions(["narrows", seq])
 
 
 def test_relation_only_alias_raises_client_error() -> None:
@@ -1352,6 +1497,46 @@ def test_cost_non_number_is_client_error_not_value_error() -> None:
     ):
         with pytest.raises(ClientError, match="must be a number"):
             parse_actions(toks)
+
+
+@pytest.mark.parametrize("field", ["agent-cost", "resource-cost"])
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e999"])
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        ["issue", "title", "to", "root"],
+        ["issue", "title", "to", "root", "produced", "websearch", "query", "to", "q"],
+        ["issue", "1", "produced", "websearch", "query", "to", "q"],
+    ],
+    ids=["create", "nested-create", "anchored-inline"],
+)
+def test_nonfinite_cost_fails_before_any_request(
+    field: str,
+    value: str,
+    prefix: list[str],
+) -> None:
+    client = FakeClient()
+    with pytest.raises(ClientError, match="finite"):
+        cli.parse_and_run(
+            [*prefix, field, "add", "--", value],
+            client_factory=lambda: cast(Client, client),
+        )
+    assert client.calls == []
+
+
+@pytest.mark.parametrize("field", ["agent-cost", "resource-cost"])
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("-1.25", -1.25), ("0", 0.0), ("2.5", 2.5)],
+)
+def test_finite_signed_cost_is_preserved(
+    field: str,
+    value: str,
+    expected: float,
+) -> None:
+    assert parse_actions([field, "add", value]) == [
+        AddCost(field=field, value=expected),
+    ]
 
 
 def test_confidence_non_number_is_clean_client_error() -> None:

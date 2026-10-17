@@ -45,6 +45,7 @@ __all__ = [
     "MetricReduce",
     "MetricWriteResponse",
     "RankFilter",
+    "coerce_metric_operand",
     "experiment_metric_query_path",
     "experiment_metric_write_path",
 ]
@@ -229,6 +230,36 @@ METRICS_QUERY_API_PATHS: tuple[str, ...] = (
 )
 """Every mask-query route template, for the drift guard (analogue of
 ``METRICS_API_PATHS``)."""
+
+
+def coerce_metric_operand(mask: MetricMaskClause) -> str | int | float:
+    """Coerce a comparison operand within its metric cell field's contract.
+
+    Args:
+      mask: Comparison clause carrying one axis's string operand.
+
+    Returns:
+      operand: Text, integer step, or finite numeric value for the selected axis.
+
+    Raises:
+      ValueError: The operand cannot represent a valid metric field.
+
+    """
+    try:
+        if mask.axis == "key":
+            operand: str | int | float = mask.value
+        elif mask.axis == "step":
+            operand = int(mask.value)
+        else:
+            operand = float(mask.value)
+        MetricPoint.model_validate(
+            {"key": "k", "step": 0, "value": 0.0} | {mask.axis: operand},
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"{mask.axis} operand {mask.value!r} is not a valid metric {mask.axis}",
+        ) from error
+    return operand
 
 
 def experiment_metric_query_path(experiment_id: uuid.UUID) -> str:

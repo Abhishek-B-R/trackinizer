@@ -11,7 +11,7 @@ tools: Bash, Read, Write, Edit, Glob, Grep
 
 Use `trax` as the task and inquiry tracker for Trackinizer-backed work.
 
-Core rule: `trackinizer/trax/docs/{grammar.lark,GRAMMAR.md}` and `trax help` are
+Core rule: `grammar.lark`, `GRAMMAR.md` and `trax help` are
 the source of truth. If this skill disagrees with live help, trust live help.
 The CLI is deterministic left-to-right prefix parsing: existing refs end at
 `seq`/UUID, inline creates consume fields until a non-field token, edge metadata
@@ -330,14 +330,15 @@ substantial row of that kind:
 | `trax-websearch` | WebSearch (query, provider, findings as edges) |
 | `trax-agentsession` | AgentSession (envelope vs events asymmetry) |
 
-The bodies live at `trackinizer/trax/docs/skills/trax/<kind>/SKILL.md`.
+The bodies live at `<kind>/SKILL.md`, relative to this skill. Installed copies
+include `grammar.lark` and `GRAMMAR.md` beside this file.
 
 For live trackinizer DB schema/shape changes (migrations, constraints,
 new Inquiry kinds), read
 `trackinizer/docs/db_schema_migration.md` before
 touching the deployed database.
 
-Inspection: `trax graph --open-only`, `trax search <terms> --kind issue`,
+Inspection: `trax graph --open-only`, `trax issue title re "<terms>"`,
 `trax recent`, `trax cost issue 7 --deep`, `trax issue 7 --changes`.
 
 ## Agent-controlled canvas

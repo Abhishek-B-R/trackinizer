@@ -154,7 +154,10 @@ def server_url(raw: str, source: str) -> str:
 
     """
     url = raw.rstrip("/")
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError as error:
+        raise ClientError(f"{source} has invalid URL") from error
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ClientError(f"{source} has invalid URL {raw!r}")
     user = parsed.username or ""

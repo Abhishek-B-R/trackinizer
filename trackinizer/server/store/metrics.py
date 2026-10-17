@@ -40,6 +40,7 @@ from trackinizer.wire.wire_metrics import MetricPoint
 from trackinizer.wire.wire_metrics_query import (
     METRIC_COMPARE_OPS,
     MetricMaskClause,
+    coerce_metric_operand,
 )
 
 
@@ -612,29 +613,12 @@ async def _require_experiment(
         )
 
 
-# ``key`` stays text; ``step`` becomes ``int`` and ``value`` ``float`` so the bound
-# parameter matches the ``bigint`` / ``float8`` cast. The operand is then held to the
-# ``MetricPoint`` contract of the cell it compares against, so each failure is a caller
-# error (409): a step past ``bigint`` fails the cast as an unmapped ``DataError`` (500);
-# Postgres sorts ``NaN`` above every float, so ``value lt NaN`` matches every cell; and
-# a key the wire refuses would, once written by the single-cell upsert, 500 every read.
 def _coerce_operand(mask: MetricMaskClause) -> str | int | float:
     """Coerce a mask's string operand to its axis's type, within the cell contract."""
     try:
-        if mask.axis == "key":
-            operand: str | int | float = mask.value
-        elif mask.axis == "step":
-            operand = int(mask.value)
-        else:
-            operand = float(mask.value)
-        MetricPoint.model_validate(
-            {"key": "k", "step": 0, "value": 0.0} | {mask.axis: operand},
-        )
-    except ValueError as exc:
-        raise ConflictError(
-            f"{mask.axis} operand {mask.value!r} is not a valid metric {mask.axis}",
-        ) from exc
-    return operand
+        return coerce_metric_operand(mask)
+    except ValueError as error:
+        raise ConflictError(str(error)) from error
 
 
 # ``execute`` returns the command tag (``"UPDATE 3"``, ``"INSERT 0 1"``); the row count

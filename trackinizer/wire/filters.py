@@ -370,13 +370,15 @@ def validate_presence_op(field: str, op: FilterOp) -> str | None:
 # deliberately preferred over a hand-tuned exclusion, which would re-introduce the drift
 # the derivation kills.
 def _kind_specific_aliases() -> dict[str, str]:
-    """Bare field name -> flat storage column, for every kind-specific column."""
+    """Map bare field and singular list names to kind-specific storage columns."""
     out: dict[str, str] = {}
     for cls in KIND_TO_CLASS.values():
         for name, spec in column_specs(cls).items():
             storage = storage_name(name, spec)
             if storage != name:
                 out[name] = storage
+                if spec.list_verb_stem:
+                    out[spec.list_verb_stem] = storage
     return out
 
 

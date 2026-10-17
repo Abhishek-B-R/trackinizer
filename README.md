@@ -33,6 +33,9 @@ message to an agent in the console, answered live.
 
 uv tool install trackinizer
 
+# Optional: install authoring guidance for your agent (claude, codex, or cursor).
+trax doctor --fix --target codex --offline
+
 # Local server at http://127.0.0.1:8765.
 trackinizer
 
@@ -417,6 +420,7 @@ useful on its own:
 
 ```bash
 trax help                          # grammar and subjects
+trax doctor                        # check skills, profile, and server access
 trax issue                         # list issues
 trax env                           # list the org's environment variables
 trax machine                       # list the machines campaigns may run on

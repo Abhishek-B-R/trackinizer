@@ -56,6 +56,7 @@ from trackinizer.trax.parser import (
     parse_export_selector,
     parse_list_query,
     parse_metric_action,
+    parse_sequence_number,
     parse_subject_list,
     starts_with_ref,
 )
@@ -109,12 +110,13 @@ if TYPE_CHECKING:
         MetricMaskClause,
         MetricRankRow,
         MetricReduce,
+        coerce_metric_operand,
     )
 else:
     # The metric wire modules build pydantic models at import (~44ms measured
-    # for the pair). Every name above bar ``MetricMaskClause`` is annotation-only
-    # under ``from __future__ import annotations``, and ``MetricMaskClause`` is
-    # constructed only in ``_mask_clauses``; an eager import would tax every
+    # for the pair). ``MetricMaskClause`` and operand coercion are needed only
+    # for metric masks; the other names above are annotation-only under
+    # ``from __future__ import annotations``. An eager import would tax every
     # ``trax`` cold start -- ``trax issue`` included -- for the metric verbs
     # alone, and would defeat the matching ``lazy_import`` in ``client.client``.
     from wrapt import lazy_import
@@ -122,6 +124,10 @@ else:
     MetricMaskClause = lazy_import(
         "trackinizer.wire.wire_metrics_query",
         "MetricMaskClause",
+    )
+    coerce_metric_operand = lazy_import(
+        "trackinizer.wire.wire_metrics_query",
+        "coerce_metric_operand",
     )
 
 
@@ -373,6 +379,8 @@ class Kind(Command):
 
         """
         action = parse_metric_action(tail)
+        if action.write is not None:
+            _metric_write(action)
         if starts_with_ref(before):
             cls._run_metric_single(before, action, args, client_factory)
         elif not before or parse_list_query("Experiment", before) is not None:
@@ -549,12 +557,7 @@ class Kind(Command):
         bulk_ok: bool,
     ) -> int:
         """Coerce and apply a masked ``to`` write, guarding a bulk blast radius."""
-        if action.write is None:
-            raise ValueError("Expected action.write is not None.")
-        value = _finite_float(action.write)
-        masks = _mask_clauses(action.masks)
-        if not any(m.axis == "step" for m in masks):
-            raise ClientError("a metric write must mask 'step' (no default step)")
+        value, masks = _metric_write(action)
         if not bulk_ok:
             # Discover the blast radius before writing: a mask selecting more
             # than one cell needs explicit --makeitso, so a fat-fingered
@@ -775,14 +778,14 @@ class Kind(Command):
         edge_kind: str,
         token: str,
     ) -> dict[str, object]:
-        if not token.isdigit():
+        if not token.isdecimal():
             raise ClientError(
                 f"relation index must be a positive integer, got {token!r}",
             )
-        seq_matches = [row for row in rows if str(row.get("seq") or "") == token]
+        index = parse_sequence_number(token)
+        seq_matches = [row for row in rows if row.get("seq") == index]
         if len(seq_matches) == 1:
             return seq_matches[0]
-        index = int(token)
         if index < 1 or index > len(rows):
             raise ClientError(
                 f"relation index {index} out of range; {len(rows)} {edge_kind} rows",
@@ -951,10 +954,6 @@ class Kind(Command):
             labels=edge_labels,
             reason=_arg_str(args, "reason"),
         )
-        # The echo shows the spelling the write carries: a negative-valence
-        # citation was typed (and stored) as a dis* action, so echoing the
-        # base kind would confirm the opposite of what was asked.
-        shown = edge_kind
         # The echo shows the spelling the action carries: a dis* write stores
         # (or annotates) the against-polarity, so echoing the base kind would
         # confirm the opposite of what was asked. valence_negate is only True
@@ -3466,6 +3465,27 @@ def _mask_clauses(masks: Sequence[MetricMask]) -> list[MetricMaskClause]:
         )
         for mask in masks
     ]
+
+
+def _metric_write(action: MetricAction) -> tuple[float, list[MetricMaskClause]]:
+    """Validate a metric write before any create or metric request."""
+    if action.write is None:
+        raise ValueError("Expected action.write is not None.")
+    value = _finite_float(action.write)
+    masks = _mask_clauses(action.masks)
+    if not any(mask.axis == "step" for mask in masks):
+        raise ClientError("a metric write must mask 'step' (no default step)")
+    for mask in masks:
+        if mask.op in ("max", "min"):
+            raise ClientError(
+                "reduction max/min is a read-only step selection; "
+                "a write cannot reduce",
+            )
+        try:
+            coerce_metric_operand(mask)
+        except ValueError as error:
+            raise ClientError(str(error)) from error
+    return value, masks
 
 
 # ``float("nan")`` / ``float("inf")`` parse fine but are not valid JSON numbers and

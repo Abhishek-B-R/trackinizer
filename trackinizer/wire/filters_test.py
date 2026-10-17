@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from trackinizer.types.columns import (
     column_specs,
     flat_column_specs,
@@ -69,6 +71,22 @@ def test_agentsession_filter_aliases_resolve_to_storage_columns() -> None:
     assert canonical_filter_field("started") == "agentsession_started"
     assert canonical_filter_field("ended") == "agentsession_ended"
     assert canonical_filter_field("rooms") == "agentsession_rooms"
+
+
+@pytest.mark.parametrize(
+    ("field", "column"),
+    [
+        ("author", "paper_authors"),
+        ("authors", "paper_authors"),
+        ("codechange", "experiment_codechanges"),
+        ("codechanges", "experiment_codechanges"),
+    ],
+)
+def test_list_filter_aliases_resolve_to_storage_columns(
+    field: str,
+    column: str,
+) -> None:
+    assert canonical_filter_field(field) == column
 
 
 def test_non_nullable_columns_match_schema_metadata() -> None:
