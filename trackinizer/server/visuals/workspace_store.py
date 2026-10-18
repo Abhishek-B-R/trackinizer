@@ -1009,6 +1009,7 @@ async def set_station_workstream(
     workstream_id: uuid.UUID,
     inbound: InboundQueue,
     assistant: Assistant | None,
+    conn: Conn | None = None,
 ) -> WorkspaceState | None:
     """Move an owned station after checking its destination workstream.
 
@@ -1020,33 +1021,68 @@ async def set_station_workstream(
       workstream_id: Owned workstream Issue to attach.
       inbound: In-process poller leases.
       assistant: The configured assistant, if any.
+      conn: Existing transaction, or None to own a transaction.
 
     Returns:
       state: The updated station, or None when either id is unavailable.
 
     """
-    if not await check_workstream(engine, email=email, workstream_id=workstream_id):
+    if not await check_workstream(
+        engine,
+        email=email,
+        workstream_id=workstream_id,
+        conn=conn,
+    ):
         return None
-    async with engine.acquire() as conn, tx(conn):
-        row = await conn.fetchrow(
-            vetted_sql(
-                "UPDATE visual_workspaces SET station = ",
-                "(coalesce(station, '{}'::jsonb) - 'suggestion') || ",
-                "jsonb_build_object('workstream_id', $3::text), ",
-                "modified_at = clock_timestamp() WHERE id = $1 AND user_id = $2",
-                _RETURNING_STATION,
-            ),
-            workspace_id,
-            user_id,
-            str(workstream_id),
-        )
-        return await _with_partner(
+    if conn is not None:
+        return await _set_station_workstream_on_conn(
             conn,
-            row=row,
             user_id=user_id,
+            workspace_id=workspace_id,
+            workstream_id=workstream_id,
             inbound=inbound,
             assistant=assistant,
         )
+    async with engine.acquire() as own_conn, tx(own_conn):
+        return await _set_station_workstream_on_conn(
+            own_conn,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            workstream_id=workstream_id,
+            inbound=inbound,
+            assistant=assistant,
+        )
+
+
+async def _set_station_workstream_on_conn(
+    conn: Conn,
+    *,
+    user_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    workstream_id: uuid.UUID,
+    inbound: InboundQueue,
+    assistant: Assistant | None,
+) -> WorkspaceState | None:
+    """Update owned station metadata on the caller's transaction."""
+    row = await conn.fetchrow(
+        vetted_sql(
+            "UPDATE visual_workspaces SET station = ",
+            "(coalesce(station, '{}'::jsonb) - 'suggestion') || ",
+            "jsonb_build_object('workstream_id', $3::text), ",
+            "modified_at = clock_timestamp() WHERE id = $1 AND user_id = $2",
+            _RETURNING_STATION,
+        ),
+        workspace_id,
+        user_id,
+        str(workstream_id),
+    )
+    return await _with_partner(
+        conn,
+        row=row,
+        user_id=user_id,
+        inbound=inbound,
+        assistant=assistant,
+    )
 
 
 async def set_workspace_page(

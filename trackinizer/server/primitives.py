@@ -77,6 +77,8 @@ async def insert_inquiry(
     ``values`` holds every non-identity column by its flat storage name (base
     columns bare -- ``title``, ``account``, ``description``, ``labels``, ... --
     and ``<kind>_<field>`` for kind-specific ones); an absent column stores NULL.
+    ``created`` may supply a historical instant at initial creation; absent or
+    ``None`` leaves the database default in effect. ``modified`` stays server-owned.
     The column list, placeholders, and per-column normalization all derive from
     :data:`COLUMN_SPECS` + ``RUNTIME_HOOKS`` (the same "unset is NULL" contract
     the edit path uses), so a new column needs no edit here -- decorate the
@@ -100,7 +102,7 @@ async def insert_inquiry(
     # would otherwise silently DROP a typo'd key (``paper_soruce`` -> the real
     # column binds NULL) and let a missing required column reach the DB as a raw
     # NOT NULL 500. Reject both at the call site instead, before any SQL runs.
-    if unknown := set(values) - set(derived_columns):
+    if unknown := set(values) - set(derived_columns) - {"created"}:
         raise ValueError(f"insert_inquiry: unknown column(s) {sorted(unknown)}")
     # A kind-specific column is required of that kind's rows alone.
     if missing := [
@@ -111,6 +113,10 @@ async def insert_inquiry(
         and values.get(c) is None
     ]:
         raise ValueError(f"insert_inquiry: missing required column(s) {missing}")
+    insert_values = [_normalize_for_insert(c, values.get(c)) for c in derived_columns]
+    if values.get("created") is not None:
+        derived_columns.append("created")
+        insert_values.append(values["created"])
     # ``id`` ($1), ``kind`` ($2), ``seq`` (nextval), ``status`` (COALESCE'd $3);
     # the derived columns follow as $4.. in bind order.
     derived_placeholders = ", ".join(
@@ -132,7 +138,7 @@ async def insert_inquiry(
         row_id,
         kind,
         status,
-        *(_normalize_for_insert(c, values.get(c)) for c in derived_columns),
+        *insert_values,
     )
 
 
@@ -342,6 +348,12 @@ async def insert_edge(
     validate_edge_priority(edge_kind, priority)
     valence = validate_edge_valence(edge_kind, valence)
     await _reject_edge_cycle(conn, from_id=from_id, to_id=to_id, edge_kind=edge_kind)
+    await validate_edge_creation_order(
+        conn,
+        from_id=from_id,
+        to_id=to_id,
+        edge_kind=edge_kind,
+    )
     inserted_from = await conn.fetchval(
         "INSERT INTO edges "
         "(from_id, from_kind, to_id, to_kind, edge_kind, priority, "
@@ -367,6 +379,54 @@ async def insert_edge(
     return (inserted_from is not None, to_kind)
 
 
+async def validate_edge_creation_order(
+    conn: Conn,
+    *,
+    from_id: UUID,
+    to_id: UUID,
+    edge_kind: Edge.Kind,
+) -> None:
+    """Reject a new lineage edge whose source predates its target.
+
+    Existing relationships may be retried or annotated even when their dates
+    violate the creation-order rule. Equal dates permit bulk imports.
+
+    Args:
+      conn: Database connection for the endpoint check.
+      from_id: Source inquiry id.
+      to_id: Parent or predecessor inquiry id.
+      edge_kind: Relationship whose creation-order policy applies.
+
+    Raises:
+      ConflictError: A new relationship conflicts with the stored creation dates.
+      ValidationError: The edge kind is unknown.
+
+    """
+    _reject_unknown_edge_kind(edge_kind)
+    if not EDGE_POLICIES[edge_kind].enforces_creation_order:
+        return
+    conflicts = await conn.fetch(
+        "SELECT source.created AS source_created, target.created AS target_created "
+        "FROM inquiries source JOIN inquiries target ON target.id = $2 "
+        "WHERE source.id = $1 AND source.created < target.created "
+        "AND NOT EXISTS (SELECT 1 FROM edges "
+        "WHERE from_id = $1 AND to_id = $2 AND edge_kind = $3)",
+        from_id,
+        to_id,
+        edge_kind,
+    )
+    if conflicts:
+        dates = conflicts[0]
+        raise ConflictError(
+            f"{edge_kind} edge {from_id} -> {to_id}: source created "
+            f"{dates['source_created']} cannot predate its parent or predecessor "
+            f"created {dates['target_created']}. Check the edge direction and both rows' created "
+            "timestamps; if a date is incorrect, re-import the incorrectly "
+            "dated row with --backfill. Backfill only applies to new rows; "
+            "existing creation times cannot be changed in place.",
+        )
+
+
 async def infer_produced_endpoints(
     conn: Conn,
     *,
@@ -376,17 +436,17 @@ async def infer_produced_endpoints(
     """Order ``{from_id, to_id}`` as ``(producer, produced, winner)`` or ``None``.
 
     Implements the definition of provenance (see :attr:`Inquiry.produced_by`):
-    the YOUNGER vertex was produced by the OLDER, inferred from the first edge
-    between the pair. The age order is always ``older`` (producer) vs ``younger``
+    the YOUNGER vertex was produced by the OLDER, inferred from an eligible
+    structural edge between the pair. The age order is ``older`` (producer) vs ``younger``
     (produced) by :attr:`Inquiry.created` (a created-time tie breaks by id, so
     the choice is stable per pair); this function decides only *whether* to
     stamp. The caller stamps the ``produced_by`` edge child -> parent
     (from=produced, to=producer).
 
-    Inference is universal: every edge kind stores younger -> older, so a first
-    edge of any kind implies ``younger produced_by older``. The whole pair-edge
-    set is read (not just the triggering edge) so the outcome is independent of
-    insert order within a create-time batch:
+    Only structural kinds in :data:`PRODUCED_INFERENCE_PRECEDENCE` participate;
+    citations are provenance-neutral. The whole pair-edge set is read (not just
+    the triggering edge) so the outcome is independent of insert order within
+    a create-time batch:
 
     * Idempotency: if the pair already carries a ``produced_by`` (it ranks first
       in :data:`PRODUCED_INFERENCE_PRECEDENCE` and is the lone member of

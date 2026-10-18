@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import uuid
@@ -26,6 +27,7 @@ from trackinizer.server.api.canvas_test_support import (
 )
 from trackinizer.server.chat_hub import ChatHub
 from trackinizer.server.inbound import InboundQueue
+from trackinizer.wire.bodies import SubmitIssue
 
 
 if TYPE_CHECKING:
@@ -87,7 +89,7 @@ async def _labels(store: Store, session: uuid.UUID) -> list[str]:
             "SELECT labels FROM inquiries WHERE id = $1",
             session,
         )
-    return sorted(from_plain(labels, list[str]))
+    return sorted(from_plain(labels, list[str], default=[]))
 
 
 async def _stations(store: Store) -> list[str]:
@@ -439,6 +441,204 @@ async def test_moving_a_station_moves_every_session_placed_on_it(
     assert moved.status_code == 200
     assert await _edges(store, first) == [target]
     assert await _edges(store, second) == [target]
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+async def test_rejected_session_move_preserves_its_edge_and_station(
+    pglite_route_client: _Client,
+) -> None:
+    """A newer workstream cannot replace a session's existing provenance."""
+    client, store = pglite_route_client
+    await seed_accounts(store)
+    session = await seed_session(store, USER_AGENT)
+    placed = await _place(client, session)
+    old_edges = await _edges(store, session)
+    old_labels = await _labels(store, session)
+    target = await _workstream(client, "Too new")
+    act_as_user_agent()
+
+    moved = await client.put(
+        f"/api/sessions/{session}/workstream",
+        json={"workstream_id": str(target)},
+    )
+
+    assert moved.status_code == 409, moved.text
+    assert await _edges(store, session) == old_edges
+    assert await _labels(store, session) == old_labels
+    assert (
+        await _station_workstream(store, placed["workspace_id"])
+        == placed["workstream_id"]
+    )
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("selected_station", [False, True])
+async def test_rejected_placement_creates_no_station_edge_or_labels(
+    pglite_route_client: _Client,
+    selected_station: bool,
+) -> None:
+    """Both a supplied station and branch inference reject a newer workstream."""
+    client, store = pglite_route_client
+    await seed_accounts(store)
+    session = await seed_session(store, USER_AGENT, actor="historical")
+    target = await _workstream(client, "Too new")
+    await _earlier_on_branch(store, target)
+    browser()
+    station = await client.post(
+        "/api/workspaces/new",
+        json={"workstream_id": str(target)},
+    )
+    assert station.status_code == 200, station.text
+    station_id = from_plain(json_loads(station.content, dict[str, object])["id"], str)
+    before = await _stations(store)
+    act_as_user_agent()
+
+    refused = await client.post(
+        f"/api/sessions/{session}/place",
+        json={"workspace": station_id} if selected_station else _MAIN,
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert await _stations(store) == before
+    assert await _edges(store, session) == []
+    assert await _labels(store, session) == []
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+async def test_rejected_station_move_preserves_all_sessions_and_station_metadata(
+    pglite_route_client: _Client,
+) -> None:
+    """One incompatible session rejects the entire station move before writes."""
+    client, store = pglite_route_client
+    await seed_accounts(store)
+    first = await seed_session(store, USER_AGENT, actor="historical")
+    placed = await _place(client, first)
+    station = from_plain(placed["workspace_id"], str)
+    target = await _workstream(client, "Between sessions")
+    second = await seed_session(
+        store,
+        USER_AGENT,
+        actor="recent",
+        labels=[f"station:{station}"],
+    )
+    await _place(client, second, {"workspace": station})
+    old_edges = [await _edges(store, session) for session in (first, second)]
+    async with store.engine.acquire() as conn:
+        before = await conn.fetchrow(
+            "SELECT station, modified_at FROM visual_workspaces WHERE id = $1",
+            uuid.UUID(station),
+        )
+    browser()
+
+    moved = await client.put(
+        f"/api/workspaces/{station}/workstream",
+        json={"workstream_id": str(target)},
+    )
+
+    assert moved.status_code == 409, moved.text
+    assert [await _edges(store, session) for session in (first, second)] == old_edges
+    async with store.engine.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT station, modified_at FROM visual_workspaces WHERE id = $1",
+            uuid.UUID(station),
+        )
+    assert after == before
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize("total", [200, 201])
+async def test_station_move_checks_its_oldest_member_beyond_two_hundred_sessions(
+    pglite_route_client: _Client,
+    total: int,
+) -> None:
+    """An incompatible oldest session rejects the whole station without writes."""
+    client, store = pglite_route_client
+    await seed_accounts(store)
+    workstreams = [
+        await store.submit_issue(
+            SubmitIssue(
+                title=f"Workstream {year}",
+                account=USER_AGENT.email,
+                owner=USER_AGENT.email,
+                labels=["workstream"],
+                created=datetime(year, 1, 1, tzinfo=UTC),
+            ),
+            actor=USER_AGENT.email,
+        )
+        for year in (2019, 2021)
+    ]
+    old, target = workstreams
+    browser()
+    made = await client.post(
+        "/api/workspaces/new",
+        json={"workstream_id": str(old)},
+    )
+    assert made.status_code == 200, made.text
+    station = uuid.UUID(
+        from_plain(json_loads(made.content, dict[str, object])["id"], str),
+    )
+    async with store.engine.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO inquiries (id, kind, seq, account, title, created, labels, "
+            "agentsession_audience) SELECT gen_random_uuid(), 'AgentSession', n, "
+            "$2, 'Session', CASE WHEN n = 1 THEN '2020-01-01'::timestamptz "
+            "ELSE '2022-01-01'::timestamptz END, ARRAY[$3::text], 'open' "
+            "FROM generate_series(1, $1::int) AS n",
+            total,
+            USER_AGENT.email,
+            f"station:{station}",
+        )
+        await conn.execute(
+            "INSERT INTO edges (from_id, from_kind, to_id, to_kind, edge_kind) "
+            "SELECT id, kind, $1, 'Issue', 'produced_by' FROM inquiries "
+            "WHERE kind = 'AgentSession'",
+            old,
+        )
+        before_station = await conn.fetchrow(
+            "SELECT station, modified_at FROM visual_workspaces WHERE id = $1",
+            station,
+        )
+        before_sessions = await conn.fetch(
+            "SELECT * FROM inquiries WHERE kind = 'AgentSession' ORDER BY id",
+        )
+        before_edges = await conn.fetch(
+            "SELECT * FROM edges ORDER BY from_id, to_id, edge_kind",
+        )
+        before_changes = await conn.fetch("SELECT * FROM change_log ORDER BY id")
+
+    refused = await client.put(
+        f"/api/workspaces/{station}/workstream",
+        json={"workstream_id": str(target)},
+    )
+
+    assert refused.status_code == 409, refused.text
+    async with store.engine.acquire() as conn:
+        assert (
+            await conn.fetchrow(
+                "SELECT station, modified_at FROM visual_workspaces WHERE id = $1",
+                station,
+            )
+            == before_station
+        )
+        assert (
+            await conn.fetch(
+                "SELECT * FROM inquiries WHERE kind = 'AgentSession' ORDER BY id",
+            )
+            == before_sessions
+        )
+        assert (
+            await conn.fetch(
+                "SELECT * FROM edges ORDER BY from_id, to_id, edge_kind",
+            )
+            == before_edges
+        )
+        assert (
+            await conn.fetch("SELECT * FROM change_log ORDER BY id") == before_changes
+        )
 
 
 @pytest.mark.db_pglite

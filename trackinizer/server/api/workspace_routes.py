@@ -18,6 +18,7 @@ from trackinizer.server.api._deps import (
     get_store,
 )
 from trackinizer.server.api._routes_shared import engine_of, require_browser
+from trackinizer.server.api.locks import require_unlocked_on_conn
 from trackinizer.server.api.session_access import resolve_asker, session_reader
 from trackinizer.server.api.visuals_routes import visual_catalog
 from trackinizer.server.audience import TranscriptPings
@@ -32,7 +33,7 @@ from trackinizer.server.chat_hub import (
 )
 from trackinizer.server.notify import iter_changed_ids
 from trackinizer.server.visuals.science_chats import read_head
-from trackinizer.server.visuals.session_placement import move_station_sessions
+from trackinizer.server.visuals.session_placement import move_station
 from trackinizer.server.visuals.workspace_store import (
     ReplayConflictError,
     RevisionConflictError,
@@ -49,7 +50,6 @@ from trackinizer.server.visuals.workspace_store import (
     rename_workspace,
     set_session_campaign,
     set_station_flags,
-    set_station_workstream,
     set_workspace_layout,
     set_workspace_page,
     settings_refs_for_chat,
@@ -426,25 +426,20 @@ async def set_station_workstream_route(
 
     """
     require_browser(identity)
-    state = await set_station_workstream(
+    state = await move_station(
         engine_of(request),
+        store=get_store(request),
         user_id=identity.user_id,
         email=identity.email,
         workspace_id=workspace_id,
         workstream_id=body.workstream_id,
+        api_key_id=identity.api_key_id,
         inbound=get_inbound(request),
         assistant=get_assistant(request),
+        authorize=partial(require_unlocked_on_conn, identity=identity),
     )
     if state is None:
         raise HTTPException(status_code=404, detail="Workspace or workstream not found")
-    await move_station_sessions(
-        engine_of(request),
-        store=get_store(request),
-        workspace_id=workspace_id,
-        email=identity.email,
-        api_key_id=identity.api_key_id,
-        workstream_id=body.workstream_id,
-    )
     return state
 
 

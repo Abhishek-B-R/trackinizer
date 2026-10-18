@@ -1185,15 +1185,28 @@ class _EditMixin(_CascadeAuditMixin):
         reason: str = "",
         include: bool,
         validate_item: (Callable[[Conn], Awaitable[None]] | None) = None,
+        conn: Conn | None = None,
     ) -> UUID | None:
         """Add to or remove from a list-valued column atomically."""
-        async with (
-            notify_after_commit(),
-            self.engine.acquire() as conn,
-            tx(conn),
-        ):
+        if conn is not None:
             return await self._mutate_list_field_on_conn(
                 conn,
+                target_id,
+                item,
+                column=column,
+                api_key_id=api_key_id,
+                actor=actor,
+                reason=reason,
+                include=include,
+                validate_item=validate_item,
+            )
+        async with (
+            notify_after_commit(),
+            self.engine.acquire() as own_conn,
+            tx(own_conn),
+        ):
+            return await self._mutate_list_field_on_conn(
+                own_conn,
                 target_id,
                 item,
                 column=column,
@@ -1698,6 +1711,7 @@ class _EditMixin(_CascadeAuditMixin):
         api_key_id: UUID | None = None,
         actor: Inquiry.Actor,
         reason: str = "",
+        conn: Conn | None = None,
     ) -> UUID | None:
         """Atomically add one label.
 
@@ -1707,6 +1721,7 @@ class _EditMixin(_CascadeAuditMixin):
           api_key_id: ID of the API key used for this edit, if any.
           actor: Identifier of the user making this edit.
           reason: Optional audit context, stored on the change log entry.
+          conn: Existing transaction; its caller owns commit and notifications.
 
         Returns:
           result: The UUID | None.
@@ -1720,6 +1735,7 @@ class _EditMixin(_CascadeAuditMixin):
             actor=actor,
             reason=reason,
             include=True,
+            conn=conn,
         )
 
     async def remove_label(
@@ -1730,6 +1746,7 @@ class _EditMixin(_CascadeAuditMixin):
         api_key_id: UUID | None = None,
         actor: Inquiry.Actor,
         reason: str = "",
+        conn: Conn | None = None,
     ) -> UUID | None:
         """Atomically remove one label.
 
@@ -1739,6 +1756,7 @@ class _EditMixin(_CascadeAuditMixin):
           api_key_id: ID of the API key used for this edit, if any.
           actor: Identifier of the user making this edit.
           reason: Optional audit context, stored on the change log entry.
+          conn: Existing transaction; its caller owns commit and notifications.
 
         Returns:
           result: The UUID | None.
@@ -1752,6 +1770,7 @@ class _EditMixin(_CascadeAuditMixin):
             actor=actor,
             reason=reason,
             include=False,
+            conn=conn,
         )
 
     async def add_issue_kind(

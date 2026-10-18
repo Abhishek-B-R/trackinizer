@@ -8,6 +8,8 @@ across modules.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import math
 
 from pydantic import ValidationError
@@ -36,6 +38,43 @@ from trackinizer.wire.edge_bodies import CreateEdge, CreateEdgeItem
 
 
 class TestSubmitModels:
+    @pytest.mark.parametrize(
+        "created",
+        ["2020-01-02T03:04:05Z", "2020-01-02T05:04:05+02:00"],
+    )
+    def test_backfill_preserves_an_aware_instant(self, created: str) -> None:
+        body = SubmitIssue.model_validate({"title": "imported", "created": created})
+        assert body.created == datetime(2020, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+    @pytest.mark.parametrize(
+        "created",
+        [
+            "2020-01-02",
+            "2020-01-02T03:04:05",
+            datetime(2020, 1, 2, tzinfo=UTC).replace(tzinfo=None),
+        ],
+    )
+    def test_backfill_requires_an_explicit_timezone(self, created: object) -> None:
+        with pytest.raises(ValidationError, match="timezone"):
+            SubmitIssue.model_validate({"title": "imported", "created": created})
+
+    @pytest.mark.parametrize(
+        "created",
+        [0, 1_577_934_245.0, "1577934245", "1577934245.0", True, [], {}],
+    )
+    def test_backfill_rejects_implicit_utc_coercion(self, created: object) -> None:
+        with pytest.raises(ValidationError):
+            SubmitIssue.model_validate({"title": "imported", "created": created})
+
+    def test_backfill_rejects_future_instants(self) -> None:
+        future = datetime.now(UTC) + timedelta(days=1)
+        with pytest.raises(ValidationError, match="future"):
+            SubmitIssue.model_validate({"title": "imported", "created": future})
+
+    def test_backfill_defaults_to_the_server_clock(self) -> None:
+        assert SubmitIssue(title="new").created is None
+        assert SubmitIssue(title="new", created=None).created is None
+
     def test_pydantic_submit_models_have_defaults(self) -> None:
         assert SubmitArtifact(title="x").labels is None
         assert SubmitIssue(title="x").priority is None
