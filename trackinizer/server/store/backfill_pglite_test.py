@@ -147,7 +147,7 @@ async def test_omitted_and_null_created_use_current_server_defaults(
         assert before <= row.created <= row.modified <= after
         changes = await store.list_changes(subject_id=row_id)
         assert len(changes) == 1
-        assert changes[0].reason == reason
+        assert changes[0].reason == ""
 
 
 @pytest.mark.db_pglite
@@ -180,7 +180,7 @@ async def test_backfill_survives_edits_and_retries_without_rewriting_clocks(
     assert creation_change.reason == (
         f"backfill: created={instant.isoformat()}; original explanation"
         if initial_backfill
-        else "original explanation"
+        else ""
     )
 
     retry = request.model_copy(
@@ -267,6 +267,45 @@ async def test_backfill_dates_drive_provenance_instead_of_import_order(
     assert [edge.id for edge in younger.produced_by] == [older_id]
     assert [edge.id for edge in older.produces] == [younger_id]
     assert older.produced_by == ()
+
+
+@pytest.mark.db_pglite
+@pytest.mark.asyncio(loop_scope="session")
+async def test_backfill_arrives_after_the_live_change_cursor(store: Store) -> None:
+    cursor = await _database_now(store)
+    key = new_uuid()
+    historical = datetime(2020, 1, 2, tzinfo=UTC)
+    row_id = await store.submit_issue(
+        SubmitIssue(
+            account="tester@example.com",
+            title="historical record arriving now",
+            created=historical,
+            subscribers=["observer"],
+            idempotency_key=key,
+        ),
+    )
+
+    personal = await store.what_changed_for_me("observer", cursor)
+    broadcast = await store.what_changed_for_anyone(cursor)
+    recent = await store.list_changes(since=cursor)
+
+    assert [change.id for change in personal] == [key]
+    assert [(change.id, seq) for change, seq in broadcast] == [(key, 1)]
+    assert [change.id for change in recent] == [key]
+    assert personal[0].subject_id == row_id
+    assert personal[0].created >= cursor
+    assert (
+        await store.what_changed_for_me(
+            "observer",
+            personal[0].created,
+            after_id=key,
+        )
+        == []
+    )
+    row = await store.get_inquiry(row_id)
+    assert row is not None
+    assert row.created == historical
+    assert row.modified >= cursor
 
 
 if __name__ == "__main__":

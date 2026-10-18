@@ -134,11 +134,9 @@ The server sets each new row's `modified` and the creation event's
 existing row preserves its timestamps. Without the flag, normal creation
 uses the current server time.
 
-New `produced_by`, `narrows`, and `supersedes` links require the source to
-have the same or a later creation date than the target. A conflict rejects
-the link and explains how to check the dates and re-import an incorrectly
-dated row. Existing creation dates cannot be edited in place. Citations and
-`requires` are exempt from this creation-order rule.
+Historical session records keep their original CLI session IDs. Reserved
+science-chat identities (`chat:` IDs) keep server-owned creation timestamps
+because their order establishes chat ownership; they cannot be backfilled.
 
 ## 4. Tails on an existing row
 
@@ -795,8 +793,7 @@ trax issue --backfill 2025-02-14T08:30:00Z title to "Historical timeout"
 ```
 
 Create a historical artifact under an existing issue. Only the new artifact
-gets the supplied creation date; Issue#7 keeps its date and must have been
-created on or before that historical date:
+gets the supplied creation date; Issue#7 keeps its date:
 
 ```trax
 trax issue --backfill 2025-02-14T09:30:00+01:00 7 produced artifact title to "Historical result"

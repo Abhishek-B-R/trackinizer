@@ -2582,7 +2582,20 @@ async def test_moving_a_station_to_an_unknown_workstream_is_not_found(
         store=store,
     )
 
-    monkeypatch.setattr(workspace_routes, "move_station", AsyncMock(return_value=None))
+    async def missing(
+        engine: DatabaseEngine,
+        *,
+        user_id: uuid.UUID,
+        email: str,
+        workspace_id: uuid.UUID,
+        workstream_id: uuid.UUID,
+        inbound: InboundQueue,
+        assistant: Assistant | None,
+    ) -> WorkspaceState | None:
+        del engine, user_id, email, workspace_id, workstream_id, inbound, assistant
+        return None
+
+    monkeypatch.setattr(workspace_routes, "set_station_workstream", missing)
     with pytest.raises(HTTPException) as error:
         await workspace_routes.set_station_workstream_route(
             workspace_id=uuid.uuid4(),

@@ -30,14 +30,11 @@ from trackinizer.wire.json_types import MutableJSON
 if TYPE_CHECKING:
     from collections.abc import Collection, Sequence
 
-    from trackinizer.lib.postgres import Conn
-
 
 __all__ = [
     "LockBody",
     "referenced_ids",
     "require_unlocked",
-    "require_unlocked_on_conn",
     "set_lock_route",
 ]
 
@@ -72,46 +69,18 @@ async def require_unlocked(
         is locked and the caller is not an admin.
 
     """
-    if identity.role == "admin" or not row_ids:
+    ids = list(row_ids)
+    if identity.role == "admin" or not ids:
         return
     async with get_store(request).engine.acquire() as conn:
-        await require_unlocked_on_conn(
-            conn,
-            row_ids,
-            identity=identity,
-            include_peers=include_peers,
+        rows = await conn.fetch(
+            "SELECT kind, seq FROM inquiries WHERE locked AND (id = ANY($1) OR ($2 "
+            "AND id IN (SELECT to_id FROM edges WHERE from_id = ANY($1) "
+            "UNION SELECT from_id FROM edges WHERE to_id = ANY($1)))) "
+            "ORDER BY created, id LIMIT 1",
+            ids,
+            include_peers,
         )
-
-
-async def require_unlocked_on_conn(
-    conn: Conn,
-    row_ids: Collection[uuid.UUID],
-    *,
-    identity: AuthIdentity,
-    include_peers: bool = False,
-) -> None:
-    """Apply the locked-inquiry write rule inside the caller's transaction.
-
-    Args:
-      conn: The caller's database connection.
-      row_ids: Every inquiry endpoint the operation writes.
-      identity: Authenticated caller; admins may change locked inquiries.
-      include_peers: Also check endpoints of edges deleted with a named row.
-
-    Raises:
-      HTTPException: 403 when a non-admin would change a locked inquiry.
-
-    """
-    if identity.role == "admin" or not row_ids:
-        return
-    rows = await conn.fetch(
-        "SELECT kind, seq FROM inquiries WHERE locked AND (id = ANY($1) OR ($2 "
-        "AND id IN (SELECT to_id FROM edges WHERE from_id = ANY($1) "
-        "UNION SELECT from_id FROM edges WHERE to_id = ANY($1)))) "
-        "ORDER BY created, id LIMIT 1",
-        list(row_ids),
-        include_peers,
-    )
     row = next(iter(rows), None)
     if row is not None:
         raise HTTPException(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from functools import partial
 from typing import TYPE_CHECKING, Annotated
 
 import uuid
@@ -11,7 +10,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from trackinizer.server.api._deps import get_hub, get_store
 from trackinizer.server.api._routes_shared import engine_of
-from trackinizer.server.api.locks import require_unlocked_on_conn
 from trackinizer.server.api.session_access import require_session
 from trackinizer.server.api.visuals_routes import visual_catalog
 from trackinizer.server.auth import AuthIdentity, require_role
@@ -70,7 +68,6 @@ async def place_session_route(
         api_key_id=identity.api_key_id,
         body=body,
         catalog=visual_catalog(request).catalog(),
-        authorize=partial(require_unlocked_on_conn, identity=identity),
     )
     get_hub(request).nudge()
     return placement
@@ -103,7 +100,6 @@ async def move_session_route(
         email=identity.email,
         api_key_id=identity.api_key_id,
         workstream_id=body.workstream_id,
-        authorize=partial(require_unlocked_on_conn, identity=identity),
     ):
         raise HTTPException(status_code=404, detail="Workstream not found")
     get_hub(request).nudge()

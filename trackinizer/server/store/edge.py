@@ -881,150 +881,105 @@ class _EdgeMixin(_CascadeAuditMixin):
         reason: str = "",
         api_key_id: UUID | None = None,
         actor: Inquiry.Actor,
-        conn: Conn | None = None,
     ) -> UUID | None:
-        """Remove an edge and its audited effects in an owned or supplied transaction.
-
-        Args:
-          from_id: UUID of the edge origin.
-          to_id: UUID of the edge target.
-          edge_kind: Relationship to remove.
-          reason: Justification recorded on the audit events.
-          api_key_id: Calling key, if any.
-          actor: Identity recorded on the audit events.
-          conn: Existing transaction; its caller owns commit and notification fanout.
-
-        Returns:
-          change_id: The removal event, or None if the edge is absent.
-
-        """
-        if conn is not None:
-            return await self._remove_edge_on_conn(
-                conn,
-                from_id=from_id,
-                to_id=to_id,
-                edge_kind=edge_kind,
-                reason=reason,
-                api_key_id=api_key_id,
-                actor=actor,
-            )
         async with (
             notify_after_commit(),
-            self.engine.acquire() as own_conn,
-            tx(own_conn),
+            self.engine.acquire() as conn,
+            tx(conn),
         ):
-            return await self._remove_edge_on_conn(
-                own_conn,
-                from_id=from_id,
-                to_id=to_id,
-                edge_kind=edge_kind,
-                reason=reason,
+            # FOR UPDATE blocks a concurrent annotate/remove from seeing
+            # stale state between this SELECT and the DELETE.
+            row = await conn.fetchrow(
+                "SELECT from_kind, to_kind, priority, note, valence, labels "
+                "FROM edges WHERE from_id = $1 AND to_id = $2 "
+                "AND edge_kind = $3 FOR UPDATE",
+                from_id,
+                to_id,
+                edge_kind,
+            )
+            if row is None:
+                return None
+            from_kind = cast(Inquiry.InquiryKind, row["from_kind"])
+            to_kind = cast(Inquiry.InquiryKind, row["to_kind"])
+            priority = cast(Issue.Priority | None, row["priority"])
+            note = row["note"]
+            valence = row["valence"]
+            if note is not None and not isinstance(note, str):
+                raise ValueError("Expected note is None or isinstance(note, str).")
+            if valence is not None and not isinstance(valence, float):
+                raise ValueError(
+                    "Expected valence is None or isinstance(valence, float).",
+                )
+            labels = row["labels"]
+            edge_labels = (
+                None if labels is None else tuple(from_plain(labels, list[str]))
+            )
+            # Capture every edge touching ``from_id`` before the DELETE.
+            # The cascade re-walks ``edges`` live, so deleting first would
+            # drop the removed edge: ``_parent_edges`` would miss it and the
+            # dependent endpoint (notably the broader Issue on a
+            # ``narrows`` removal) never gets its ``dependency_changed``
+            # alert. Mirrors ``purge()``.
+            captured_edges = await conn.fetch(
+                "SELECT from_id, from_kind, to_id, to_kind, edge_kind, "
+                "priority, note, valence, labels FROM edges "
+                "WHERE from_id = $1 OR to_id = $1",
+                from_id,
+            )
+            await conn.execute(
+                "DELETE FROM edges WHERE from_id = $1 AND to_id = $2 "
+                "AND edge_kind = $3",
+                from_id,
+                to_id,
+                edge_kind,
+            )
+            cause, _ = await self.emit_change(
+                conn,
                 api_key_id=api_key_id,
                 actor=actor,
+                subject_id=from_id,
+                subject_kind=from_kind,
+                kind="edge_removed",
+                reason=reason,
+                old=Snapshot(
+                    peer_id=to_id,
+                    peer_kind=to_kind,
+                    peer_edge_kind=edge_kind,
+                    edge_priority=priority,
+                    edge_note=note,
+                    edge_valence=valence,
+                    edge_labels=edge_labels,
+                ),
+                cascade=False,
             )
-
-    async def _remove_edge_on_conn(
-        self,
-        conn: Conn,
-        *,
-        from_id: UUID,
-        to_id: UUID,
-        edge_kind: Edge.Kind,
-        reason: str,
-        api_key_id: UUID | None,
-        actor: Inquiry.Actor,
-    ) -> UUID | None:
-        """Remove one edge and its audited effects on an existing transaction."""
-        # FOR UPDATE blocks a concurrent annotate/remove from seeing
-        # stale state between this SELECT and the DELETE.
-        row = await conn.fetchrow(
-            "SELECT from_kind, to_kind, priority, note, valence, labels "
-            "FROM edges WHERE from_id = $1 AND to_id = $2 "
-            "AND edge_kind = $3 FOR UPDATE",
-            from_id,
-            to_id,
-            edge_kind,
-        )
-        if row is None:
-            return None
-        from_kind = cast(Inquiry.InquiryKind, row["from_kind"])
-        to_kind = cast(Inquiry.InquiryKind, row["to_kind"])
-        priority = cast(Issue.Priority | None, row["priority"])
-        note = row["note"]
-        valence = row["valence"]
-        if note is not None and not isinstance(note, str):
-            raise ValueError("Expected note is None or isinstance(note, str).")
-        if valence is not None and not isinstance(valence, float):
-            raise ValueError(
-                "Expected valence is None or isinstance(valence, float).",
+            # Drive the cascade ourselves with the pre-DELETE edge list
+            # so the deleted edge's dependent endpoint still gets the
+            # alert.
+            await self._cascade_dependency_changed(
+                conn,
+                child_id=from_id,
+                child_kind=from_kind,
+                caused_by=cause,
+                edge_rows=captured_edges,
             )
-        labels = row["labels"]
-        edge_labels = None if labels is None else tuple(from_plain(labels, list[str]))
-        # Capture every edge touching ``from_id`` before the DELETE.
-        # The cascade re-walks ``edges`` live, so deleting first would
-        # drop the removed edge: ``_parent_edges`` would miss it and the
-        # dependent endpoint (notably the broader Issue on a
-        # ``narrows`` removal) never gets its ``dependency_changed``
-        # alert. Mirrors ``purge()``.
-        captured_edges = await conn.fetch(
-            "SELECT from_id, from_kind, to_id, to_kind, edge_kind, "
-            "priority, note, valence, labels FROM edges "
-            "WHERE from_id = $1 OR to_id = $1",
-            from_id,
-        )
-        await conn.execute(
-            "DELETE FROM edges WHERE from_id = $1 AND to_id = $2 AND edge_kind = $3",
-            from_id,
-            to_id,
-            edge_kind,
-        )
-        cause, _ = await self.emit_change(
-            conn,
-            api_key_id=api_key_id,
-            actor=actor,
-            subject_id=from_id,
-            subject_kind=from_kind,
-            kind="edge_removed",
-            reason=reason,
-            old=Snapshot(
-                peer_id=to_id,
-                peer_kind=to_kind,
-                peer_edge_kind=edge_kind,
-                edge_priority=priority,
-                edge_note=note,
-                edge_valence=valence,
-                edge_labels=edge_labels,
-            ),
-            cascade=False,
-        )
-        # Drive the cascade ourselves with the pre-DELETE edge list
-        # so the deleted edge's dependent endpoint still gets the
-        # alert.
-        await self._cascade_dependency_changed(
-            conn,
-            child_id=from_id,
-            child_kind=from_kind,
-            caused_by=cause,
-            edge_rows=captured_edges,
-        )
-        await self.emit_change(
-            conn,
-            api_key_id=api_key_id,
-            actor=actor,
-            subject_id=to_id,
-            subject_kind=to_kind,
-            kind="edge_removed",
-            caused_by=cause,
-            cascade=False,
-            reason=reason,
-            old=Snapshot(
-                peer_id=from_id,
-                peer_kind=from_kind,
-                peer_edge_kind=edge_kind,
-                edge_priority=priority,
-                edge_note=note,
-                edge_valence=valence,
-                edge_labels=edge_labels,
-            ),
-        )
-        return cause
+            await self.emit_change(
+                conn,
+                api_key_id=api_key_id,
+                actor=actor,
+                subject_id=to_id,
+                subject_kind=to_kind,
+                kind="edge_removed",
+                caused_by=cause,
+                cascade=False,
+                reason=reason,
+                old=Snapshot(
+                    peer_id=from_id,
+                    peer_kind=from_kind,
+                    peer_edge_kind=edge_kind,
+                    edge_priority=priority,
+                    edge_note=note,
+                    edge_valence=valence,
+                    edge_labels=edge_labels,
+                ),
+            )
+            return cause

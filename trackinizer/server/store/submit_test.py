@@ -50,7 +50,7 @@ class TestSubmit:
         "reason",
         ["", "  uploaded history\noriginal explanation  ", " "],
     )
-    async def test_creation_audit_preserves_reason_and_marks_backfills(
+    async def test_creation_audit_marks_only_backfills(
         self,
         created: str | None,
         reason: str,
@@ -74,7 +74,7 @@ class TestSubmit:
         ]
         assert len(changes) == 1
         columns = str(changes[0].args[0]).split("(", 1)[1].split(")", 1)[0].split(", ")
-        expected = reason
+        expected = ""
         if created is not None:
             expected = (
                 f"backfill: created={datetime.fromisoformat(created).isoformat()}"

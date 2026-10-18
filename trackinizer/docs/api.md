@@ -1532,7 +1532,6 @@ request commits many items.
   "value": <field_value>,
   "actor": "<actor>",
   "reason": "<text>",
-  "mode": "cas",
   "expected": <expected_value>
 }
 ```
@@ -1543,11 +1542,11 @@ reason  optional; default is empty string
 ```
 
 ```
-mode defaults to "set": blind overwrite, with expected absent.
-mode "cas" requires expected and is valid for PUT owner, status, judgement, and app.
+expected only valid for PUT owner, status, judgement, and app.
 expected for app is the whole object read before; null when unset.
+expected omitted means blind overwrite.
 expected mismatch returns 409.
-mode "cas" on any other field returns 400.
+expected on any other field returns 400.
 ```
 
 ### 3.4 Field add/sub body
@@ -1617,9 +1616,20 @@ the row. For a backfill, the same creation event records
 caller's reason when supplied. This annotation survives later edits and same-key
 retries; it is readable audit text, not a structured import identifier. Without
 an override, both row timestamps use the current server time and the creation
-event keeps the caller's reason unchanged.
+event keeps its existing empty reason.
 Later edits leave `created` unchanged and advance `modified`. A retry or
 deduplication that returns an existing row preserves its timestamps.
+
+Science-chat sessions, whose `cli_session_id` starts with `chat:`, cannot
+override `created`: their server-owned creation order establishes chat
+ownership. Ordinary historical AgentSession records remain importable under
+their original CLI session IDs. A session cannot adopt or change a reserved
+chat ID when it ends; an unchanged chat ID can still be supplied.
+
+Historical dates participate in existing chronological sorting and provenance
+inference. Branch placement of a historical session considers sessions no later
+than its creation time. Audit and notification cursors use the creation event's
+server timestamp, so an imported record remains visible as a new change.
 
 ### 3.7 Inquiry batch create body
 
@@ -1660,16 +1670,6 @@ A same-kind retry returns the original row without replacing its content or date
   "reason": "<text>"
 }
 ```
-
-New `produced_by`, `narrows`, and `supersedes` edges require the source's
-`created` to be on or after the target's `created`. Equal timestamps are valid.
-A reversed order answers 409 before the edge or its audit events are written.
-The error identifies both rows and dates: check the edge direction and correct
-incorrect historical dates by re-importing with `created` or `--backfill`.
-Existing creation dates are immutable; re-import creates a replacement row
-and does not transfer its links. Existing-edge annotation and removal remain
-available. `requires` uses completion order; citation edges (`proves`,
-`favors`, `cites_paper`) have no creation-order restriction.
 
 ### 3.9 Edge batch create body
 

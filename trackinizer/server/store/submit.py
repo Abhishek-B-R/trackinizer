@@ -444,7 +444,7 @@ class _SubmitMixin(_EditMixin, _EdgeMixin):
             )
             for model, vec in embeddings:
                 await upsert_embedding(conn, row_id, model, vec)
-            reason = req.reason
+            reason = ""
             if req.created is not None:
                 reason = f"backfill: created={req.created.isoformat()}"
                 if req.reason:

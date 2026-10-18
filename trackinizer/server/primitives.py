@@ -348,12 +348,6 @@ async def insert_edge(
     validate_edge_priority(edge_kind, priority)
     valence = validate_edge_valence(edge_kind, valence)
     await _reject_edge_cycle(conn, from_id=from_id, to_id=to_id, edge_kind=edge_kind)
-    await validate_edge_creation_order(
-        conn,
-        from_id=from_id,
-        to_id=to_id,
-        edge_kind=edge_kind,
-    )
     inserted_from = await conn.fetchval(
         "INSERT INTO edges "
         "(from_id, from_kind, to_id, to_kind, edge_kind, priority, "
@@ -379,54 +373,6 @@ async def insert_edge(
     return (inserted_from is not None, to_kind)
 
 
-async def validate_edge_creation_order(
-    conn: Conn,
-    *,
-    from_id: UUID,
-    to_id: UUID,
-    edge_kind: Edge.Kind,
-) -> None:
-    """Reject a new lineage edge whose source predates its target.
-
-    Existing relationships may be retried or annotated even when their dates
-    violate the creation-order rule. Equal dates permit bulk imports.
-
-    Args:
-      conn: Database connection for the endpoint check.
-      from_id: Source inquiry id.
-      to_id: Parent or predecessor inquiry id.
-      edge_kind: Relationship whose creation-order policy applies.
-
-    Raises:
-      ConflictError: A new relationship conflicts with the stored creation dates.
-      ValidationError: The edge kind is unknown.
-
-    """
-    _reject_unknown_edge_kind(edge_kind)
-    if not EDGE_POLICIES[edge_kind].enforces_creation_order:
-        return
-    conflicts = await conn.fetch(
-        "SELECT source.created AS source_created, target.created AS target_created "
-        "FROM inquiries source JOIN inquiries target ON target.id = $2 "
-        "WHERE source.id = $1 AND source.created < target.created "
-        "AND NOT EXISTS (SELECT 1 FROM edges "
-        "WHERE from_id = $1 AND to_id = $2 AND edge_kind = $3)",
-        from_id,
-        to_id,
-        edge_kind,
-    )
-    if conflicts:
-        dates = conflicts[0]
-        raise ConflictError(
-            f"{edge_kind} edge {from_id} -> {to_id}: source created "
-            f"{dates['source_created']} cannot predate its parent or predecessor "
-            f"created {dates['target_created']}. Check the edge direction and both rows' created "
-            "timestamps; if a date is incorrect, re-import the incorrectly "
-            "dated row with --backfill. Backfill only applies to new rows; "
-            "existing creation times cannot be changed in place.",
-        )
-
-
 async def infer_produced_endpoints(
     conn: Conn,
     *,
@@ -436,17 +382,17 @@ async def infer_produced_endpoints(
     """Order ``{from_id, to_id}`` as ``(producer, produced, winner)`` or ``None``.
 
     Implements the definition of provenance (see :attr:`Inquiry.produced_by`):
-    the YOUNGER vertex was produced by the OLDER, inferred from an eligible
-    structural edge between the pair. The age order is ``older`` (producer) vs ``younger``
+    the YOUNGER vertex was produced by the OLDER, inferred from the first edge
+    between the pair. The age order is always ``older`` (producer) vs ``younger``
     (produced) by :attr:`Inquiry.created` (a created-time tie breaks by id, so
     the choice is stable per pair); this function decides only *whether* to
     stamp. The caller stamps the ``produced_by`` edge child -> parent
     (from=produced, to=producer).
 
-    Only structural kinds in :data:`PRODUCED_INFERENCE_PRECEDENCE` participate;
-    citations are provenance-neutral. The whole pair-edge set is read (not just
-    the triggering edge) so the outcome is independent of insert order within
-    a create-time batch:
+    Inference is universal: every edge kind stores younger -> older, so a first
+    edge of any kind implies ``younger produced_by older``. The whole pair-edge
+    set is read (not just the triggering edge) so the outcome is independent of
+    insert order within a create-time batch:
 
     * Idempotency: if the pair already carries a ``produced_by`` (it ranks first
       in :data:`PRODUCED_INFERENCE_PRECEDENCE` and is the lone member of

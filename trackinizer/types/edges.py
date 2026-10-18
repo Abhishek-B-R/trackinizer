@@ -53,10 +53,10 @@ class Edge:
 
     Invariants:
 
-    * New ``narrows``, ``produced_by``, and ``supersedes`` edges require the
-      child's creation time to be at least the parent's; equal times permit
-      bulk imports. ``requires`` orders completion-time (do-time): ``A requires
-      B`` means B must be done first. Citations do not constrain creation times.
+    * "Parents" are always "older" than "children", on each edge's own clock:
+      creation-time for every edge except ``requires``, which is completion-time
+      (do-time). ``A requires B`` means B must be done first, so B is do-time
+      older.
     * Any Inquiry can be ``produced_by`` one or more older Inquiries (its
       origins); the parent's inverse view is ``produces``. Provenance is the one
       relation with no natural child-as-subject active verb in English, so it
@@ -389,15 +389,6 @@ class EdgeKindPolicy:
     data to store, not an error. The self-loop bar (``from_id <> to_id``, also a
     schema CHECK) is unconditional and independent of this flag."""
 
-    enforces_creation_order: bool = False
-    """Reject a new edge when its source was created before its target.
-
-    Lineage and supersession require an origin or predecessor no newer than
-    its child; equal timestamps permit imports with a shared creation time.
-    ``requires`` orders completion, while citations do not imply creation order.
-    Existing edges remain available for annotation and idempotent retries.
-    """
-
 
 EDGE_POLICIES: Mapping[Edge.Kind, EdgeKindPolicy] = MappingProxyType(
     {
@@ -411,7 +402,6 @@ EDGE_POLICIES: Mapping[Edge.Kind, EdgeKindPolicy] = MappingProxyType(
             from_kinds="issue",
             to_kinds="issue",
             cascade_dependent="to",
-            enforces_creation_order=True,
         ),
         "requires": EdgeKindPolicy(
             description=(
@@ -437,7 +427,6 @@ EDGE_POLICIES: Mapping[Edge.Kind, EdgeKindPolicy] = MappingProxyType(
             inverse_label="produces",
             from_kinds="inquiry",
             to_kinds="inquiry",
-            enforces_creation_order=True,
         ),
         "proves": EdgeKindPolicy(
             description=(
@@ -479,7 +468,6 @@ EDGE_POLICIES: Mapping[Edge.Kind, EdgeKindPolicy] = MappingProxyType(
             to_kinds="inquiry",
             skips_scheduler_on="to",
             invalidates_currency_on="to",
-            enforces_creation_order=True,
         ),
         "cites_paper": EdgeKindPolicy(
             description=(

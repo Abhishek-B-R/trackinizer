@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import asyncio
@@ -30,7 +29,7 @@ from trackinizer.server.visuals.workstreams import (
     update_workstream,
     workstream_info,
 )
-from trackinizer.wire.bodies import SubmitAgentSession, SubmitIssue
+from trackinizer.wire.bodies import SubmitIssue
 
 
 if TYPE_CHECKING:
@@ -99,86 +98,6 @@ async def test_two_first_calls_create_one_scratch_issue(
             _EMAIL,
         )
     assert count == 1
-
-
-@pytest.mark.db_pglite
-@pytest.mark.asyncio(loop_scope="session")
-async def test_first_scratch_starts_at_the_accounts_earliest_session(
-    context: tuple[PGliteEngine, Store],
-) -> None:
-    engine, store = context
-    for account, created in (
-        ("other@example.com", datetime(2000, 1, 1, tzinfo=UTC)),
-        (_EMAIL, datetime(2020, 1, 2, tzinfo=UTC)),
-        (_EMAIL, datetime(2020, 1, 1, tzinfo=UTC)),
-    ):
-        if account != _EMAIL:
-            async with engine.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO users (id, email, name, role, status) "
-                    "VALUES ($1, $2, 'Other', 'writer', 'active')",
-                    uuid.uuid4(),
-                    account,
-                )
-        _ = await store.submit_agentsession(
-            SubmitAgentSession(
-                title="Imported session",
-                account=account,
-                created=created,
-            ),
-            audience="open",
-            actor=account,
-        )
-
-    scratch = await open_scratch(engine, store=store, user_id=_USER, email=_EMAIL)
-
-    issue = await store.get_inquiry(scratch)
-    assert issue is not None
-    assert issue.created == datetime(2020, 1, 1, tzinfo=UTC)
-
-
-@pytest.mark.db_pglite
-@pytest.mark.asyncio(loop_scope="session")
-async def test_scratch_without_sessions_keeps_the_server_creation_clock(
-    context: tuple[PGliteEngine, Store],
-) -> None:
-    engine, store = context
-    async with engine.acquire() as conn:
-        before = await conn.fetchval("SELECT clock_timestamp()")
-    assert isinstance(before, datetime)
-
-    scratch = await open_scratch(engine, store=store, user_id=_USER, email=_EMAIL)
-
-    async with engine.acquire() as conn:
-        after = await conn.fetchval("SELECT clock_timestamp()")
-    assert isinstance(after, datetime)
-    issue = await store.get_inquiry(scratch)
-    assert issue is not None
-    assert before <= issue.created <= after
-
-
-@pytest.mark.db_pglite
-@pytest.mark.asyncio(loop_scope="session")
-async def test_existing_scratch_is_not_backdated_for_a_later_import(
-    context: tuple[PGliteEngine, Store],
-) -> None:
-    engine, store = context
-    scratch = await open_scratch(engine, store=store, user_id=_USER, email=_EMAIL)
-    before = await store.get_inquiry(scratch)
-    _ = await store.submit_agentsession(
-        SubmitAgentSession(
-            title="Imported later",
-            account=_EMAIL,
-            created=datetime(2020, 1, 1, tzinfo=UTC),
-        ),
-        audience="open",
-        actor=_EMAIL,
-    )
-
-    assert (
-        await open_scratch(engine, store=store, user_id=_USER, email=_EMAIL) == scratch
-    )
-    assert await store.get_inquiry(scratch) == before
 
 
 @pytest.mark.db_pglite

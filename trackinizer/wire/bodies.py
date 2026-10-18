@@ -41,6 +41,7 @@ from trackinizer.types.inquiries import (
     is_valid_source,
 )
 from trackinizer.wire.json_types import UtcDatetime
+from trackinizer.wire.wire_science_chat import CHAT_SESSION_PREFIX
 
 
 if TYPE_CHECKING:
@@ -120,6 +121,10 @@ class SubmitBase(_CostFields):
     @field_validator("created", mode="after")
     @classmethod
     def _validate_created(cls, value: datetime | None) -> datetime | None:
+        # asyncpg maps the UTC minimum to -infinity, whose naive decode breaks
+        # comparisons with ordinary inquiry timestamps.
+        if value is not None and value <= datetime.min.replace(tzinfo=UTC):
+            raise ValueError("created must be after 0001-01-01T00:00:00Z")
         if value is not None and value > datetime.now(UTC):
             raise ValueError("created must not be in the future")
         return value
@@ -161,8 +166,8 @@ class SubmitBase(_CostFields):
     server default from the authenticated principal's email."""
 
     reason: str = ""
-    """Optional audit context for the ``created`` change. A backfill prepends
-    its historical creation timestamp while preserving this explanation."""
+    """Optional context for the backfill creation audit. The historical
+    creation timestamp is prepended while preserving this explanation."""
 
     # ``submit_batch`` does ``item.actor or actor``, so a whitespace-only ``actor``
     # would silently fall through to the batch actor -- the same malformed-input hazard
@@ -429,6 +434,15 @@ class SubmitAgentSession(SubmitBase):
     @classmethod
     def _validate_rooms(cls, value: list[str] | None) -> list[str] | None:
         return None if value is None else _validate_room_names(value)
+
+    @model_validator(mode="after")
+    def _protect_chat_creation_time(self) -> Self:
+        """Keep the timestamp that determines a chat's starter server-owned."""
+        if self.created is not None and (self.cli_session_id or "").startswith(
+            CHAT_SESSION_PREFIX,
+        ):
+            raise ValueError("created cannot be backfilled for science chat sessions")
+        return self
 
 
 # A room name must be a single clean token: non-blank (it is matched verbatim against

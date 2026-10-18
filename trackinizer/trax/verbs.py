@@ -3607,8 +3607,8 @@ def _creation_items(
     context: dict[str, object] = {}
     if created := _arg_str(args, "backfill"):
         context["created"] = created
-    if reason := _arg_str(args, "reason"):
-        context["reason"] = reason
+        if reason := _arg_str(args, "reason"):
+            context["reason"] = reason
     if context:
         return [(kind, dict(body, **context)) for kind, body in items]
     return items

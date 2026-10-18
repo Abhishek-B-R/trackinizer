@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-from functools import partial
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from unittest.mock import AsyncMock
 
 import asyncio
@@ -29,12 +27,6 @@ from trackinizer.types.errors import (
     ValidationError,
 )
 from trackinizer.types.inquiries import CITATION_VALENCE_DEFAULT
-
-
-if TYPE_CHECKING:
-    from uuid import UUID
-
-    from trackinizer.types.edges import Edge
 
 
 class TestInsertInquiryGuards:
@@ -281,117 +273,6 @@ class TestCLIHelpers:
             )
 
 
-class TestEdgeCreationOrder:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("edge_kind", ["narrows", "produced_by", "supersedes"])
-    async def test_older_source_is_rejected_before_insert(
-        self,
-        edge_kind: Edge.Kind,
-    ) -> None:
-        from_id, to_id = new_uuid(), new_uuid()
-        created = datetime(2020, 1, 1, tzinfo=UTC)
-        conn = make_conn()
-        conn.fetch.side_effect = conn.fetchval.side_effect = partial(
-            _edge_creation_query,
-            from_id=from_id,
-            from_created=created,
-            to_created=created + timedelta(days=1),
-        )
-        with pytest.raises(ConflictError) as exc:
-            await insert_edge(
-                cast(Conn, conn),
-                from_id=from_id,
-                from_kind="Issue",
-                to_id=to_id,
-                edge_kind=edge_kind,
-            )
-        message = str(exc.value)
-        for expected in (edge_kind, str(from_id), str(to_id), "created", "--backfill"):
-            assert expected in message
-        assert "re-import" in message
-        assert "new rows" in message
-        assert not any(
-            "INSERT INTO edges" in str(call.args[0])
-            for call in conn.fetchval.call_args_list
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("edge_kind", ["narrows", "produced_by", "supersedes"])
-    @pytest.mark.parametrize("age_days", [0, 1])
-    async def test_tied_or_younger_source_is_allowed(
-        self,
-        edge_kind: Edge.Kind,
-        age_days: int,
-    ) -> None:
-        from_id = new_uuid()
-        created = datetime(2020, 1, 1, tzinfo=UTC)
-        conn = make_conn()
-        conn.fetch.side_effect = conn.fetchval.side_effect = partial(
-            _edge_creation_query,
-            from_id=from_id,
-            from_created=created + timedelta(days=age_days),
-            to_created=created,
-        )
-        assert await insert_edge(
-            cast(Conn, conn),
-            from_id=from_id,
-            from_kind="Issue",
-            to_id=new_uuid(),
-            edge_kind=edge_kind,
-        ) == (True, "Issue")
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "edge_kind",
-        ["requires", "proves", "favors", "cites_paper"],
-    )
-    async def test_creation_independent_edges_allow_older_source(
-        self,
-        edge_kind: Edge.Kind,
-    ) -> None:
-        from_id = new_uuid()
-        created = datetime(2020, 1, 1, tzinfo=UTC)
-        conn = make_conn()
-        conn.fetch.side_effect = conn.fetchval.side_effect = partial(
-            _edge_creation_query,
-            from_id=from_id,
-            from_created=created,
-            to_created=created + timedelta(days=1),
-        )
-        assert await insert_edge(
-            cast(Conn, conn),
-            from_id=from_id,
-            from_kind="Issue",
-            to_id=new_uuid(),
-            edge_kind=edge_kind,
-        ) == (True, "Issue")
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("edge_kind", ["narrows", "produced_by", "supersedes"])
-    async def test_legacy_edge_is_still_an_idempotent_noop(
-        self,
-        edge_kind: Edge.Kind,
-    ) -> None:
-        from_id = new_uuid()
-        created = datetime(2020, 1, 1, tzinfo=UTC)
-        conn = make_conn()
-        conn.fetch.side_effect = conn.fetchval.side_effect = partial(
-            _edge_creation_query,
-            from_id=from_id,
-            from_created=created,
-            to_created=created + timedelta(days=1),
-            edge_exists=True,
-        )
-        assert await insert_edge(
-            cast(Conn, conn),
-            from_id=from_id,
-            from_kind="Issue",
-            to_id=new_uuid(),
-            edge_kind=edge_kind,
-            note="updated annotation",
-        ) == (False, "Issue")
-
-
 class TestCoverageStoreReadsAndEdits:
     @pytest.mark.asyncio
     async def testinsert_edge_supersedes_allows_distinct_edges(self) -> None:
@@ -406,30 +287,6 @@ class TestCoverageStoreReadsAndEdits:
         )
         assert inserted
         assert to_kind == "Issue"
-
-
-def _edge_creation_query(
-    sql: str,
-    *args: object,
-    from_id: UUID,
-    from_created: datetime,
-    to_created: datetime,
-    edge_exists: bool = False,
-) -> object:
-    del args
-    if "SELECT kind FROM inquiries" in sql:
-        return "Issue"
-    if "WITH RECURSIVE" in sql:
-        return False
-    if "INSERT INTO edges" in sql:
-        return None if edge_exists else from_id
-    if "FROM inquiries" in sql:
-        return (
-            [{"source_created": from_created, "target_created": to_created}]
-            if from_created < to_created and not edge_exists
-            else []
-        )
-    raise AssertionError(f"Unexpected query: {sql}")
 
 
 if __name__ == "__main__":

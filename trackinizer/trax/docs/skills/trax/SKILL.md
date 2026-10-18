@@ -292,18 +292,14 @@ generic setter. `modified` and the creation audit event use the current
 server time. Later edits preserve `created`; retries and deduplication that
 return an existing row preserve its timestamps.
 
+Import historical sessions under their original CLI session IDs. Reserved
+science-chat identities (`chat:` IDs) cannot be backfilled: their server-owned
+creation order establishes chat ownership.
+
 When importing a session summary, use the original occurrence date for an
 existing historical fact. Use the synthesis date for a newly inferred
 Belief: old evidence does not make a new inference historical. Omit the flag
 for normal creation at the current server time.
-
-Creation-dependent links (`produced_by`, `narrows`, `supersedes`) reject a
-source dated before its target; equal dates are allowed. The Issue#7 example
-above assumes its creation date is on or before the artifact's historical
-date. Check the direction and both dates on a conflict. To correct an import
-date, re-import a replacement row with `--backfill`; it does not edit an
-existing row or transfer its links. Citations (`proves`, `favors`,
-`cites_paper`) and `requires` have no creation-order guard.
 
 ### Linking code changes (commit SHAs)
 

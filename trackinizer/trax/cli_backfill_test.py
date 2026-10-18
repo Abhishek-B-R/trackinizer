@@ -93,14 +93,15 @@ def test_creation_context_reaches_every_new_inline_row(
     batch = next(call for call in client.calls if call[0] == "submit_batch")
     items = from_plain(batch[1][0], tuple[tuple[str, dict[str, object]], ...])
     assert [body["title"] for _, body in items] == ["root", "child", "grandchild"]
-    assert all(
-        body["reason"] == "  Imported from a local session; original wording.\n"
-        for _, body in items
-    )
     if backfill:
+        assert all(
+            body["reason"] == "  Imported from a local session; original wording.\n"
+            for _, body in items
+        )
         assert all(body["created"] == "2020-01-02T03:04:05+00:00" for _, body in items)
     else:
         assert all("created" not in body for _, body in items)
+        assert all("reason" not in body for _, body in items)
 
 
 @pytest.mark.parametrize("backfill", [[], ["--backfill", "2020-01-02T03:04:05Z"]])
@@ -134,11 +135,14 @@ def test_creation_context_preserves_existing_anchor(
     items = from_plain(batch[1][0], tuple[tuple[str, dict[str, object]], ...])
     edges = from_plain(batch[2]["edges"], tuple[dict[str, object], ...])
     assert [body["title"] for _, body in items] == ["child", "grandchild"]
-    assert all(body["reason"] == "Import two historical findings." for _, body in items)
     if backfill:
+        assert all(
+            body["reason"] == "Import two historical findings." for _, body in items
+        )
         assert all(body["created"] == "2020-01-02T03:04:05+00:00" for _, body in items)
     else:
         assert all("created" not in body for _, body in items)
+        assert all("reason" not in body for _, body in items)
     assert edges[0]["from_id"] == str(client.target_id)
     assert client.rows[0] == anchor
     assert not any(call[0] == "edit" for call in client.calls)

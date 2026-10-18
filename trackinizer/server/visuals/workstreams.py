@@ -139,7 +139,6 @@ async def open_scratch(
     store: Store,
     user_id: uuid.UUID,
     email: str,
-    conn: Conn | None = None,
 ) -> uuid.UUID:
     """Find or create the user's Scratch Issue.
 
@@ -148,66 +147,38 @@ async def open_scratch(
       store: Store used to submit a Scratch Issue in the locked transaction.
       user_id: The owner of the users row to lock during creation.
       email: The user's account and Issue owner.
-      conn: Existing transaction; its caller owns commit and notifications.
 
     Returns:
       issue_id: The Scratch Issue id.
 
     """
-    if conn is not None:
-        return await _open_scratch_on_conn(
-            conn,
-            store=store,
-            user_id=user_id,
-            email=email,
-        )
-    async with notify_after_commit(), engine.acquire() as own_conn, tx(own_conn):
-        return await _open_scratch_on_conn(
-            own_conn,
-            store=store,
-            user_id=user_id,
-            email=email,
-        )
-
-
-async def _open_scratch_on_conn(
-    conn: Conn,
-    *,
-    store: Store,
-    user_id: uuid.UUID,
-    email: str,
-) -> uuid.UUID:
-    """Read or create Scratch in the caller's transaction."""
-    row = await _scratch_row(conn, email=email)
+    async with engine.acquire() as conn:
+        row = await _scratch_row(conn, email=email)
     if row is not None:
         return from_plain(row["id"], uuid.UUID)
-    user = await conn.fetchrow(
-        "SELECT id FROM users WHERE id = $1 FOR UPDATE",
-        user_id,
-    )
-    if user is None:
-        raise ValueError("User not found")
-    row = await _scratch_row(conn, email=email)
-    if row is not None:
+
+    async with notify_after_commit(), engine.acquire() as conn, tx(conn):
+        user = await conn.fetchrow(
+            "SELECT id FROM users WHERE id = $1 FOR UPDATE",
+            user_id,
+        )
+        if user is None:
+            raise ValueError("User not found")
+        row = await _scratch_row(conn, email=email)
+        if row is None:
+            return await store.submit_issue(
+                SubmitIssue(
+                    title="Scratch",
+                    account=email,
+                    owner=email,
+                    actor=email,
+                    labels=["workstream", "scratch"],
+                    status="active",
+                ),
+                actor=email,
+                conn=conn,
+            )
         return from_plain(row["id"], uuid.UUID)
-    earliest = await conn.fetchval(
-        "SELECT min(created) FROM inquiries "
-        "WHERE kind = 'AgentSession' AND account = $1",
-        email,
-    )
-    return await store.submit_issue(
-        SubmitIssue(
-            title="Scratch",
-            account=email,
-            owner=email,
-            actor=email,
-            labels=["workstream", "scratch"],
-            status="active",
-            created=from_plain(earliest, datetime, default=None),
-        ),
-        actor=email,
-        conn=conn,
-    )
 
 
 async def create_workstream(
@@ -440,7 +411,6 @@ async def check_workstream(
     *,
     email: str,
     workstream_id: uuid.UUID,
-    conn: Conn | None = None,
 ) -> bool:
     """Say whether the Issue exists, belongs to ``email``, and has its label.
 
@@ -448,14 +418,11 @@ async def check_workstream(
       engine: Database connection source.
       email: The expected Issue owner.
       workstream_id: Issue to check.
-      conn: Existing transaction to read on, or None to acquire a connection.
 
     Returns:
       found: Whether this is an owned workstream Issue.
 
     """
-    if conn is not None:
-        return await _check_workstream(conn, email=email, workstream_id=workstream_id)
     async with engine.acquire() as conn:
         return await _check_workstream(
             conn,
